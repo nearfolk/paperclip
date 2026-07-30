@@ -115,21 +115,27 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     dirty: boolean;
     lastMirrorAt: number;
     timer: NodeJS.Timeout | null;
-    upload: Promise<void> | null;
+    upload: Promise<boolean> | null;
   }
   const inflightMirrors = new Map<string, InflightMirrorEntry>();
 
-  function mirrorInflightNow(logRef: string, entry: InflightMirrorEntry): Promise<void> {
+  function mirrorInflightNow(logRef: string, entry: InflightMirrorEntry): Promise<boolean> {
     entry.dirty = false;
     const upload = (async () => {
       const absPath = resolveWithin(basePath, logRef);
       const stat = await fs.stat(absPath);
+      if (stat.size === 0) return true;
       await s3!.provider.putObject({
         objectKey: s3Key(logRef),
-        body: createReadStream(absPath),
+        // Bound the stream to the stat'ed size: the run is still appending,
+        // and an unbounded stream that grows past stat.size would violate
+        // the declared contentLength and fail (or truncate) the upload.
+        // Bytes appended after the stat stay dirty and ride the next mirror.
+        body: createReadStream(absPath, { start: 0, end: stat.size - 1 }),
         contentType: "application/x-ndjson",
         contentLength: stat.size,
       });
+      return true;
     })().catch((err) => {
       // Best-effort like the finalize mirror: a failing upload must never
       // break the run, but a persistently broken mirror should be visible.
@@ -140,6 +146,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       // Re-dirty so the tail retries next interval even without new appends;
       // the lastMirrorAt stamp below bounds retries to one per interval.
       entry.dirty = true;
+      return false;
     }).finally(() => {
       // Stamp AFTER the attempt so a slow or failing endpoint self-throttles
       // to one attempt per interval instead of hot-looping.
@@ -342,19 +349,35 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 
     async flushInflightMirrors() {
       if (!s3 || inflightMirrorMs <= 0) return;
-      const flushes: Promise<void>[] = [];
-      for (const [logRef, entry] of inflightMirrors) {
-        if (entry.timer) {
-          clearTimeout(entry.timer);
-          entry.timer = null;
+      const flushEntry = async (logRef: string, entry: InflightMirrorEntry) => {
+        // Loop until the entry is clean: an append that lands while an
+        // upload is on the wire re-dirties the entry, and its follow-up
+        // mirror sits on an unref'ed timer that would never fire once the
+        // process exits — so re-check after every await instead of trusting
+        // a single pass. A FAILED attempt ends the loop instead of retrying:
+        // hot-looping a down endpoint at shutdown would spin forever, and
+        // the flush is best-effort by design.
+        for (;;) {
+          if (entry.timer) {
+            clearTimeout(entry.timer);
+            entry.timer = null;
+          }
+          if (entry.upload) {
+            await entry.upload;
+            continue;
+          }
+          if (!entry.dirty) return;
+          const uploaded = await mirrorInflightNow(logRef, entry);
+          if (!uploaded) {
+            if (entry.timer) {
+              clearTimeout(entry.timer);
+              entry.timer = null;
+            }
+            return;
+          }
         }
-        if (entry.upload) {
-          flushes.push(entry.upload);
-        } else if (entry.dirty) {
-          flushes.push(mirrorInflightNow(logRef, entry));
-        }
-      }
-      await Promise.all(flushes);
+      };
+      await Promise.all([...inflightMirrors].map(([logRef, entry]) => flushEntry(logRef, entry)));
     },
   };
 }

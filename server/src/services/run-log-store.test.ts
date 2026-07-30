@@ -242,6 +242,70 @@ describe("in-flight mirror", () => {
     expect(objects.get(key)!.toString("utf8")).toContain("final-line");
   });
 
+  it("shutdown flush re-checks dirtiness after an upload already on the wire completes", async () => {
+    const { provider, objects, calls } = createMemoryProvider();
+    let releaseFirstPut: (() => void) | null = null;
+    const firstPutGate = new Promise<void>((resolve) => {
+      releaseFirstPut = resolve;
+    });
+    let putStarts = 0;
+    const realPut = provider.putObject.bind(provider);
+    provider.putObject = async (input) => {
+      putStarts++;
+      if (putStarts === 1) await firstPutGate; // hold the first upload on the wire
+      return realPut(input);
+    };
+    const store = createDurableRunLogStore({
+      basePath: baseDir,
+      s3: { provider, keyPrefix: "run-logs", inflightMirrorMs: 10 },
+    });
+    const handle = await store.begin(begin);
+    await store.append(handle, { stream: "stdout", chunk: "mirrored-line", ts: "t1" });
+    await vi.waitFor(() => expect(putStarts).toBe(1), { timeout: 2000 });
+    // Re-dirty the entry while the first upload is still in flight.
+    await store.append(handle, { stream: "stdout", chunk: "tail-during-upload", ts: "t2" });
+    const flush = store.flushInflightMirrors!();
+    releaseFirstPut!();
+    await flush;
+    // A single-pass flush would exit after the first upload and leave the
+    // tail on an unref'ed timer that never fires once the process exits.
+    const body = objects.get(`run-logs/${handle.logRef}`)!.toString("utf8");
+    expect(body).toContain("tail-during-upload");
+    expect(calls.put).toBeGreaterThanOrEqual(2);
+  });
+
+  it("bounds the in-flight upload to the stat'ed size when appends race the stream", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({
+      basePath: baseDir,
+      s3: { provider, keyPrefix: "run-logs", inflightMirrorMs: 60_000 },
+    });
+    const handle = await store.begin(begin);
+    await store.append(handle, { stream: "stdout", chunk: "counted-line", ts: "t1" });
+    const absPath = path.join(baseDir, handle.logRef);
+    const sizeAtStat = (await fs.stat(absPath)).size;
+    // Grow the file between the mirror's stat() and its stream reaching EOF:
+    // the upload must carry exactly the stat'ed bytes, not the racing tail
+    // (an unbounded stream would violate the declared contentLength).
+    const realStat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, ...rest) => {
+      const result = await realStat(target as Parameters<typeof realStat>[0], ...(rest as []));
+      if (String(target).endsWith(".ndjson")) {
+        await fs.appendFile(absPath, `${JSON.stringify({ ts: "t2", stream: "stdout", chunk: "raced-append" })}\n`);
+      }
+      return result;
+    });
+    try {
+      await store.flushInflightMirrors!();
+    } finally {
+      statSpy.mockRestore();
+    }
+    const body = objects.get(`run-logs/${handle.logRef}`)!;
+    expect(body.length).toBe(sizeAtStat);
+    expect(body.toString("utf8")).toContain("counted-line");
+    expect(body.toString("utf8")).not.toContain("raced-append");
+  });
+
   it("in-flight upload failures never break appends and recover on the next flush", async () => {
     const { provider, objects, calls } = createMemoryProvider();
     let failPuts = true;
