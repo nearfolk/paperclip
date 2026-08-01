@@ -405,7 +405,8 @@ containment, directory, and symlink guards pass. Primary checkouts with other
 linked worktrees are preserved as ambiguous. Repository-prefixed top-level
 names also require a same-agent stable sibling Git checkout with that repository
 basename. Recursive worktree-container discovery is limited to those same stable
-sibling checkouts, so ambiguous names such as `archive-LIV-321-old` and any
+sibling checkouts, and repository-prefixed nested candidates must resolve to the
+same recognized family set. Ambiguous names such as `archive-LIV-321-old` and any
 nested contents beneath them are preserved. Each cleanup attempt writes a
 structured log and an `issue.terminal_workspace_cleanup` activity entry with
 matched, removed, skipped, and failed paths; failures are isolated per path so

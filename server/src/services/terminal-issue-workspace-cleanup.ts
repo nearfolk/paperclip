@@ -106,7 +106,6 @@ export function matchesTerminalIssueWorkspaceName(
   input: Pick<CleanupIssue, "identifier" | "issueNumber">,
   options: {
     workspaceFamilies?: ReadonlySet<string>;
-    insideWorktreeContainer?: boolean;
   } = {},
 ) {
   const identity = parseIssueIdentity(input);
@@ -134,7 +133,6 @@ export function matchesTerminalIssueWorkspaceName(
     "i",
   ).exec(name);
   if (!repositoryPrefixed) return false;
-  if (options.insideWorktreeContainer) return true;
   return options.workspaceFamilies?.has(repositoryPrefixed[1].toLowerCase()) ?? false;
 }
 
@@ -297,7 +295,7 @@ export async function cleanupTerminalIssueWorkspaces(input: {
   if (!TERMINAL_STATUSES.has(input.issue.status) || !identity) return report;
 
   const candidates = new Map<string, TerminalIssueWorkspaceCleanupEntry["source"]>();
-  const inspectContainer = async (containerPath: string) => {
+  const inspectContainer = async (containerPath: string, workspaceFamilies: ReadonlySet<string>) => {
     let entries: Dirent[];
     try {
       entries = await fs.readdir(containerPath, { withFileTypes: true });
@@ -306,7 +304,7 @@ export async function cleanupTerminalIssueWorkspaces(input: {
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      if (!matchesTerminalIssueWorkspaceName(entry.name, input.issue, { insideWorktreeContainer: true })) continue;
+      if (!matchesTerminalIssueWorkspaceName(entry.name, input.issue, { workspaceFamilies })) continue;
       candidates.set(path.resolve(containerPath, entry.name), "nested_worktree_container");
     }
   };
@@ -338,7 +336,10 @@ export async function cleanupTerminalIssueWorkspaces(input: {
         continue;
       }
       if (!workspaceFamilies.has(entry.name.toLowerCase())) continue;
-      await discoverNestedWorktreeContainers(entryPath, inspectContainer);
+      await discoverNestedWorktreeContainers(
+        entryPath,
+        (containerPath) => inspectContainer(containerPath, workspaceFamilies),
+      );
     }
   }
 

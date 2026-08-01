@@ -118,7 +118,7 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await mkdirs(ambiguousContainer, ["liv-321-unrelated"]);
     const ctoContainer = path.join(checkout, ".cto-worktrees");
     const qaContainer = path.join(checkout, ".qa-worktrees");
-    await mkdirs(ctoContainer, ["liv-321-parser", "liv-3210"]);
+    await mkdirs(ctoContainer, ["liv-321-parser", "liv-3210", "otherrepo-LIV-321"]);
     await mkdirs(qaContainer, ["liv-321-review", "liv-3210-review"]);
 
     const report = await cleanupTerminalIssueWorkspaces({
@@ -139,6 +139,7 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await expect(fs.stat(path.join(agentRoot, "archive-qa-321-old"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(ambiguousContainer, "liv-321-unrelated"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(ctoContainer, "liv-3210"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(ctoContainer, "otherrepo-LIV-321"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(qaContainer, "liv-3210-review"))).resolves.toBeDefined();
   });
 
