@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createProcessMemorySample } from "../services/process-memory-monitor.js";
+import {
+  createProcessMemorySample,
+  getProcessMemoryMonitorSubscriberCount,
+  startProcessMemoryMonitor,
+} from "../services/process-memory-monitor.js";
 
 describe("process memory monitoring", () => {
   it("reports bounded metadata without process payloads", () => {
@@ -27,5 +31,17 @@ describe("process memory monitoring", () => {
       "rssBytes",
       "uptimeSeconds",
     ]);
+  });
+
+  it("shares one process monitor across repeated starts and cleans it up", () => {
+    const stopFirst = startProcessMemoryMonitor(60_000);
+    const stopSecond = startProcessMemoryMonitor(60_000);
+
+    expect(getProcessMemoryMonitorSubscriberCount()).toBe(2);
+    stopFirst();
+    stopFirst();
+    expect(getProcessMemoryMonitorSubscriberCount()).toBe(1);
+    stopSecond();
+    expect(getProcessMemoryMonitorSubscriberCount()).toBe(0);
   });
 });

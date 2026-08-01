@@ -6,6 +6,8 @@ const DEFAULT_SAMPLE_INTERVAL_MS = 30_000;
 const HEAP_WARNING_RATIO = 0.75;
 const GC_PRESSURE_RATIO = 0.2;
 
+let activeMonitor: { subscribers: number; stop: () => void } | null = null;
+
 export interface ProcessMemorySample {
   event: "process_memory";
   rssBytes: number;
@@ -44,6 +46,20 @@ export function createProcessMemorySample(
 }
 
 export function startProcessMemoryMonitor(intervalMs = DEFAULT_SAMPLE_INTERVAL_MS): () => void {
+  if (activeMonitor) {
+    activeMonitor.subscribers += 1;
+    let released = false;
+    return () => {
+      if (released || !activeMonitor) return;
+      released = true;
+      activeMonitor.subscribers -= 1;
+      if (activeMonitor.subscribers === 0) {
+        activeMonitor.stop();
+        activeMonitor = null;
+      }
+    };
+  }
+
   let gcDurationMs = 0;
   let gcCount = 0;
   const observer = new PerformanceObserver((list) => {
@@ -74,8 +90,24 @@ export function startProcessMemoryMonitor(intervalMs = DEFAULT_SAMPLE_INTERVAL_M
   }, intervalMs);
   timer.unref();
 
-  return () => {
+  const stop = () => {
     clearInterval(timer);
     observer.disconnect();
   };
+  activeMonitor = { subscribers: 1, stop };
+
+  let released = false;
+  return () => {
+    if (released || !activeMonitor) return;
+    released = true;
+    activeMonitor.subscribers -= 1;
+    if (activeMonitor.subscribers === 0) {
+      activeMonitor.stop();
+      activeMonitor = null;
+    }
+  };
+}
+
+export function getProcessMemoryMonitorSubscriberCount(): number {
+  return activeMonitor?.subscribers ?? 0;
 }
