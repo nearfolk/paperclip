@@ -65,6 +65,17 @@ describe("terminal issue workspace name matching", () => {
   ])("does not match %s", (name) => {
     expect(matchesTerminalIssueWorkspaceName(name, issue)).toBe(false);
   });
+
+  it("fails closed when the identifier and issue number disagree", () => {
+    expect(matchesTerminalIssueWorkspaceName("liveslip-liv-321", {
+      identifier: "LIV-321",
+      issueNumber: 322,
+    })).toBe(false);
+    expect(matchesTerminalIssueWorkspaceName("liveslip-liv-322", {
+      identifier: "LIV-321",
+      issueNumber: 322,
+    })).toBe(false);
+  });
 });
 
 describe("cleanupTerminalIssueWorkspaces", () => {

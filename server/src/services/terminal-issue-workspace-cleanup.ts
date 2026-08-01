@@ -68,9 +68,19 @@ function escapeRegExp(value: string) {
 function parseIssueIdentity(input: Pick<CleanupIssue, "identifier" | "issueNumber">) {
   const identifier = input.identifier?.trim().toUpperCase() ?? "";
   const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(identifier);
-  const issueNumber = input.issueNumber ?? (match ? Number(match[2]) : null);
-  if (!match || !Number.isSafeInteger(issueNumber) || issueNumber! < 1) return null;
-  return { identifier, prefix: match[1], issueNumber: issueNumber! };
+  if (!match) return null;
+  const identifierIssueNumber = Number(match[2]);
+  const issueNumber = input.issueNumber ?? identifierIssueNumber;
+  if (
+    !Number.isSafeInteger(identifierIssueNumber) ||
+    identifierIssueNumber < 1 ||
+    !Number.isSafeInteger(issueNumber) ||
+    issueNumber < 1 ||
+    issueNumber !== identifierIssueNumber
+  ) {
+    return null;
+  }
+  return { identifier, prefix: match[1], issueNumber };
 }
 
 /**
