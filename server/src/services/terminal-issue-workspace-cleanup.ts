@@ -83,6 +83,20 @@ function parseIssueIdentity(input: Pick<CleanupIssue, "identifier" | "issueNumbe
   return { identifier, prefix: match[1], issueNumber };
 }
 
+function containsTerminalIssueIdentity(
+  name: string,
+  input: Pick<CleanupIssue, "identifier" | "issueNumber">,
+) {
+  const identity = parseIssueIdentity(input);
+  if (!identity) return false;
+  const escapedPrefix = escapeRegExp(identity.prefix);
+  const issueNumber = String(identity.issueNumber);
+  return new RegExp(
+    `(?:^|[-_])(?:(?:qa|pr|merge)[-_]?)?(?:${escapedPrefix}[-_]?)?${issueNumber}(?!\\d)(?:$|[-_.])`,
+    "i",
+  ).test(name);
+}
+
 /**
  * Match only workspace naming conventions. Numeric look-ahead is deliberate:
  * closing issue 123 must never select a workspace for issue 1234.
@@ -311,6 +325,9 @@ export async function cleanupTerminalIssueWorkspaces(input: {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const entryPath = path.join(agentRoot, entry.name);
       if (!(await hasGitMetadata(entryPath))) continue;
+      // A repository family must be a stable sibling checkout, not a
+      // candidate-shaped directory for the issue currently being cleaned.
+      if (containsTerminalIssueIdentity(entry.name, input.issue)) continue;
       workspaceFamilies.add(entry.name.toLowerCase());
     }
     for (const entry of entries) {
@@ -320,6 +337,7 @@ export async function cleanupTerminalIssueWorkspaces(input: {
         candidates.set(path.resolve(entryPath), "agent_workspace");
         continue;
       }
+      if (!workspaceFamilies.has(entry.name.toLowerCase())) continue;
       await discoverNestedWorktreeContainers(entryPath, inspectContainer);
     }
   }

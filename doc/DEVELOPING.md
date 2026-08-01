@@ -403,8 +403,10 @@ Registered linked worktrees are removed with `git worktree remove --force`.
 Directly-created scratch directories are removed only after basename, path
 containment, directory, and symlink guards pass. Primary checkouts with other
 linked worktrees are preserved as ambiguous. Repository-prefixed top-level
-names also require a same-agent sibling Git checkout with that repository
-basename; ambiguous names such as `archive-LIV-321-old` are preserved. Each cleanup attempt writes a
+names also require a same-agent stable sibling Git checkout with that repository
+basename. Recursive worktree-container discovery is limited to those same stable
+sibling checkouts, so ambiguous names such as `archive-LIV-321-old` and any
+nested contents beneath them are preserved. Each cleanup attempt writes a
 structured log and an `issue.terminal_workspace_cleanup` activity entry with
 matched, removed, skipped, and failed paths; failures are isolated per path so
 one stale workspace does not prevent the remaining matches from being handled.

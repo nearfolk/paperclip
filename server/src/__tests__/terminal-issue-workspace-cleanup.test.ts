@@ -114,6 +114,8 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await mkdirs(checkout, [".git"]);
     await mkdirs(paperclipCheckout, [".git"]);
     await mkdirs(path.join(agentRoot, "archive-LIV-321-old"), [".git"]);
+    const ambiguousContainer = path.join(agentRoot, "archive-LIV-321-old", ".cto-worktrees");
+    await mkdirs(ambiguousContainer, ["liv-321-unrelated"]);
     const ctoContainer = path.join(checkout, ".cto-worktrees");
     const qaContainer = path.join(checkout, ".qa-worktrees");
     await mkdirs(ctoContainer, ["liv-321-parser", "liv-3210"]);
@@ -135,6 +137,7 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await expect(fs.stat(path.join(agentRoot, "liveslip-qa-3210"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(agentRoot, "archive-LIV-321-old"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(agentRoot, "archive-qa-321-old"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(ambiguousContainer, "liv-321-unrelated"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(ctoContainer, "liv-3210"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(qaContainer, "liv-3210-review"))).resolves.toBeDefined();
   });
@@ -153,6 +156,7 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     const checkout = path.join(agentRoot, "liveslip");
     const container = path.join(checkout, ".cto-worktrees");
     const linkedWorktree = path.join(container, "liv-321-registered");
+    await fs.mkdir(path.join(checkout, ".git"), { recursive: true });
     await fs.mkdir(container, { recursive: true });
     await execFileAsync("git", ["worktree", "add", "-b", "liv-321", linkedWorktree], { cwd: repo });
 
