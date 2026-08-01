@@ -90,25 +90,47 @@ function parseIssueIdentity(input: Pick<CleanupIssue, "identifier" | "issueNumbe
 export function matchesTerminalIssueWorkspaceName(
   name: string,
   input: Pick<CleanupIssue, "identifier" | "issueNumber">,
+  options: {
+    workspaceFamilies?: ReadonlySet<string>;
+    insideWorktreeContainer?: boolean;
+  } = {},
 ) {
   const identity = parseIssueIdentity(input);
   if (!identity) return false;
   const escapedPrefix = escapeRegExp(identity.prefix);
   const issueNumber = String(identity.issueNumber);
-  const explicitIdentifier = new RegExp(
-    `(?:^|[^a-z0-9])${escapedPrefix}[-_]?${issueNumber}(?!\\d)(?:[-_.]|$)`,
+  const standaloneIdentifier = new RegExp(
+    `^${escapedPrefix}[-_]?${issueNumber}(?!\\d)(?:[-_.].*)?$`,
     "i",
   );
-  if (explicitIdentifier.test(name)) return true;
+  if (standaloneIdentifier.test(name)) return true;
 
   // QA, PR, and merge operators historically omitted the company prefix.
-  // Anchor these aliases to the whole basename so ordinary product/artifact
-  // directories containing the same number are not treated as workspaces.
-  const operatorAlias = new RegExp(
-    `^(?:[a-z0-9]+[-_])?(?:qa|pr|merge)[-_]?(?:${escapedPrefix}[-_]?)?${issueNumber}(?!\\d)(?:[-_.].*)?$`,
+  const standaloneOperatorAlias = new RegExp(
+    `^(?:qa|pr|merge)[-_]?(?:${escapedPrefix}[-_]?)?${issueNumber}(?!\\d)(?:[-_.].*)?$`,
     "i",
   );
-  return operatorAlias.test(name);
+  if (standaloneOperatorAlias.test(name)) return true;
+
+  // A repository-prefixed direct child is eligible only when the prefix maps
+  // to a real sibling checkout in the same agent workspace. Without that
+  // context, names such as archive-LIV-321-old are ambiguous and must survive.
+  const repositoryPrefixed = new RegExp(
+    `^(.+?)[-_](?:(?:qa|pr|merge)[-_]?(?:${escapedPrefix}[-_]?)?|${escapedPrefix}[-_]?)${issueNumber}(?!\\d)(?:[-_.].*)?$`,
+    "i",
+  ).exec(name);
+  if (!repositoryPrefixed) return false;
+  if (options.insideWorktreeContainer) return true;
+  return options.workspaceFamilies?.has(repositoryPrefixed[1].toLowerCase()) ?? false;
+}
+
+async function hasGitMetadata(targetPath: string) {
+  try {
+    const stat = await fs.lstat(path.join(targetPath, ".git"));
+    return stat.isDirectory() || stat.isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function isDirectoryWithoutFollowingSymlinks(targetPath: string) {
@@ -270,7 +292,7 @@ export async function cleanupTerminalIssueWorkspaces(input: {
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      if (!matchesTerminalIssueWorkspaceName(entry.name, input.issue)) continue;
+      if (!matchesTerminalIssueWorkspaceName(entry.name, input.issue, { insideWorktreeContainer: true })) continue;
       candidates.set(path.resolve(containerPath, entry.name), "nested_worktree_container");
     }
   };
@@ -284,10 +306,17 @@ export async function cleanupTerminalIssueWorkspaces(input: {
     } catch {
       continue;
     }
+    const workspaceFamilies = new Set<string>();
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const entryPath = path.join(agentRoot, entry.name);
-      if (matchesTerminalIssueWorkspaceName(entry.name, input.issue)) {
+      if (!(await hasGitMetadata(entryPath))) continue;
+      workspaceFamilies.add(entry.name.toLowerCase());
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const entryPath = path.join(agentRoot, entry.name);
+      if (matchesTerminalIssueWorkspaceName(entry.name, input.issue, { workspaceFamilies })) {
         candidates.set(path.resolve(entryPath), "agent_workspace");
         continue;
       }

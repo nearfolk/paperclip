@@ -402,7 +402,9 @@ closing issue `ABC-123` cannot select a workspace for `ABC-1234`.
 Registered linked worktrees are removed with `git worktree remove --force`.
 Directly-created scratch directories are removed only after basename, path
 containment, directory, and symlink guards pass. Primary checkouts with other
-linked worktrees are preserved as ambiguous. Each cleanup attempt writes a
+linked worktrees are preserved as ambiguous. Repository-prefixed top-level
+names also require a same-agent sibling Git checkout with that repository
+basename; ambiguous names such as `archive-LIV-321-old` are preserved. Each cleanup attempt writes a
 structured log and an `issue.terminal_workspace_cleanup` activity entry with
 matched, removed, skipped, and failed paths; failures are isolated per path so
 one stale workspace does not prevent the remaining matches from being handled.

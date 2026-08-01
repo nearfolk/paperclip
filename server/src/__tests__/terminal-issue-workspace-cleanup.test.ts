@@ -44,6 +44,16 @@ describe("terminal issue workspace name matching", () => {
   const issue = { identifier: "LIV-321", issueNumber: 321 };
 
   it.each([
+    "liv-321",
+    "qa-321",
+    "qa-liv-321-bf9271",
+    "pr-321",
+    "merge-321-final",
+  ])("matches %s", (name) => {
+    expect(matchesTerminalIssueWorkspaceName(name, issue)).toBe(true);
+  });
+
+  it.each([
     "liveslip-liv-321",
     "paperclip-liv-321-parser",
     "liveslip-qa-321",
@@ -51,9 +61,10 @@ describe("terminal issue workspace name matching", () => {
     "liveslip-qa-liv-321-bf9271",
     "liveslip-pr-321",
     "liveslip-merge-321-final",
-    "liv-321",
-  ])("matches %s", (name) => {
-    expect(matchesTerminalIssueWorkspaceName(name, issue)).toBe(true);
+  ])("matches recognized repository workspace family %s", (name) => {
+    expect(matchesTerminalIssueWorkspaceName(name, issue, {
+      workspaceFamilies: new Set(["liveslip", "paperclip"]),
+    })).toBe(true);
   });
 
   it.each([
@@ -62,6 +73,8 @@ describe("terminal issue workspace name matching", () => {
     "liveslip-pr-1321",
     "artifacts-321",
     "preview-321",
+    "archive-LIV-321-old",
+    "archive-qa-321-old",
   ])("does not match %s", (name) => {
     expect(matchesTerminalIssueWorkspaceName(name, issue)).toBe(false);
   });
@@ -88,8 +101,19 @@ describe("cleanupTerminalIssueWorkspaces", () => {
       "liveslip-pr-321",
       "liveslip-merge-321",
     ];
-    await mkdirs(agentRoot, [...topLevelMatches, "liveslip-liv-3210", "liveslip-qa-3210"]);
+    await mkdirs(agentRoot, [
+      ...topLevelMatches,
+      "liveslip-liv-3210",
+      "liveslip-qa-3210",
+      "archive-LIV-321-old",
+      "archive-qa-321-old",
+    ]);
     const checkout = path.join(agentRoot, "liveslip");
+    const paperclipCheckout = path.join(agentRoot, "paperclip");
+    await mkdirs(agentRoot, ["liveslip", "paperclip"]);
+    await mkdirs(checkout, [".git"]);
+    await mkdirs(paperclipCheckout, [".git"]);
+    await mkdirs(path.join(agentRoot, "archive-LIV-321-old"), [".git"]);
     const ctoContainer = path.join(checkout, ".cto-worktrees");
     const qaContainer = path.join(checkout, ".qa-worktrees");
     await mkdirs(ctoContainer, ["liv-321-parser", "liv-3210"]);
@@ -109,6 +133,8 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await expect(fs.stat(path.join(qaContainer, "liv-321-review"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.stat(path.join(agentRoot, "liveslip-liv-3210"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(agentRoot, "liveslip-qa-3210"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(agentRoot, "archive-LIV-321-old"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(agentRoot, "archive-qa-321-old"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(ctoContainer, "liv-3210"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(qaContainer, "liv-3210-review"))).resolves.toBeDefined();
   });
@@ -165,6 +191,8 @@ describe("cleanupTerminalIssueWorkspaces", () => {
     await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: primaryCheckout });
     const linkedWorktree = path.join(root, "linked-worktree");
     await execFileAsync("git", ["worktree", "add", "-b", "linked", linkedWorktree], { cwd: primaryCheckout });
+    await fs.mkdir(path.join(agentRoot, "liveslip", ".git"), { recursive: true });
+    await fs.mkdir(path.join(agentRoot, "paperclip", ".git"), { recursive: true });
     const removableScratch = path.join(agentRoot, "liveslip-qa-321-review");
     await fs.mkdir(removableScratch, { recursive: true });
 
@@ -202,8 +230,10 @@ describe("cleanupTerminalIssueWorkspaces", () => {
   it("does not traverse agents outside the issue company agent set", async () => {
     const { workspaceRoot, agentRoot } = await makeFixtureRoot();
     const otherAgentRoot = path.join(workspaceRoot, "agent-two");
+    const ownCheckout = path.join(agentRoot, "liveslip");
     const ownPath = path.join(agentRoot, "liveslip-liv-321");
     const otherPath = path.join(otherAgentRoot, "liveslip-liv-321");
+    await fs.mkdir(path.join(ownCheckout, ".git"), { recursive: true });
     await fs.mkdir(ownPath, { recursive: true });
     await fs.mkdir(otherPath, { recursive: true });
 
@@ -287,6 +317,16 @@ describeEmbeddedPostgres("terminal issue transition workspace cleanup", () => {
       agentId,
       "liveslip-liv-321",
     );
+    const primaryCheckout = path.join(
+      home,
+      "instances",
+      "cleanup-test",
+      "workspaces",
+      agentId,
+      "liveslip",
+      ".git",
+    );
+    await fs.mkdir(primaryCheckout, { recursive: true });
     await fs.mkdir(workspacePath, { recursive: true });
 
     await issueService(db).update(issueId, { status });
