@@ -81,6 +81,7 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+import { startProcessMemoryMonitor } from "./services/process-memory-monitor.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -750,7 +751,9 @@ export async function startServer(): Promise<StartedServer> {
     decisionServiceOptions,
     managedPluginAutoInstall,
   });
+  const stopProcessMemoryMonitor = startProcessMemoryMonitor();
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
+  server.once("close", stopProcessMemoryMonitor);
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts
   // of common reverse proxies and load balancers (like AWS ALB, Nginx, or Traefik).
