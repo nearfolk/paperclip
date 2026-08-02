@@ -1,0 +1,122 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { finished } from "node:stream/promises";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  LAUNCHD_LOG_GENERATIONS,
+  LAUNCHD_MAX_EARLY_FAILURES,
+  LAUNCHD_MIN_FREE_DISK_BYTES,
+  RotatingLogWriter,
+  launchdStartupBlockReason,
+  runLaunchdServiceSupervisor,
+} from "../services/launchd-service-supervisor.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
+});
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-launchd-supervisor-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+describe("launchd startup safeguards", () => {
+  it("refuses startup below the free-disk floor", () => {
+    expect(launchdStartupBlockReason({
+      freeDiskBytes: LAUNCHD_MIN_FREE_DISK_BYTES - 1,
+      failureTimestamps: [],
+      now: 100_000,
+    })).toMatchObject({ reason: "low_disk" });
+  });
+
+  it("caps five early failures in a sixty-second window", () => {
+    const now = 100_000;
+    expect(launchdStartupBlockReason({
+      freeDiskBytes: LAUNCHD_MIN_FREE_DISK_BYTES,
+      failureTimestamps: Array.from({ length: LAUNCHD_MAX_EARLY_FAILURES }, (_, index) => now - index * 1_000),
+      now,
+    })).toMatchObject({ reason: "crash_loop" });
+  });
+
+  it("writes an operator-readable status without spawning when disk is low", async () => {
+    const homeDir = await temporaryDirectory();
+    let spawnCalled = false;
+
+    const exitCode = await runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: "/missing/paperclipai",
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES - 1,
+      spawnChild: () => {
+        spawnCalled = true;
+        throw new Error("must not spawn");
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawnCalled).toBe(false);
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; message: string };
+    expect(status).toMatchObject({ state: "blocked", reason: "low_disk" });
+    expect(status.message).toContain("startup refused");
+  });
+
+  it("stops spawning after the fifth early child failure", async () => {
+    const homeDir = await temporaryDirectory();
+    let spawnCount = 0;
+    const options = {
+      instanceId: "test",
+      homeDir,
+      shimPath: process.execPath,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => {
+        spawnCount += 1;
+        return spawn(process.execPath, ["-e", "process.exit(1)"], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      },
+    };
+
+    for (let attempt = 1; attempt <= LAUNCHD_MAX_EARLY_FAILURES; attempt += 1) {
+      const exitCode = await runLaunchdServiceSupervisor(options);
+      expect(exitCode).toBe(attempt === LAUNCHD_MAX_EARLY_FAILURES ? 0 : 1);
+    }
+    expect(spawnCount).toBe(LAUNCHD_MAX_EARLY_FAILURES);
+
+    expect(await runLaunchdServiceSupervisor(options)).toBe(0);
+    expect(spawnCount).toBe(LAUNCHD_MAX_EARLY_FAILURES);
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; earlyFailureCount: number };
+    expect(status).toMatchObject({
+      state: "blocked",
+      reason: "crash_loop",
+      earlyFailureCount: LAUNCHD_MAX_EARLY_FAILURES,
+    });
+  });
+});
+
+describe("launchd service log rotation", () => {
+  it("rotates while streaming and retains only three generations", async () => {
+    const directory = await temporaryDirectory();
+    const logPath = path.join(directory, "service.log");
+    const writer = new RotatingLogWriter(logPath, 10, LAUNCHD_LOG_GENERATIONS);
+
+    writer.end(Buffer.from("0123456789abcdefghijKLMNOPQRSTuvwxy"));
+    await finished(writer);
+
+    expect(await fs.readFile(logPath, "utf8")).toBe("uvwxy");
+    expect(await fs.readFile(`${logPath}.1`, "utf8")).toBe("KLMNOPQRST");
+    expect(await fs.readFile(`${logPath}.2`, "utf8")).toBe("abcdefghij");
+    expect(await fs.readFile(`${logPath}.3`, "utf8")).toBe("0123456789");
+    await expect(fs.access(`${logPath}.4`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
