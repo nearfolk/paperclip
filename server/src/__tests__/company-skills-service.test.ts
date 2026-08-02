@@ -2062,7 +2062,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-browse-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-browse-")),
+    );
     cleanupDirs.add(workspaceDir);
     const skillDir = path.join(workspaceDir, "content", "teams", "editorial");
     await fs.mkdir(skillDir, { recursive: true });
@@ -2122,7 +2124,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-preview-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-preview-")),
+    );
     cleanupDirs.add(workspaceDir);
     const codexSkillDir = path.join(workspaceDir, ".codex", "skills", "preview-codex");
     const cursorSkillDir = path.join(workspaceDir, ".cursor", "skills", "preview-cursor");
@@ -2181,7 +2185,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-same-path-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-same-path-")),
+    );
     cleanupDirs.add(workspaceDir);
     const skillDir = path.join(workspaceDir, ".codex", "skills", "same-path");
     await fs.mkdir(skillDir, { recursive: true });
@@ -2229,7 +2235,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const bundledSkillId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-built-in-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-built-in-")),
+    );
     const bundledSkillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-bundled-source-"));
     cleanupDirs.add(workspaceDir);
     cleanupDirs.add(bundledSkillDir);
@@ -2288,7 +2296,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const existingSkillId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-rename-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-rename-")),
+    );
     const existingSkillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-existing-"));
     cleanupDirs.add(workspaceDir);
     cleanupDirs.add(existingSkillDir);
@@ -2358,7 +2368,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-selective-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-selective-")),
+    );
     cleanupDirs.add(workspaceDir);
     const selectedSkillDir = path.join(workspaceDir, ".gemini", "skills", "selected-skill");
     const ignoredSkillDir = path.join(workspaceDir, ".opencode", "skills", "ignored-skill");
@@ -2433,11 +2445,15 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-")),
+    );
     const otherCompanyId = randomUUID();
     const otherProjectId = randomUUID();
     const otherWorkspaceId = randomUUID();
-    const otherWorkspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-other-"));
+    const otherWorkspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-scope-other-")),
+    );
     cleanupDirs.add(workspaceDir);
     cleanupDirs.add(otherWorkspaceDir);
 
@@ -2529,7 +2545,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-symlink-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-symlink-")),
+    );
     const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-outside-"));
     cleanupDirs.add(workspaceDir);
     cleanupDirs.add(outsideDir);
@@ -2599,7 +2617,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const folderSvc = folderService(db);
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-project-folder-"));
+    const workspaceDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-project-folder-")),
+    );
     cleanupDirs.add(workspaceDir);
     const skillDir = path.join(workspaceDir, "skills", "project-skill");
     const skillFile = path.join(skillDir, "SKILL.md");

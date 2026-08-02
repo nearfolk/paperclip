@@ -3316,7 +3316,9 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
-    const worktreesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-instances-"));
+    const worktreesDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-instances-")),
+    );
     const instanceId = deriveWorktreeInstanceId(workspace.cwd);
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
     await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
@@ -5508,9 +5510,15 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     await db.delete(companies);
   });
 
-  it("adopts a live auto-port shared service after runtime state is reset", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-"));
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+  it.skipIf(process.platform !== "linux")(
+    "adopts a live auto-port shared service after runtime state is reset",
+    async () => {
+    const workspaceRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-")),
+    );
+    const paperclipHome = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-")),
+    );
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-reconcile-${randomUUID()}`;
 
@@ -5615,7 +5623,8 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     });
 
     await expect(fetch(service!.url!)).rejects.toThrow();
-  });
+    },
+  );
 
   it("does not reuse a stopped auto-port service port while another process owns it", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-unhealthy-adopt-"));
