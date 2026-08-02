@@ -113,8 +113,6 @@ export function renderLaunchdPlist(input: {
   instanceId: string;
   shimPath: string;
   homeDir: string;
-  supervisorStdoutPath: string;
-  supervisorStderrPath: string;
 }): string {
   const label = launchdServiceName(input.instanceId);
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -139,8 +137,8 @@ export function renderLaunchdPlist(input: {
   </dict>
   <key>ThrottleInterval</key><integer>5</integer>
   <key>ExitTimeOut</key><integer>300</integer>
-  <key>StandardOutPath</key><string>${escapeXml(input.supervisorStdoutPath)}</string>
-  <key>StandardErrorPath</key><string>${escapeXml(input.supervisorStderrPath)}</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
 </dict>
 </plist>
 `;
@@ -242,8 +240,6 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly domain = `gui/${process.getuid?.() ?? 0}`;
   private readonly stdoutPath: string;
   private readonly stderrPath: string;
-  private readonly supervisorStdoutPath: string;
-  private readonly supervisorStderrPath: string;
   private readonly instanceRoot: string;
 
   constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
@@ -253,8 +249,6 @@ export class LaunchdServiceManager implements ServiceManager {
     const logDir = path.join(this.instanceRoot, "logs");
     this.stdoutPath = path.join(logDir, "service.log");
     this.stderrPath = path.join(logDir, "service.err.log");
-    this.supervisorStdoutPath = path.join(logDir, "service-supervisor.log");
-    this.supervisorStderrPath = path.join(logDir, "service-supervisor.err.log");
   }
 
   renderDefinition(): string {
@@ -262,8 +256,6 @@ export class LaunchdServiceManager implements ServiceManager {
       instanceId: this.instanceId,
       shimPath: this.shimPath,
       homeDir: this.homeDir,
-      supervisorStdoutPath: this.supervisorStdoutPath,
-      supervisorStderrPath: this.supervisorStderrPath,
     });
   }
 

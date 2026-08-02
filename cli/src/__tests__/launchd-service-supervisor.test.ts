@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import type { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -102,6 +103,113 @@ describe("launchd startup safeguards", () => {
       earlyFailureCount: LAUNCHD_MAX_EARLY_FAILURES,
     });
   });
+
+  it("persists an asynchronous child spawn error as an early failure", async () => {
+    const homeDir = await temporaryDirectory();
+
+    const exitCode = await runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: path.join(homeDir, "missing-paperclipai"),
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+    });
+
+    expect(exitCode).toBe(1);
+    const instanceRoot = path.join(homeDir, "instances", "test");
+    const failures = JSON.parse(await fs.readFile(
+      path.join(instanceRoot, "service-early-failures.json"),
+      "utf8",
+    )) as { timestamps: number[] };
+    const status = JSON.parse(await fs.readFile(
+      path.join(instanceRoot, "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; message: string; earlyFailureCount: number };
+    expect(failures.timestamps).toHaveLength(1);
+    expect(status).toMatchObject({
+      state: "exited",
+      reason: "spawn_error",
+      earlyFailureCount: 1,
+    });
+    expect(status.message).toContain("could not start the child service");
+  });
+
+  it("caps repeated synchronous child spawn failures", async () => {
+    const homeDir = await temporaryDirectory();
+    let spawnCount = 0;
+    const options = {
+      instanceId: "test",
+      homeDir,
+      shimPath: "/missing/paperclipai",
+      now: () => 100_000,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => {
+        spawnCount += 1;
+        throw new Error("spawn denied");
+      },
+    };
+
+    for (let attempt = 1; attempt <= LAUNCHD_MAX_EARLY_FAILURES; attempt += 1) {
+      await expect(runLaunchdServiceSupervisor(options)).resolves.toBe(
+        attempt === LAUNCHD_MAX_EARLY_FAILURES ? 0 : 1,
+      );
+    }
+    await expect(runLaunchdServiceSupervisor(options)).resolves.toBe(0);
+    expect(spawnCount).toBe(LAUNCHD_MAX_EARLY_FAILURES);
+
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; earlyFailureCount: number };
+    expect(status).toMatchObject({
+      state: "blocked",
+      reason: "crash_loop",
+      earlyFailureCount: LAUNCHD_MAX_EARLY_FAILURES,
+    });
+  });
+
+  it.each(["service.log", "service.err.log"])(
+    "persists a %s pipeline/log-write failure and stops the child",
+    async (blockedLogName) => {
+      const homeDir = await temporaryDirectory();
+      const instanceRoot = path.join(homeDir, "instances", "test");
+      const blockedLogPath = path.join(instanceRoot, "logs", blockedLogName);
+      await fs.mkdir(blockedLogPath, { recursive: true });
+      const spawnedChildren: Array<ChildProcess & { stdout: Readable; stderr: Readable }> = [];
+
+      const exitCode = await runLaunchdServiceSupervisor({
+        instanceId: "test",
+        homeDir,
+        shimPath: process.execPath,
+        freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+        spawnChild: () => {
+          const spawnedChild = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1_000)"], {
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          spawnedChildren.push(spawnedChild);
+          return spawnedChild;
+        },
+      });
+
+      expect(exitCode).toBe(1);
+      expect(spawnedChildren).toHaveLength(1);
+      expect(spawnedChildren[0]?.signalCode).toBe("SIGTERM");
+      const failures = JSON.parse(await fs.readFile(
+        path.join(instanceRoot, "service-early-failures.json"),
+        "utf8",
+      )) as { timestamps: number[] };
+      const status = JSON.parse(await fs.readFile(
+        path.join(instanceRoot, "service-supervisor-status.json"),
+        "utf8",
+      )) as { state: string; reason: string; message: string; earlyFailureCount: number };
+      expect(failures.timestamps).toHaveLength(1);
+      expect(status).toMatchObject({
+        state: "exited",
+        reason: "output_error",
+        earlyFailureCount: 1,
+      });
+      expect(status.message).toContain("could not stream the child service logs");
+    },
+  );
 });
 
 describe("launchd service log rotation", () => {

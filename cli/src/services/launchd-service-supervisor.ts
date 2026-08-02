@@ -35,6 +35,15 @@ type LaunchdServiceSupervisorOptions = {
   freeDiskBytes?: (instanceRoot: string) => Promise<number>;
 };
 
+type SupervisorFailureReason = "spawn_error" | "output_error" | "supervisor_error";
+
+class LaunchdSupervisorError extends Error {
+  constructor(readonly reason: SupervisorFailureReason, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "LaunchdSupervisorError";
+  }
+}
+
 function isMissingFileError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -212,6 +221,69 @@ async function defaultFreeDiskBytes(instanceRoot: string): Promise<number> {
   return freeBytes > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(freeBytes);
 }
 
+async function recordLaunchdSupervisorFailure(input: {
+  instanceId: string;
+  failurePath: string;
+  statusPath: string;
+  failures: number[];
+  finishedAt: number;
+  reason: SupervisorFailureReason;
+  error: unknown;
+  childPid?: number | null;
+}): Promise<number> {
+  const nextFailures = [
+    ...recentLaunchdEarlyFailures(input.failures, input.finishedAt),
+    input.finishedAt,
+  ];
+  const crashLoopCapped = nextFailures.length >= LAUNCHD_MAX_EARLY_FAILURES;
+  const detail = input.error instanceof Error ? input.error.message : String(input.error);
+  const failureKind = input.reason === "spawn_error"
+    ? "could not start the child service"
+    : input.reason === "output_error"
+      ? "could not stream the child service logs"
+      : "encountered an internal supervisor error";
+  const message = crashLoopCapped
+    ? `Paperclip startup paused after ${nextFailures.length} early failures within ${LAUNCHD_EARLY_EXIT_WINDOW_MS / 1000} seconds. Last failure: ${failureKind}: ${detail}. Run 'paperclipai service start --instance ${input.instanceId}' after correcting the cause.`
+    : `Paperclip launchd supervisor ${failureKind}: ${detail}.`;
+
+  await writeJsonAtomically(input.failurePath, { timestamps: nextFailures });
+  await writeJsonAtomically(input.statusPath, {
+    state: crashLoopCapped ? "blocked" : "exited",
+    reason: crashLoopCapped ? "crash_loop" : input.reason,
+    message,
+    updatedAt: new Date(input.finishedAt).toISOString(),
+    childPid: input.childPid ?? null,
+    earlyFailureCount: nextFailures.length,
+  } satisfies SupervisorStatus);
+
+  return crashLoopCapped ? 0 : 1;
+}
+
+function waitForTimeout(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, milliseconds);
+    timeout.unref();
+  });
+}
+
+async function stopChildAfterSupervisorFailure(
+  child: ChildProcess,
+  childExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  const stopped = await Promise.race([
+    childExit.then(() => true, () => true),
+    waitForTimeout(5_000).then(() => false),
+  ]);
+  if (stopped || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGKILL");
+  await Promise.race([
+    childExit.then(() => undefined, () => undefined),
+    waitForTimeout(5_000),
+  ]);
+}
+
 export async function clearLaunchdServiceSafetyState(instanceRoot: string): Promise<void> {
   await Promise.all([
     fs.rm(path.join(instanceRoot, "service-early-failures.json"), { force: true }),
@@ -233,109 +305,162 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
     stdio: ["ignore", "pipe", "pipe"],
   }));
 
-  await fs.mkdir(logDirectory, { recursive: true, mode: 0o700 });
   const startedAt = now();
-  const failures = recentLaunchdEarlyFailures(await readFailureTimestamps(failurePath), startedAt);
-  const availableBytes = await freeDiskBytes(instanceRoot);
-  const blocked = launchdStartupBlockReason({ freeDiskBytes: availableBytes, failureTimestamps: failures, now: startedAt });
+  let failures: number[] = [];
+  let child: (ChildProcess & { stdout: Readable; stderr: Readable }) | null = null;
+  let childExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null;
+  let stopping = false;
+  let onSigterm: (() => void) | null = null;
+  let onSigint: (() => void) | null = null;
+  try {
+    await fs.mkdir(logDirectory, { recursive: true, mode: 0o700 });
+    failures = recentLaunchdEarlyFailures(await readFailureTimestamps(failurePath), startedAt);
+    const availableBytes = await freeDiskBytes(instanceRoot);
+    const blocked = launchdStartupBlockReason({ freeDiskBytes: availableBytes, failureTimestamps: failures, now: startedAt });
 
-  if (blocked) {
-    const lowDisk = blocked.reason === "low_disk";
-    const message = lowDisk
-      ? `Paperclip startup refused: ${availableBytes} bytes free; at least ${LAUNCHD_MIN_FREE_DISK_BYTES} bytes are required.`
-      : `Paperclip startup paused after ${blocked.failures.length} early failures within ${LAUNCHD_EARLY_EXIT_WINDOW_MS / 1000} seconds. Run 'paperclipai service start --instance ${options.instanceId}' after correcting the cause.`;
+    if (blocked) {
+      const lowDisk = blocked.reason === "low_disk";
+      const message = lowDisk
+        ? `Paperclip startup refused: ${availableBytes} bytes free; at least ${LAUNCHD_MIN_FREE_DISK_BYTES} bytes are required.`
+        : `Paperclip startup paused after ${blocked.failures.length} early failures within ${LAUNCHD_EARLY_EXIT_WINDOW_MS / 1000} seconds. Run 'paperclipai service start --instance ${options.instanceId}' after correcting the cause.`;
+      await writeJsonAtomically(statusPath, {
+        state: "blocked",
+        reason: blocked.reason,
+        message,
+        updatedAt: new Date(startedAt).toISOString(),
+        freeDiskBytes: availableBytes,
+        earlyFailureCount: blocked.failures.length,
+      } satisfies SupervisorStatus);
+      return 0;
+    }
+
+    await writeJsonAtomically(failurePath, { timestamps: failures });
     await writeJsonAtomically(statusPath, {
-      state: "blocked",
-      reason: blocked.reason,
-      message,
+      state: "starting",
+      reason: "preflight_passed",
+      message: "Paperclip launchd supervisor preflight passed; starting the service.",
       updatedAt: new Date(startedAt).toISOString(),
       freeDiskBytes: availableBytes,
-      earlyFailureCount: blocked.failures.length,
+      earlyFailureCount: failures.length,
     } satisfies SupervisorStatus);
-    process.stderr.write(`${message}\n`);
-    return 0;
-  }
 
-  await writeJsonAtomically(failurePath, { timestamps: failures });
-  await writeJsonAtomically(statusPath, {
-    state: "starting",
-    reason: "preflight_passed",
-    message: "Paperclip launchd supervisor preflight passed; starting the service.",
-    updatedAt: new Date(startedAt).toISOString(),
-    freeDiskBytes: availableBytes,
-    earlyFailureCount: failures.length,
-  } satisfies SupervisorStatus);
+    try {
+      child = spawnChild(options.shimPath, ["run", "--instance", options.instanceId], {
+        ...process.env,
+        PAPERCLIP_SERVICE_MANAGED: "1",
+        PAPERCLIP_INSTANCE_ID: options.instanceId,
+        PAPERCLIP_HOME: options.homeDir,
+      });
+    } catch (error) {
+      throw new LaunchdSupervisorError("spawn_error", error);
+    }
 
-  const child = spawnChild(options.shimPath, ["run", "--instance", options.instanceId], {
-    ...process.env,
-    PAPERCLIP_SERVICE_MANAGED: "1",
-    PAPERCLIP_INSTANCE_ID: options.instanceId,
-    PAPERCLIP_HOME: options.homeDir,
-  });
-  const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal }));
-  });
-  const stdoutWriter = new RotatingLogWriter(stdoutPath);
-  const stderrWriter = new RotatingLogWriter(stderrPath);
-  const outputPipelines = [
-    pipeline(child.stdout, stdoutWriter),
-    pipeline(child.stderr, stderrWriter),
-  ];
+    childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child?.once("error", reject);
+      child?.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    const childOutcome = childExit.then(
+      (value) => ({ kind: "exit" as const, value }),
+      (error: unknown) => ({ kind: "spawn_error" as const, error }),
+    );
+    const outputOutcome = Promise.all([
+      pipeline(child.stdout, new RotatingLogWriter(stdoutPath)),
+      pipeline(child.stderr, new RotatingLogWriter(stderrPath)),
+    ]).then(
+      () => ({ kind: "output_complete" as const }),
+      (error: unknown) => ({ kind: "output_error" as const, error }),
+    );
 
-  await writeJsonAtomically(statusPath, {
-    state: "running",
-    reason: "child_started",
-    message: "Paperclip service is running under the launchd supervisor.",
-    updatedAt: new Date(now()).toISOString(),
-    childPid: child.pid ?? null,
-    freeDiskBytes: availableBytes,
-    earlyFailureCount: failures.length,
-  } satisfies SupervisorStatus);
+    await writeJsonAtomically(statusPath, {
+      state: "running",
+      reason: "child_started",
+      message: "Paperclip service is running under the launchd supervisor.",
+      updatedAt: new Date(now()).toISOString(),
+      childPid: child.pid ?? null,
+      freeDiskBytes: availableBytes,
+      earlyFailureCount: failures.length,
+    } satisfies SupervisorStatus);
 
-  let stopping = false;
-  const forwardSignal = (signal: NodeJS.Signals) => {
-    stopping = true;
-    child.kill(signal);
-  };
-  const onSigterm = () => forwardSignal("SIGTERM");
-  const onSigint = () => forwardSignal("SIGINT");
-  process.once("SIGTERM", onSigterm);
-  process.once("SIGINT", onSigint);
+    const forwardSignal = (signal: NodeJS.Signals) => {
+      stopping = true;
+      child?.kill(signal);
+    };
+    onSigterm = () => forwardSignal("SIGTERM");
+    onSigint = () => forwardSignal("SIGINT");
+    process.once("SIGTERM", onSigterm);
+    process.once("SIGINT", onSigint);
 
-  let exitCode: number | null = null;
-  let exitSignal: NodeJS.Signals | null = null;
-  try {
-    ({ code: exitCode, signal: exitSignal } = await childExit);
-    await Promise.all(outputPipelines);
+    const firstOutcome = await Promise.race([childOutcome, outputOutcome]);
+    let exitCode: number | null;
+    let exitSignal: NodeJS.Signals | null;
+    if (firstOutcome.kind === "output_error") {
+      await stopChildAfterSupervisorFailure(child, childExit);
+      throw new LaunchdSupervisorError("output_error", firstOutcome.error);
+    }
+    if (firstOutcome.kind === "spawn_error") {
+      throw new LaunchdSupervisorError("spawn_error", firstOutcome.error);
+    }
+    if (firstOutcome.kind === "output_complete") {
+      const outcome = await childOutcome;
+      if (outcome.kind === "spawn_error") throw new LaunchdSupervisorError("spawn_error", outcome.error);
+      ({ code: exitCode, signal: exitSignal } = outcome.value);
+    } else {
+      ({ code: exitCode, signal: exitSignal } = firstOutcome.value);
+      const outcome = await outputOutcome;
+      if (outcome.kind === "output_error") throw new LaunchdSupervisorError("output_error", outcome.error);
+    }
+
+    const finishedAt = now();
+    const exitedEarly = !stopping && finishedAt - startedAt < LAUNCHD_EARLY_EXIT_WINDOW_MS;
+    const nextFailures = exitedEarly
+      ? [...recentLaunchdEarlyFailures(failures, finishedAt), finishedAt]
+      : [];
+    await writeJsonAtomically(failurePath, { timestamps: nextFailures });
+
+    const crashLoopCapped = nextFailures.length >= LAUNCHD_MAX_EARLY_FAILURES;
+    const message = crashLoopCapped
+      ? `Paperclip startup paused after ${nextFailures.length} early failures within ${LAUNCHD_EARLY_EXIT_WINDOW_MS / 1000} seconds. Run 'paperclipai service start --instance ${options.instanceId}' after correcting the cause.`
+      : `Paperclip service exited${exitCode === null ? "" : ` with code ${exitCode}`}${exitSignal ? ` from ${exitSignal}` : ""}.`;
+    await writeJsonAtomically(statusPath, {
+      state: crashLoopCapped ? "blocked" : "exited",
+      reason: crashLoopCapped ? "crash_loop" : stopping ? "operator_stop" : exitedEarly ? "early_exit" : "child_exit",
+      message,
+      updatedAt: new Date(finishedAt).toISOString(),
+      childPid: child.pid ?? null,
+      exitCode,
+      signal: exitSignal,
+      earlyFailureCount: nextFailures.length,
+    } satisfies SupervisorStatus);
+
+    if (crashLoopCapped) return 0;
+    if (stopping) return 1;
+    return exitCode && exitCode > 0 ? exitCode : 1;
+  } catch (error) {
+    if (stopping) return 1;
+    if (child && childExit && child.exitCode === null && child.signalCode === null) {
+      await stopChildAfterSupervisorFailure(child, childExit);
+    }
+    const supervisorError = error instanceof LaunchdSupervisorError
+      ? error
+      : new LaunchdSupervisorError("supervisor_error", error);
+    try {
+      return await recordLaunchdSupervisorFailure({
+        instanceId: options.instanceId,
+        failurePath,
+        statusPath,
+        failures,
+        finishedAt: now(),
+        reason: supervisorError.reason,
+        error: supervisorError,
+        childPid: child?.pid ?? null,
+      });
+    } catch {
+      // If safety-state persistence itself is unavailable, fail closed so launchd
+      // does not retry forever and amplify the underlying disk/filesystem fault.
+      return 0;
+    }
   } finally {
-    process.off("SIGTERM", onSigterm);
-    process.off("SIGINT", onSigint);
+    if (onSigterm) process.off("SIGTERM", onSigterm);
+    if (onSigint) process.off("SIGINT", onSigint);
   }
-
-  const finishedAt = now();
-  const exitedEarly = !stopping && finishedAt - startedAt < LAUNCHD_EARLY_EXIT_WINDOW_MS;
-  const nextFailures = exitedEarly
-    ? [...recentLaunchdEarlyFailures(failures, finishedAt), finishedAt]
-    : [];
-  await writeJsonAtomically(failurePath, { timestamps: nextFailures });
-
-  const crashLoopCapped = nextFailures.length >= LAUNCHD_MAX_EARLY_FAILURES;
-  const message = crashLoopCapped
-    ? `Paperclip startup paused after ${nextFailures.length} early failures within ${LAUNCHD_EARLY_EXIT_WINDOW_MS / 1000} seconds. Run 'paperclipai service start --instance ${options.instanceId}' after correcting the cause.`
-    : `Paperclip service exited${exitCode === null ? "" : ` with code ${exitCode}`}${exitSignal ? ` from ${exitSignal}` : ""}.`;
-  await writeJsonAtomically(statusPath, {
-    state: crashLoopCapped ? "blocked" : "exited",
-    reason: crashLoopCapped ? "crash_loop" : stopping ? "operator_stop" : exitedEarly ? "early_exit" : "child_exit",
-    message,
-    updatedAt: new Date(finishedAt).toISOString(),
-    childPid: child.pid ?? null,
-    exitCode,
-    signal: exitSignal,
-    earlyFailureCount: nextFailures.length,
-  } satisfies SupervisorStatus);
-
-  if (crashLoopCapped) return 0;
-  if (stopping) return 1;
-  return exitCode && exitCode > 0 ? exitCode : 1;
 }

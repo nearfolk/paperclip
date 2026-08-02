@@ -61,14 +61,14 @@ describe("service definition generation", () => {
       instanceId: "team-a",
       shimPath: "/Users/alice/.local/bin/paperclipai",
       homeDir: "/Users/alice/.paperclip",
-      supervisorStdoutPath: "/Users/alice/.paperclip/instances/team-a/logs/service-supervisor.log",
-      supervisorStderrPath: "/Users/alice/.paperclip/instances/team-a/logs/service-supervisor.err.log",
     });
     expect(plist).toContain("ing.paperclip.paperclipai.team-a");
     expect(plist).toContain("<key>RunAtLoad</key><true/>");
     expect(plist).toContain("<string>_service-run</string>");
     expect(plist).toContain("<key>SuccessfulExit</key><false/>");
-    expect(plist).toContain("service-supervisor.err.log");
+    expect(plist).toContain("<key>StandardOutPath</key><string>/dev/null</string>");
+    expect(plist).toContain("<key>StandardErrorPath</key><string>/dev/null</string>");
+    expect(plist).not.toContain("service-supervisor.err.log");
   });
 });
 
