@@ -272,6 +272,10 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
     PAPERCLIP_INSTANCE_ID: options.instanceId,
     PAPERCLIP_HOME: options.homeDir,
   });
+  const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
   const stdoutWriter = new RotatingLogWriter(stdoutPath);
   const stderrWriter = new RotatingLogWriter(stderrPath);
   const outputPipelines = [
@@ -302,10 +306,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   try {
-    ({ code: exitCode, signal: exitSignal } = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (code, signal) => resolve({ code, signal }));
-    }));
+    ({ code: exitCode, signal: exitSignal } = await childExit);
     await Promise.all(outputPipelines);
   } finally {
     process.off("SIGTERM", onSigterm);
