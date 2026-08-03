@@ -515,6 +515,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
     A.execSandboxMs,
     A.execNetworkMs,
     A.execCriticalPath,
+    A.execCacheHit,
     A.outcome,
   ]);
 
@@ -596,6 +597,50 @@ describe("resolveEnvironmentExecutionTarget", () => {
     // The wall time is a real, finite, non-negative number.
     expect(typeof span.attributes[A.execWallMs]).toBe("number");
     expect(span.attributes[A.execWallMs] as number).toBeGreaterThanOrEqual(0);
+  });
+
+  it("carries the explicit exec cache_hit from result.metadata.cacheHit", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "ok",
+        stderr: "",
+        metadata: { durationMs: 600, getDurationMs: 0, cacheHit: true },
+      },
+      tracer,
+    });
+
+    await runner.execute({ command: "echo", args: ["a"] });
+
+    const span = spans[0]!;
+    // The flag comes from the metadata boolean, not from a zero handle-fetch.
+    expect(span.attributes[A.execCacheHit]).toBe(true);
+  });
+
+  it("omits exec cache_hit when the provider reports no cacheHit metadata", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "ok",
+        stderr: "",
+        metadata: { durationMs: 600, getDurationMs: 15 },
+      },
+      tracer,
+    });
+
+    await runner.execute({ command: "echo", args: ["a"] });
+
+    const span = spans[0]!;
+    // A provider that omits the boolean yields no attribute — never `false`.
+    expect(span.attributes).not.toHaveProperty(A.execCacheHit);
   });
 
   it("omits each duration attribute when a provider returns no timing (does not throw, keeps provider)", async () => {

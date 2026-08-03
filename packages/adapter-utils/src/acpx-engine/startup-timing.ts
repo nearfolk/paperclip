@@ -86,6 +86,8 @@ export const SANDBOX_STARTUP_SPAN_ATTRS = {
   execNetworkMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}exec.network_ms`,
   /** Whether one execution sits on the startup critical path. */
   execCriticalPath: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}exec.critical_path`,
+  /** Whether the provider served the sandbox handle from its warm cache. */
+  execCacheHit: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}exec.cache_hit`,
   /** The root-span wall time of the whole bring-up. */
   rootWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}root.wall_ms`,
   /** The sum of the step wall times of the whole bring-up. */
@@ -108,6 +110,12 @@ export const SANDBOX_STARTUP_SPAN_ATTRS = {
   handshakeEnsureSessionWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}handshake.ensure_session.wall_ms`,
   /** A shared low-cardinality tag that marks two steps as one parallel batch. */
   batch: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}batch`,
+  /** The host-local wall time of the pack step (build the tarball). */
+  packWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}pack.wall_ms`,
+  /** The wall time of the transfer step (upload the files to the sandbox). */
+  transferWallMs: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.wall_ms`,
+  /** The number of serial guard round trips before one transfer. */
+  transferGuardCount: `${SANDBOX_STARTUP_SPAN_ATTR_PREFIX}transfer.guard.count`,
 } as const;
 
 /** The closed value set for the `outcome` attribute. */

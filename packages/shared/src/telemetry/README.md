@@ -159,10 +159,72 @@ numeric attribute when the provider does not report the value.
 | `paperclip.sandbox.startup.exec.sandbox_ms` | number | yes | The in-sandbox run time of the execution. |
 | `paperclip.sandbox.startup.exec.network_ms` | number | yes | The transport time the host adds; `wall_ms − wait_before_ms − sandbox_ms`. |
 | `paperclip.sandbox.startup.exec.critical_path` | boolean | no | Whether the execution sits on the startup critical path. |
+| `paperclip.sandbox.startup.exec.cache_hit` | boolean | yes | Whether the provider served the sandbox handle from its warm cache. |
 | `paperclip.sandbox.startup.outcome` | string | no | The execution outcome (`ok` or `failed`). |
+
+The plugin decides the cache hit at the sandbox-handle lookup. The span no
+longer infers a cache hit from `wait_before_ms == 0`. Paperclip omits the
+`cache_hit` attribute when the provider does not report the value.
 
 To add a span attribute, extend the `SANDBOX_STARTUP_SPAN_ATTRS` allowlist in
 the code first. Keep the attribute low-cardinality and free of user content.
+
+### Provider spans
+
+A sandbox provider plugin also opens spans for its own sync steps. These spans
+use the `sandbox.provider.` name prefix. They share the
+`paperclip.sandbox.startup.` attribute prefix and obey the same opt-in and
+no-user-content rules as the startup spans above.
+
+The plugin worker runs in a separate process from the host. So the host treats
+every field of a worker-sent span as untrusted input. The host re-clamps the
+span name and every attribute at one boundary, the `span.record` host handler,
+before it records the span.
+
+| Span | Scope | Parent |
+| --- | --- | --- |
+| `sandbox.provider.pack` | The host-local pack step that builds the upload tarball. It makes no sandbox round trip. | the active startup step span |
+| `sandbox.provider.transfer` | The transfer step that uploads the files to the sandbox. | the active startup step span |
+| `sandbox.provider.other` | Any span name outside the known set. | the active startup step span |
+
+The host clamps the span name to the closed set `pack` and `transfer`. The host
+maps a known name to `sandbox.provider.<name>`. The host maps any other value to
+`sandbox.provider.other`, so a span name never carries free-form data.
+
+The `sandbox.provider.*` spans use this closed attribute allowlist. The host
+drops every other key, so a command, an argument, a path, an id, a standard
+output, or a standard error never rides a provider span. The host records only
+the attributes that the producer sends for one span.
+
+| Attribute | Type | Optional | Meaning |
+| --- | --- | --- | --- |
+| `paperclip.sandbox.startup.provider` | string | no | The normalized provider family. |
+| `paperclip.sandbox.startup.outcome` | string | yes | The step outcome (`ok`, `skipped`, or `failed`). |
+| `paperclip.sandbox.startup.pack.wall_ms` | number | yes | The host-local wall time of the pack step. It rides the `sandbox.provider.pack` span. |
+| `paperclip.sandbox.startup.transfer.wall_ms` | number | yes | The wall time of the transfer step. It rides the `sandbox.provider.transfer` span. |
+| `paperclip.sandbox.startup.transfer.guard.count` | number | yes | The number of serial guard round trips before one transfer. It rides the `sandbox.provider.transfer` span. |
+
+The `span.record` host handler enforces the allowlist. It re-maps `provider`
+through the provider-family normalizer. It keeps `outcome` only when the value
+is `ok`, `skipped`, or `failed`. It keeps a numeric attribute only when the
+value is a finite number. It drops a status message and keeps only the numeric
+status code. The handler never throws, because observability must not change the
+sync control flow.
+
+The `span.record` host method needs the `environment.drivers.register`
+capability. So only a plugin that registers an environment driver may emit a
+provider span. The capability gate rejects a provider span from any other
+plugin.
+
+The host parents each provider span to the active startup step span. The host
+mints a W3C `traceparent` from the active step and passes it to the plugin
+worker on the per-call invocation channel. The worker tags its span with the
+`traceparent` and treats the value as opaque. The worker never derives the
+parent from it. The host recovers the `traceparent` from its own invocation
+record, so a worker can never forge a parent. The host validates the
+`traceparent` and rejects a missing or malformed value. With no active host
+trace context the worker sends no span, so the whole provider-span path is a
+no-op.
 
 ## Dimension Values
 

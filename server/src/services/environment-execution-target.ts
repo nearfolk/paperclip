@@ -62,6 +62,13 @@ function toFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Read a free-form metadata value as a boolean, or `undefined`. The provider
+ * cache-hit flag rides the exec result's untyped `metadata`, so a provider that
+ * omits or mistypes it yields no attribute — never a misleading `false`. */
+function toBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 /**
  * The closed input for one `sandbox.exec` span. The seam builds it from the
  * exec result and the active step context. Every field is already bounded or
@@ -82,6 +89,8 @@ interface SandboxExecSpanInput {
   sandboxMs: number | undefined;
   /** Whether the execution sits on the startup critical path. */
   criticalPath: boolean;
+  /** Whether the provider served the sandbox handle from its warm cache. */
+  cacheHit: boolean | undefined;
 }
 
 /**
@@ -111,6 +120,13 @@ function setSandboxExecSpanAttributes(span: ExecSpan, input: SandboxExecSpanInpu
     setFiniteNumberAttr(span, A.execNetworkMs, input.wallMs - input.waitBeforeMs - input.sandboxMs);
   }
   span.setAttribute(A.execCriticalPath, input.criticalPath);
+  // The explicit provider cache-hit flag, from `result.metadata.cacheHit`. The
+  // plugin decides it at the handle lookup, so the span no longer infers a
+  // cache hit from `wait_before_ms == 0`. A provider that omits it yields no
+  // attribute.
+  if (typeof input.cacheHit === "boolean") {
+    span.setAttribute(A.execCacheHit, input.cacheHit);
+  }
   const failed = input.exitCode !== 0;
   span.setAttribute(
     A.outcome,
@@ -325,6 +341,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
                       waitBeforeMs: toFiniteNumber(result.metadata?.getDurationMs),
                       sandboxMs: toFiniteNumber(result.metadata?.durationMs),
                       criticalPath,
+                      cacheHit: toBoolean(result.metadata?.cacheHit),
                     });
                   } catch {
                     // Observability must not change execution control flow.
