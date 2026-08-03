@@ -104,6 +104,35 @@ describe("launchd startup safeguards", () => {
     });
   });
 
+  it("does not wait indefinitely when a descendant retains an output descriptor", async () => {
+    const homeDir = await temporaryDirectory();
+    const childScript = [
+      'const { spawn } = require("node:child_process");',
+      'spawn(process.execPath, ["-e", "setTimeout(() => undefined, 250)"], {',
+      '  stdio: ["ignore", "inherit", "inherit"],',
+      '});',
+      'process.exit(1);',
+    ].join("\n");
+
+    const exitCode = await runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: process.execPath,
+      outputDrainTimeoutMs: 20,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => spawn(process.execPath, ["-e", childScript], {
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    });
+
+    expect(exitCode).toBe(1);
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; exitCode: number };
+    expect(status).toMatchObject({ state: "exited", reason: "early_exit", exitCode: 1 });
+  });
+
   it("persists an asynchronous child spawn error as an early failure", async () => {
     const homeDir = await temporaryDirectory();
 

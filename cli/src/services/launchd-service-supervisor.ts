@@ -10,6 +10,7 @@ export const LAUNCHD_LOG_GENERATIONS = 3;
 export const LAUNCHD_MIN_FREE_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 export const LAUNCHD_EARLY_EXIT_WINDOW_MS = 60_000;
 export const LAUNCHD_MAX_EARLY_FAILURES = 5;
+export const LAUNCHD_OUTPUT_DRAIN_TIMEOUT_MS = 1_000;
 
 type SupervisorStatus = {
   state: "starting" | "running" | "exited" | "blocked";
@@ -33,6 +34,7 @@ type LaunchdServiceSupervisorOptions = {
     stderr: Readable;
   };
   freeDiskBytes?: (instanceRoot: string) => Promise<number>;
+  outputDrainTimeoutMs?: number;
 };
 
 type SupervisorFailureReason = "spawn_error" | "output_error" | "supervisor_error";
@@ -300,6 +302,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
   const failurePath = path.join(instanceRoot, "service-early-failures.json");
   const statusPath = path.join(instanceRoot, "service-supervisor-status.json");
   const freeDiskBytes = options.freeDiskBytes ?? defaultFreeDiskBytes;
+  const outputDrainTimeoutMs = options.outputDrainTimeoutMs ?? LAUNCHD_OUTPUT_DRAIN_TIMEOUT_MS;
   const spawnChild = options.spawnChild ?? ((command, args, env) => spawn(command, args, {
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -406,8 +409,15 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
       ({ code: exitCode, signal: exitSignal } = outcome.value);
     } else {
       ({ code: exitCode, signal: exitSignal } = firstOutcome.value);
-      const outcome = await outputOutcome;
+      const outcome = await Promise.race([
+        outputOutcome,
+        waitForTimeout(outputDrainTimeoutMs).then(() => ({ kind: "output_timeout" as const })),
+      ]);
       if (outcome.kind === "output_error") throw new LaunchdSupervisorError("output_error", outcome.error);
+      if (outcome.kind === "output_timeout") {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
     }
 
     const finishedAt = now();
