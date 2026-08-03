@@ -70,6 +70,12 @@ import {
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext } from "../instrumentation.js";
 import { logger } from "../middleware/logger.js";
+import {
+  createGitRemoteAuthProvider,
+  describeGitAuthFailure,
+  scrubGitCredentialText,
+  type GitRemoteAuthProvider,
+} from "./git-credentials.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -1489,10 +1495,12 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   }
 }
 
-async function ensureManagedProjectWorkspace(input: {
+export async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
   repoUrl: string | null;
+  /** Optional git credential source for cloning private repos; null/absent preserves ambient behavior. */
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
   const cwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
@@ -1528,15 +1536,34 @@ async function ensureManagedProjectWorkspace(input: {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 
+  const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
   try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
+    await execFile("git", [...(auth?.configArgs ?? []), "clone", input.repoUrl, cwd], {
+      env: {
+        // Spread order matters: the sanitizer strips PAPERCLIP_*, which would remove the
+        // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a
+        // credential-less private clone immediately instead of hanging on a prompt until
+        // the clone timeout.
+        ...sanitizeRuntimeServiceBaseEnv(process.env),
+        GIT_TERMINAL_PROMPT: "0",
+        ...(auth?.env ?? {}),
+      },
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });
     return { cwd, warning: null };
   } catch (error) {
+    // The clone only ever starts from a missing or just-emptied directory, so removing it on
+    // failure cannot destroy operator data — but leaving it would poison the next run: a
+    // timeout-killed clone leaves a partial .git that the gitDirExists probe above adopts.
+    await fs.rm(cwd, { recursive: true, force: true }).catch(() => undefined);
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+    const authNote = describeGitAuthFailure({
+      error: reason,
+      used: auth ? { source: auth.source, secretName: auth.secretName } : null,
+    });
+    throw new Error(scrubGitCredentialText(
+      `Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}${authNote ? ` ${authNote}` : ""}`,
+    ));
   }
 }
 
@@ -1551,6 +1578,7 @@ async function resolveConfiguredOrManagedProjectCwd(input: {
   projectId: string;
   cwd: string | null;
   repoUrl: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
   const configuredCwd = readNonEmptyString(input.cwd);
   if (configuredCwd && configuredCwd !== REPO_ONLY_CWD_SENTINEL) {
@@ -1560,6 +1588,7 @@ async function resolveConfiguredOrManagedProjectCwd(input: {
     companyId: input.companyId,
     projectId: input.projectId,
     repoUrl: readNonEmptyString(input.repoUrl),
+    resolveGitAuth: input.resolveGitAuth ?? null,
   });
 }
 
@@ -1587,8 +1616,16 @@ function defaultAdditionalProjectWorkspaceDeps(db: Db): ResolveAdditionalProject
         .from(projectWorkspaces)
         .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId)))
         .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id)),
-    resolveConfiguredOrManagedProjectCwd,
-    ensureManagedProjectWorkspace,
+    resolveConfiguredOrManagedProjectCwd: (input) =>
+      resolveConfiguredOrManagedProjectCwd({
+        ...input,
+        resolveGitAuth: input.resolveGitAuth ?? createGitRemoteAuthProvider(db, input.companyId),
+      }),
+    ensureManagedProjectWorkspace: (input) =>
+      ensureManagedProjectWorkspace({
+        ...input,
+        resolveGitAuth: input.resolveGitAuth ?? createGitRemoteAuthProvider(db, input.companyId),
+      }),
     // A realized workspace must hold real content. An empty directory gives the agent an empty
     // referenced workspace, so treat an empty directory the same as a missing one.
     directoryHasContents: async (cwd) => {
@@ -1804,6 +1841,15 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     executionWorkspacePreference?: string | null;
   } | null;
   base: ExecutionWorkspaceInput;
+  /**
+   * Anchor-resolution facts that `base` alone cannot express: whether the base cwd is the
+   * agent-home fallback despite the project having workspaces, and which materialization
+   * attempts failed on the way there. Absent means "not a fallback" (legacy callers).
+   */
+  anchor?: {
+    baseCwdFallback?: boolean;
+    materializationFailures?: WorkspaceMaterializationFailure[];
+  } | null;
 }) {
   if (!input.issue) return;
   if (
@@ -1849,10 +1895,38 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     );
   }
 
+  // Checked before isGitCheckout: when materialization failed and the base cwd is the
+  // agent-home fallback, a git checkout at that path would be an unrelated repository —
+  // proceeding would build worktrees off the wrong repo, and failing on the checkout probe
+  // would mask the real cause (for example a clone that could not authenticate). The reason
+  // is reserved for genuine materialization failures; a fallback with no failed attempt
+  // (a configured path that is simply unavailable) keeps its accurate reporting below.
+  const materializationFailures = input.anchor?.materializationFailures ?? [];
+  if (input.anchor?.baseCwdFallback && materializationFailures.length > 0) {
+    const failureDetail = `: ${materializationFailures[0].error.replace(/\s+/g, " ")}`;
+    fail(
+      "git_worktree_base_materialization_failed",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the project workspace checkout could not be prepared${failureDetail}. Repair the project workspace repository URL, clone access, or configured local cwd, then retry.`,
+      { baseCwdFallback: true, materializationFailures },
+    );
+  }
+
   if (!await isGitCheckout(input.base.baseCwd)) {
     fail(
       "git_worktree_base_not_git_checkout",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+    );
+  }
+
+  // A fallback cwd that happens to be a git checkout is still not the configured project
+  // workspace — building worktrees there would target an unrelated repository. No
+  // materialization attempt failed here (that case failed above); the configured path is
+  // simply unavailable, so the message points at the path rather than clone access.
+  if (input.anchor?.baseCwdFallback) {
+    fail(
+      "git_worktree_base_fallback_not_project_workspace",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the configured project workspace path is not available and the fallback cwd "${input.base.baseCwd}" is not the project workspace checkout. Make the configured project workspace path available on this host, or repair the project workspace configuration, then retry.`,
+      { baseCwdFallback: true, materializationFailures },
     );
   }
 }
@@ -2389,6 +2463,33 @@ export type ResolvedAdditionalWorkspace = {
   repoRef: string | null;
 };
 
+/**
+ * One project-workspace materialization attempt that failed during anchor resolution — for
+ * example a managed `git clone` that could not authenticate against a private repository.
+ * Carried on {@link ResolvedWorkspaceForRun} so downstream validation can report the real
+ * cause instead of the fallback cwd's symptoms. `repoUrl` and `error` are scrubbed of URL
+ * userinfo credentials before they are stored.
+ */
+export type WorkspaceMaterializationFailure = {
+  projectWorkspaceId: string | null;
+  repoUrl: string | null;
+  error: string;
+};
+
+/**
+ * Mask credential material embedded in URLs so it never reaches warnings, run errors, or
+ * persisted payloads: userinfo on any scheme (`https://user:token@host`,
+ * `ssh://user:pass@host`) and the entire query string of any URL (`?access_token=…` and
+ * every other parameter — masked wholesale rather than by an inevitably incomplete
+ * parameter-name list). Scp-style remotes (`git@host:path`) carry no password and are left
+ * alone.
+ */
+export function scrubGitCredentialText(text: string): string {
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'?]*)\?[^\s"']*/gi, "$1?***");
+}
+
 export type ResolvedWorkspaceForRun = {
   cwd: string;
   source: "project_primary" | "task_session" | "agent_home";
@@ -2403,6 +2504,15 @@ export type ResolvedWorkspaceForRun = {
     repoRef: string | null;
   }>;
   warnings: string[];
+  /**
+   * True when project workspaces exist for the run but none could be used, so `cwd` is the
+   * agent-home fallback rather than a configured or materialized project workspace path. The
+   * `source` stays `project_primary` in that case (session migration depends on it), so this
+   * flag is the only reliable fallback signal.
+   */
+  baseCwdFallback: boolean;
+  /** Failed materialization attempts behind {@link baseCwdFallback}; empty when every candidate resolved or none was attempted. */
+  materializationFailures: WorkspaceMaterializationFailure[];
   /**
    * Read-only referenced (mentioned) project workspaces for this run, one per authorized
    * additional project. The array is empty unless the multi-project workspace-sync flag is on
@@ -2423,6 +2533,47 @@ type ResolvedAnchorWorkspaceForRun = Omit<
   ResolvedWorkspaceForRun,
   "additionalWorkspaces" | "referencedProjectFailures"
 >;
+
+/**
+ * Assemble the run warnings for the agent-home fallback when a project has workspaces but none
+ * produced a usable cwd. Materialization failures (for example a failed managed clone) take
+ * priority over the generic "no local cwd configured" note, which previously masked them.
+ */
+export function buildAnchorFallbackWorkspaceNotes(input: {
+  fallbackCwd: string;
+  preferredWorkspaceWarning: string | null;
+  materializationFailures: WorkspaceMaterializationFailure[];
+  missingProjectCwds: string[];
+  hasConfiguredProjectCwd: boolean;
+}): string[] {
+  const warnings: string[] = [];
+  if (input.preferredWorkspaceWarning) {
+    warnings.push(input.preferredWorkspaceWarning);
+  }
+  if (input.materializationFailures.length > 0) {
+    const first = input.materializationFailures[0];
+    const extraFailureCount = input.materializationFailures.length - 1;
+    warnings.push(
+      extraFailureCount > 0
+        ? `Failed to prepare the project workspace checkout (${first.error}), and ${extraFailureCount} other candidate workspace(s) also failed. Using fallback workspace "${input.fallbackCwd}" for this run.`
+        : `Failed to prepare the project workspace checkout: ${first.error}. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  }
+  if (input.missingProjectCwds.length > 0) {
+    const firstMissing = input.missingProjectCwds[0];
+    const extraMissingCount = Math.max(0, input.missingProjectCwds.length - 1);
+    warnings.push(
+      extraMissingCount > 0
+        ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`
+        : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  } else if (input.materializationFailures.length === 0 && !input.hasConfiguredProjectCwd) {
+    warnings.push(
+      `Project workspace has no local cwd configured. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  }
+  return warnings;
+}
 
 /**
  * Build the plural workspace list that a run exposes to the agent through the
@@ -8298,12 +8449,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? projectWorkspaceRows.find((workspace) => workspace.id === preferredProjectWorkspaceId) ?? null
         : null;
       const missingProjectCwds: string[] = [];
+      const materializationFailures: WorkspaceMaterializationFailure[] = [];
       let hasConfiguredProjectCwd = false;
       let preferredWorkspaceWarning: string | null = null;
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning =
           `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
+      const resolveGitAuth = createGitRemoteAuthProvider(db, agent.companyId, { issueId });
       for (const workspace of projectWorkspaceRows) {
         let projectCwd: string;
         let managedWorkspaceWarning: string | null = null;
@@ -8313,12 +8466,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
             cwd: workspace.cwd,
             repoUrl: workspace.repoUrl,
+            resolveGitAuth,
           });
           projectCwd = resolvedCwd.cwd;
           managedWorkspaceWarning = resolvedCwd.warning;
         } catch (error) {
+          const scrubbedError = scrubGitCredentialText(
+            error instanceof Error ? error.message : String(error),
+          );
+          const workspaceRepoUrl = readNonEmptyString(workspace.repoUrl);
+          materializationFailures.push({
+            projectWorkspaceId: workspace.id,
+            repoUrl: workspaceRepoUrl ? scrubGitCredentialText(workspaceRepoUrl) : null,
+            error: scrubbedError,
+          });
           if (preferredWorkspace?.id === workspace.id) {
-            preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+            preferredWorkspaceWarning = scrubbedError;
           }
           continue;
         }
@@ -8339,6 +8502,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
             ),
+            baseCwdFallback: false,
+            materializationFailures,
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -8350,23 +8515,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (preferredWorkspaceWarning) {
-        warnings.push(preferredWorkspaceWarning);
-      }
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
+      const warnings = buildAnchorFallbackWorkspaceNotes({
+        fallbackCwd,
+        preferredWorkspaceWarning,
+        materializationFailures,
+        missingProjectCwds,
+        hasConfiguredProjectCwd,
+      });
       return {
         cwd: fallbackCwd,
         source: "project_primary" as const,
@@ -8376,6 +8531,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
         workspaceHints,
         warnings,
+        baseCwdFallback: true,
+        materializationFailures,
       };
     }
 
@@ -8394,6 +8551,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoRef: null,
         workspaceHints,
         warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
+        baseCwdFallback: false,
+        materializationFailures: [],
       };
     }
 
@@ -8414,6 +8573,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
           workspaceHints,
           warnings: [],
+          baseCwdFallback: false,
+          materializationFailures: [],
         };
       }
     }
@@ -8447,6 +8608,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoRef: null,
       workspaceHints,
       warnings,
+      baseCwdFallback: false,
+      materializationFailures: [],
     };
   }
 
@@ -13839,6 +14002,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       config: hostExecutionWorkspaceConfig,
       issue: issueRef,
       base: executionWorkspaceBase,
+      anchor: {
+        baseCwdFallback: resolvedWorkspace.baseCwdFallback,
+        materializationFailures: resolvedWorkspace.materializationFailures,
+      },
     });
     const workspaceStrategyForFingerprint = parseObject(hostExecutionWorkspaceConfig.workspaceStrategy);
     const workspaceStrategyFingerprintValue =
@@ -13922,6 +14089,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       issueId,
     });
+    // One credential provider per run: base-ref refreshes during workspace realization and
+    // restore authenticate against private GitHub remotes with the same company-secret token
+    // the managed clone uses.
+    const workspaceGitAuthProvider = createGitRemoteAuthProvider(db, agent.companyId, {
+      issueId,
+      heartbeatRunId: run.id,
+    });
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
@@ -13970,6 +14144,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               enableWorkspaceDirtyQuarantineRepair:
                 resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
               recorder: workspaceOperationRecorder,
+              resolveGitAuth: workspaceGitAuthProvider,
             })
           : null,
         realizeWorkspace: () => realizeExecutionWorkspace({
@@ -13988,6 +14163,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           enableWorkspaceDirtyQuarantineRepair:
             resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
           recorder: workspaceOperationRecorder,
+          resolveGitAuth: workspaceGitAuthProvider,
         }),
       });
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
@@ -15832,9 +16008,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function buildWorkspaceValidationRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    latestRun:
+      | Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">
+      | null
+      | undefined;
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const validationReason = readNonEmptyString(
+      readWorkspaceValidationPayloadFromRun(input.latestRun).reason,
+    );
+    if (validationReason === "git_worktree_base_materialization_failed") {
+      return (
+        "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
+        `(for example the repository clone failed).${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming."
+      );
+    }
     return (
       "Paperclip stopped before launching the local adapter because the issue workspace failed validation. " +
       `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
