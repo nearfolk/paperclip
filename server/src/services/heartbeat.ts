@@ -2476,20 +2476,6 @@ export type WorkspaceMaterializationFailure = {
   error: string;
 };
 
-/**
- * Mask credential material embedded in URLs so it never reaches warnings, run errors, or
- * persisted payloads: userinfo on any scheme (`https://user:token@host`,
- * `ssh://user:pass@host`) and the entire query string of any URL (`?access_token=…` and
- * every other parameter — masked wholesale rather than by an inevitably incomplete
- * parameter-name list). Scp-style remotes (`git@host:path`) carry no password and are left
- * alone.
- */
-export function scrubGitCredentialText(text: string): string {
-  return text
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'?]*)\?[^\s"']*/gi, "$1?***");
-}
-
 export type ResolvedWorkspaceForRun = {
   cwd: string;
   source: "project_primary" | "task_session" | "agent_home";
