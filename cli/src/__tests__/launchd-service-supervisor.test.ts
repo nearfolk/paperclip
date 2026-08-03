@@ -133,6 +133,41 @@ describe("launchd startup safeguards", () => {
     expect(status).toMatchObject({ state: "exited", reason: "early_exit", exitCode: 1 });
   });
 
+  it("installs operator signal handlers before publishing the child pid", async () => {
+    const homeDir = await temporaryDirectory();
+    const listenersBefore = new Set(process.listeners("SIGTERM"));
+    let handlerInstalledAtFirstPidRead: boolean | null = null;
+
+    const exitCode = await runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: process.execPath,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => {
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 50)"], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        const pid = child.pid;
+        Object.defineProperty(child, "pid", {
+          configurable: true,
+          enumerable: true,
+          get: () => {
+            if (handlerInstalledAtFirstPidRead === null) {
+              handlerInstalledAtFirstPidRead = process
+                .listeners("SIGTERM")
+                .some((listener) => !listenersBefore.has(listener));
+            }
+            return pid;
+          },
+        });
+        return child;
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(handlerInstalledAtFirstPidRead).toBe(true);
+  });
+
   it("force-stops a child that ignores an operator restart signal", async () => {
     const homeDir = await temporaryDirectory();
     const listenersBefore = new Set(process.listeners("SIGTERM"));

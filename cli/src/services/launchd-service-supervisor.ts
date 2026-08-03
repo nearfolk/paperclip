@@ -379,16 +379,6 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
       (error: unknown) => ({ kind: "output_error" as const, error }),
     );
 
-    await writeJsonAtomically(statusPath, {
-      state: "running",
-      reason: "child_started",
-      message: "Paperclip service is running under the launchd supervisor.",
-      updatedAt: new Date(now()).toISOString(),
-      childPid: child.pid ?? null,
-      freeDiskBytes: availableBytes,
-      earlyFailureCount: failures.length,
-    } satisfies SupervisorStatus);
-
     const forwardSignal = (signal: NodeJS.Signals) => {
       if (stopping) return;
       stopping = true;
@@ -398,6 +388,16 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
     onSigint = () => forwardSignal("SIGINT");
     process.once("SIGTERM", onSigterm);
     process.once("SIGINT", onSigint);
+
+    await writeJsonAtomically(statusPath, {
+      state: "running",
+      reason: "child_started",
+      message: "Paperclip service is running under the launchd supervisor.",
+      updatedAt: new Date(now()).toISOString(),
+      childPid: child.pid ?? null,
+      freeDiskBytes: availableBytes,
+      earlyFailureCount: failures.length,
+    } satisfies SupervisorStatus);
 
     const firstOutcome = await Promise.race([childOutcome, outputOutcome]);
     let exitCode: number | null;
