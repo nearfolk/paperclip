@@ -35,6 +35,7 @@ import {
   type AcpxEngineExecutorOptions,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
+import { SANDBOX_STARTUP_SPAN_ATTRS } from "./startup-timing.js";
 
 
 const tempRoots: string[] = [];
@@ -278,15 +279,29 @@ function createRecordingStartupTrace() {
   return { traceContext, spans };
 }
 
-// The closed span-attribute allowlist for a sandbox-start span (Phase 2 + 3).
-// A test asserts every recorded attribute key is in this set, so a command,
-// path, id, or error-text key can never ride a span.
-const ALLOWED_STARTUP_SPAN_ATTRIBUTE_KEYS = new Set([
-  "step",
-  "provider",
-  "roundTrips",
-  "providerExecMs",
-  "providerGetMs",
+// The closed span-attribute allowlist for a sandbox-start span. A test asserts
+// every recorded attribute key is in this set, so a command, path, id, or
+// error-text key can never ride a span. Every key uses the closed
+// `paperclip.sandbox.startup.` prefix from the attribute contract.
+const A = SANDBOX_STARTUP_SPAN_ATTRS;
+const ALLOWED_STARTUP_SPAN_ATTRIBUTE_KEYS = new Set<string>([
+  // Step-span keys.
+  A.provider,
+  A.stepWallMs,
+  A.outcome,
+  // Root-span keys.
+  A.rootWallMs,
+  A.rootWorkMs,
+  A.rootDiffMs,
+  A.coldStart,
+  A.region,
+  A.imageId,
+  A.sandboxId,
+  A.leaseId,
+  // Handshake sub-times and the parallel-batch tag.
+  A.handshakeCreateRuntimeWallMs,
+  A.handshakeEnsureSessionWallMs,
+  A.batch,
 ]);
 
 describe("shared ACPX engine runtime behavior", () => {
@@ -3233,6 +3248,91 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     }
   });
 
+  it("records root wall / work / diff times and the bounded context on the root span", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    // A plugin-backed target with a lease id. The provider clamps to `plugin`
+    // and the lease id rides only as a hash.
+    const executionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "fake-plugin",
+      leaseId: "lease-super-secret-internal-id",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+    };
+    const { traceContext, spans } = createRecordingStartupTrace();
+
+    await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      { authToken: "real-run-jwt", executionTarget, startupTraceContext: traceContext },
+    );
+
+    const rootSpan = spans.find((span) => span.name === "sandbox.startup" && span.parent === null);
+    expect(rootSpan).toBeTruthy();
+    // The three timing numbers are present, finite, and non-negative.
+    for (const key of [A.rootWallMs, A.rootWorkMs, A.rootDiffMs]) {
+      expect(typeof rootSpan!.attributes[key], `attribute ${key}`).toBe("number");
+      expect(Number.isFinite(rootSpan!.attributes[key] as number)).toBe(true);
+    }
+    expect(rootSpan!.attributes[A.rootWorkMs] as number).toBeGreaterThanOrEqual(0);
+    // A cold start (no warm handle) and the clamped provider family.
+    expect(rootSpan!.attributes[A.coldStart]).toBe(true);
+    expect(rootSpan!.attributes[A.provider]).toBe("plugin");
+    // The lease id rides only as a non-reversible hash, never the raw value.
+    expect(rootSpan!.attributes[A.leaseId]).toMatch(/^[0-9a-f]{12}$/);
+    expect(String(rootSpan!.attributes[A.leaseId])).not.toContain("secret");
+    // The absent region, image id, and sandbox id set no attribute (fail open).
+    expect(rootSpan!.attributes).not.toHaveProperty(A.region);
+    expect(rootSpan!.attributes).not.toHaveProperty(A.imageId);
+    expect(rootSpan!.attributes).not.toHaveProperty(A.sandboxId);
+  });
+
+  it("excludes the nested skills.reconcile wall time from the root work sum (no double count)", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const codexHome = path.join(root, "codex-home");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(codexHome, { recursive: true });
+    const executionTarget = await remoteSandboxTarget(root);
+    const { traceContext, spans } = createRecordingStartupTrace();
+
+    // A codex bring-up runs the codex-home.seed step, which nests skills.reconcile.
+    const { events } = await runExecutor(
+      {
+        agent: "codex",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd: localCwd,
+        env: { CODEX_HOME: codexHome },
+      },
+      { authToken: "real-run-jwt", executionTarget, startupTraceContext: traceContext },
+    );
+
+    const stepEvents = events.filter((event) => event.eventType === "run.startup.step");
+    // The nested skills.reconcile step still emits its own boundary event.
+    const reconcile = stepEvents.find((event) => event.payload?.step === "skills.reconcile");
+    expect(reconcile, "skills.reconcile must still emit its own step event").toBeTruthy();
+
+    // The root work sum is the sum of the top-level step walls only. The nested
+    // skills.reconcile wall sits inside the codex-home.seed wall, so it must not
+    // ride the sum a second time. The sum of every step wall except
+    // skills.reconcile equals the recorded root work sum exactly; each step
+    // reports the same duration to the event and to the root accumulator.
+    const sumExceptReconcile = stepEvents
+      .filter((event) => event.payload?.step !== "skills.reconcile")
+      .reduce((total, event) => total + (event.payload?.durationMs as number), 0);
+
+    const rootSpan = spans.find((span) => span.name === "sandbox.startup" && span.parent === null);
+    expect(rootSpan).toBeTruthy();
+    expect(rootSpan!.attributes[A.rootWorkMs]).toBe(sumExceptReconcile);
+  });
+
   it("parents both concurrent bridge spans to the root (neither orphans)", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
@@ -3252,6 +3352,33 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     const processSession = spans.find((span) => span.name === "bridge.process-session");
     expect(paperclip?.parent).toBe(rootSpan);
     expect(processSession?.parent).toBe(rootSpan);
+    // Both bridge spans carry the same batch tag, so the trace marks them as one
+    // parallel batch.
+    expect(paperclip?.attributes[A.batch]).toBe("bridge");
+    expect(processSession?.attributes[A.batch]).toBe("bridge");
+    expect(paperclip?.attributes[A.batch]).toBe(processSession?.attributes[A.batch]);
+  });
+
+  it("records the handshake create-runtime and ensure-session sub-times on the acp.handshake span", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    const executionTarget = await remoteSandboxTarget(root);
+    const { traceContext, spans } = createRecordingStartupTrace();
+
+    await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      { authToken: "real-run-jwt", executionTarget, startupTraceContext: traceContext },
+    );
+
+    const handshake = spans.find((span) => span.name === "acp.handshake");
+    expect(handshake).toBeTruthy();
+    // A cold start records both sub-times as finite float ms on the span.
+    expect(typeof handshake!.attributes[A.handshakeCreateRuntimeWallMs]).toBe("number");
+    expect(handshake!.attributes[A.handshakeCreateRuntimeWallMs] as number).toBeGreaterThanOrEqual(0);
+    expect(typeof handshake!.attributes[A.handshakeEnsureSessionWallMs]).toBe("number");
+    expect(handshake!.attributes[A.handshakeEnsureSessionWallMs] as number).toBeGreaterThanOrEqual(0);
   });
 
   it("keeps every span attribute inside the closed allowlist (no command/path/id keys)", async () => {
@@ -3560,7 +3687,7 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(handshake!.payload?.ensureSessionMs as number).toBeGreaterThanOrEqual(0);
   });
 
-  it("emits no acp.handshake event when a warm-handle hit skips the handshake", async () => {
+  it("emits a skipped acp.handshake event when a warm-handle hit skips the handshake", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const warmHandles = new Map();
@@ -3586,8 +3713,9 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
       onMeta: async () => {},
       onEvent: async () => {},
     } as never);
-    // The second run reuses the warm handle, so the whole handshake block is
-    // skipped — it must emit NO acp.handshake event (not a zero-duration one).
+    // The second run reuses the warm handle, so the handshake does no work. It
+    // must emit exactly one acp.handshake event with outcome = skipped and a
+    // zero wall time, not a misleading zero-work `ok` event.
     await execute({
       runId: "run-warm-2",
       agent: { id: "agent-1", companyId: "company-1" },
@@ -3601,10 +3729,12 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
       },
     } as never);
 
-    const handshakeEmitted = secondEvents.some(
+    const handshakeEvents = secondEvents.filter(
       (event) => event.eventType === "run.startup.step" && event.payload?.step === "acp.handshake",
     );
-    expect(handshakeEmitted).toBe(false);
+    expect(handshakeEvents).toHaveLength(1);
+    expect(handshakeEvents[0]!.payload?.outcome).toBe("skipped");
+    expect(handshakeEvents[0]!.payload?.durationMs).toBe(0);
   });
 
   it("does not emit startup-step events on a local (non-sandbox) run except workspace.resolve", async () => {

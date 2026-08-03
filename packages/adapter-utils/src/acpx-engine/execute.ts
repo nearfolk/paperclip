@@ -84,9 +84,12 @@ import {
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
 import {
+  emitSkippedStartupStep,
   measureStartupStep,
   NOOP_STARTUP_SPAN,
   NOOP_STARTUP_TRACE_CONTEXT,
+  setSandboxRootSpanAttributes,
+  type SandboxRootSpanContext,
   type StartupSpan,
   type StartupSpanContext,
   type StartupStepMeasureOptions,
@@ -972,7 +975,15 @@ async function prepareCodexSkillRuntime(input: {
   const skillsHome = path.join(effectiveCodexHome, "skills");
   await fs.mkdir(skillsHome, { recursive: true });
   // Step 3 — skills.reconcile: nested inside the codex-home seed (step 2), so it
-  // emits its own boundary event at this call-site.
+  // emits its own boundary event and span at this call-site. It must NOT add its
+  // wall time to the root work sum. The enclosing step 2 wall already covers this
+  // interval, so a second `onWallMs` call would count the same milliseconds
+  // twice. Drop `onWallMs` for the nested step; keep every other attribution
+  // field.
+  const nestedStepMetrics: StartupStepMeasureOptions = {
+    ...(input.stepMetrics ?? {}),
+    onWallMs: undefined,
+  };
   await measureStartupStep({ onEvent: input.onEvent }, now, "skills.reconcile", () =>
     reconcileManagedCodexSkills({
       skillsHome,
@@ -980,7 +991,7 @@ async function prepareCodexSkillRuntime(input: {
       selectedSkills,
       onLog: input.onLog,
     }),
-    input.stepMetrics ?? {},
+    nestedStepMetrics,
   );
 
   for (const entry of selectedSkills) {
@@ -1355,10 +1366,12 @@ async function buildRuntime(input: {
   ctx: AdapterExecutionContext;
   engine: AcpxEngineSettings;
   deps: AcpxEngineExecutorOptions;
-  // The injected tracer plus the root-span parent-context token. Merged into
-  // every startup-step option set, so each boundary span parents to the one
-  // root span (`sandbox.startup`) that the executor opens.
-  spanParent: Pick<StartupStepMeasureOptions, "tracer" | "parentContext">;
+  // The injected tracer, the root-span parent-context token, and the
+  // context-builder. Merged into every startup-step option set, so each
+  // boundary span parents to the one root span (`sandbox.startup`) that the
+  // executor opens, and each step publishes its own child context for an inner
+  // exec span to parent to.
+  spanParent: Pick<StartupStepMeasureOptions, "tracer" | "parentContext" | "contextWithSpan">;
 }): Promise<AcpxPreparedRuntime> {
   const { runId, agent, config, context, authToken } = input.ctx;
   // Injectable monotonic clock for per-step startup timing. Hoisted above the
@@ -1458,8 +1471,14 @@ async function buildRuntime(input: {
   // would double-count each other if we sampled them here. Keep the shared
   // counter attribution on the sequential startup phases only; the concurrent
   // bridge steps still emit duration telemetry (and a span), just not
-  // misleading per-step round-trip/provider deltas.
-  const concurrentBridgeStepMetrics: StartupStepMeasureOptions = { ...input.spanParent };
+  // misleading per-step round-trip/provider deltas. A shared `batch` tag marks
+  // the two spans as one parallel batch, and `criticalPath: false` keeps their
+  // inner exec spans off the critical path (their wall time overlaps).
+  const concurrentBridgeStepMetrics: StartupStepMeasureOptions = {
+    ...input.spanParent,
+    batch: STARTUP_BRIDGE_BATCH,
+    criticalPath: false,
+  };
   const shapedWorkspaceEnv = shapePaperclipWorkspaceEnvForExecution({
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceWorktreePath,
@@ -2873,6 +2892,11 @@ function warmHandleMatches(
  * low-cardinality constant, never derived from run/user data. */
 const STARTUP_ROOT_SPAN_NAME = "sandbox.startup";
 
+/** The shared batch tag for the two parallel bridge steps. It is a fixed
+ * low-cardinality literal, so it marks the two spans as one batch without
+ * carrying run or user data. */
+const STARTUP_BRIDGE_BATCH = "bridge";
+
 /**
  * Open the one root span for a sandbox bring-up and return its parent-context
  * token plus a guarded `end`. The span parents every startup boundary span:
@@ -2882,7 +2906,14 @@ const STARTUP_ROOT_SPAN_NAME = "sandbox.startup";
  * flow. With no injected trace context, the tracer is a no-op and the span is
  * a no-op.
  */
-function openStartupRootSpan(tracing: StartupTraceContext): {
+function openStartupRootSpan(
+  tracing: StartupTraceContext,
+  nowMs: () => number,
+  // Return the final root-span numbers and context at end time. The work sum
+  // and the cold-start flag are known only after the bring-up runs, so the
+  // caller reads them lazily here.
+  finalize: () => { workMs: number; context: SandboxRootSpanContext },
+): {
   parentContext: StartupSpanContext;
   end: (failed: boolean) => void;
 } {
@@ -2898,6 +2929,7 @@ function openStartupRootSpan(tracing: StartupTraceContext): {
   } catch {
     parentContext = undefined;
   }
+  const startedAtMs = nowMs();
   let ended = false;
   return {
     parentContext,
@@ -2905,6 +2937,11 @@ function openStartupRootSpan(tracing: StartupTraceContext): {
       if (ended) return;
       ended = true;
       try {
+        // The root span records its own wall time, the step-work sum, and the
+        // bounded context. `setSandboxRootSpanAttributes` sets only the closed
+        // allowlist, so no raw id or image reference rides the span.
+        const { workMs, context } = finalize();
+        setSandboxRootSpanAttributes(span, { wallMs: nowMs() - startedAtMs, workMs }, context);
         // `2` is `SpanStatusCode.ERROR`. `adapter-utils` stays OTel-free, so it
         // uses the numeric value that a real injected span reads as the error
         // status.
@@ -2956,8 +2993,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       executionTarget: ctx.executionTarget,
       legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
-    const targetsRemoteSandbox =
-      startupExecutionTarget?.kind === "remote" && startupExecutionTarget.transport === "sandbox";
+    const sandboxTarget =
+      startupExecutionTarget?.kind === "remote" && startupExecutionTarget.transport === "sandbox"
+        ? startupExecutionTarget
+        : null;
+    const targetsRemoteSandbox = sandboxTarget !== null;
     // Open the one root span for this bring-up. It spans `buildRuntime` through
     // `acp.handshake`, so every startup boundary span parents to it. `spanParent`
     // carries the injected tracer + the root parent-context token into each
@@ -2968,10 +3008,40 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       targetsRemoteSandbox && ctx.startupTraceContext
         ? ctx.startupTraceContext
         : NOOP_STARTUP_TRACE_CONTEXT;
-    const rootSpan = openStartupRootSpan(tracing);
-    const spanParent: Pick<StartupStepMeasureOptions, "tracer" | "parentContext"> = {
+    // The sum of the step wall times. The root span records it as `root.work_ms`
+    // and the difference from its own wall time as `root.diff_ms` (the overlap
+    // the parallel steps saved). Every step reports its wall time through
+    // `onWallMs`; a skipped step adds zero.
+    let stepWallSumMs = 0;
+    // Whether this bring-up is a cold start (no warm handle). Set once the warm-
+    // handle lookup runs below; it stays undefined on an early build failure, so
+    // the root span omits the attribute (fail open).
+    let coldStart: boolean | undefined;
+    const rootSpan = openStartupRootSpan(tracing, now, () => ({
+      workMs: stepWallSumMs,
+      context: {
+        coldStart,
+        // The provider key and the lease id are the only low-cardinality
+        // context values this provider-agnostic layer holds. The region, the
+        // image id, and the sandbox id are not threaded here, so the root span
+        // omits them (fail open). The lease id rides only as a hash.
+        provider: sandboxTarget?.providerKey ?? undefined,
+        leaseId: sandboxTarget?.leaseId ?? undefined,
+      },
+    }));
+    const spanParent: Pick<
+      StartupStepMeasureOptions,
+      "tracer" | "parentContext" | "contextWithSpan" | "onWallMs"
+    > = {
       tracer: tracing.tracer,
       parentContext: rootSpan.parentContext,
+      // Each step uses this to publish its own child context, so an inner exec
+      // span parents to the step span, not to the root.
+      contextWithSpan: (span) => tracing.contextWithSpan(span),
+      // Accumulate each step wall time into the root work sum.
+      onWallMs: (wallMs) => {
+        stepWallSumMs += wallMs;
+      },
     };
     let prepared: AcpxPreparedRuntime;
     try {
@@ -3056,6 +3126,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // split reports nothing for it.
     let createRuntimeMs: number | undefined;
     let runtime: AcpRuntime;
+    // A warm handle reuses the running ACP runtime; a miss constructs one. The
+    // root span records this as `cold_start`.
+    coldStart = !cached?.runtime;
     if (cached?.runtime) {
       runtime = cached.runtime;
     } else {
@@ -3102,6 +3175,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               ...(createRuntimeMs !== undefined ? { createRuntimeMs } : {}),
               ...(ensureSessionMs !== undefined ? { ensureSessionMs } : {}),
             }),
+            // The same two sub-times ride the span as fixed, closed keys.
+            spanWallTimes: () => ({
+              createRuntime: createRuntimeMs,
+              ensureSession: ensureSessionMs,
+            }),
           });
         } catch (err) {
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
@@ -3131,8 +3209,21 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             extra: () => ({
               ...(retryEnsureSessionMs !== undefined ? { ensureSessionMs: retryEnsureSessionMs } : {}),
             }),
+            // The retry reuses the runtime from the first attempt, so it reports
+            // only its own ensure-session sub-time on the span.
+            spanWallTimes: () => ({ ensureSession: retryEnsureSessionMs }),
           });
         }
+      } else {
+        // Warm-handle hit: a compatible cached handle reuses the running ACP
+        // agent, so the `acp.handshake` step does no work. Emit a step span and
+        // event with `outcome = skipped` and a zero wall time, so the trace and
+        // the run log show the skip as a distinct outcome, never a misleading
+        // zero-work `ok` step.
+        await emitSkippedStartupStep(ctx, "acp.handshake", {
+          tracer: prepared.stepMetrics.tracer,
+          parentContext: prepared.stepMetrics.parentContext,
+        });
       }
       // A compatible warm handle reuses the already-running ACP agent and does
       // not emit another spawn event. Persist its known identity on this run

@@ -43,6 +43,11 @@ interface StartupTracerHandle {
   startSpan(
     name: string,
     options?: unknown,
+    // The optional explicit parent-context token. A real OTel
+    // `startSpan(name, options, context)` parents the new span to the span that
+    // `context` carries. The no-op tracer ignores it. The exec seam passes the
+    // active step context here, so an exec span parents to its step span.
+    context?: unknown,
   ): {
     setAttribute(key: string, value: unknown): void;
     setStatus(status: { code: number; message?: string }): void;
