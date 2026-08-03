@@ -76,6 +76,7 @@ import {
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
 } from "./git-credentials.js";
+export { scrubGitCredentialText } from "./git-credentials.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
