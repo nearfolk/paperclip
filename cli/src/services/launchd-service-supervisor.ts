@@ -11,6 +11,7 @@ export const LAUNCHD_MIN_FREE_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 export const LAUNCHD_EARLY_EXIT_WINDOW_MS = 60_000;
 export const LAUNCHD_MAX_EARLY_FAILURES = 5;
 export const LAUNCHD_OUTPUT_DRAIN_TIMEOUT_MS = 1_000;
+export const LAUNCHD_CHILD_STOP_TIMEOUT_MS = 5_000;
 
 type SupervisorStatus = {
   state: "starting" | "running" | "exited" | "blocked";
@@ -35,6 +36,7 @@ type LaunchdServiceSupervisorOptions = {
   };
   freeDiskBytes?: (instanceRoot: string) => Promise<number>;
   outputDrainTimeoutMs?: number;
+  childStopTimeoutMs?: number;
 };
 
 type SupervisorFailureReason = "spawn_error" | "output_error" | "supervisor_error";
@@ -268,21 +270,23 @@ function waitForTimeout(milliseconds: number): Promise<void> {
   });
 }
 
-async function stopChildAfterSupervisorFailure(
+async function stopChild(
   child: ChildProcess,
   childExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+  signal: NodeJS.Signals,
+  timeoutMs: number,
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
+  child.kill(signal);
   const stopped = await Promise.race([
     childExit.then(() => true, () => true),
-    waitForTimeout(5_000).then(() => false),
+    waitForTimeout(timeoutMs).then(() => false),
   ]);
   if (stopped || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGKILL");
   await Promise.race([
     childExit.then(() => undefined, () => undefined),
-    waitForTimeout(5_000),
+    waitForTimeout(timeoutMs),
   ]);
 }
 
@@ -303,6 +307,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
   const statusPath = path.join(instanceRoot, "service-supervisor-status.json");
   const freeDiskBytes = options.freeDiskBytes ?? defaultFreeDiskBytes;
   const outputDrainTimeoutMs = options.outputDrainTimeoutMs ?? LAUNCHD_OUTPUT_DRAIN_TIMEOUT_MS;
+  const childStopTimeoutMs = options.childStopTimeoutMs ?? LAUNCHD_CHILD_STOP_TIMEOUT_MS;
   const spawnChild = options.spawnChild ?? ((command, args, env) => spawn(command, args, {
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -385,8 +390,9 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
     } satisfies SupervisorStatus);
 
     const forwardSignal = (signal: NodeJS.Signals) => {
+      if (stopping) return;
       stopping = true;
-      child?.kill(signal);
+      void stopChild(child!, childExit!, signal, childStopTimeoutMs);
     };
     onSigterm = () => forwardSignal("SIGTERM");
     onSigint = () => forwardSignal("SIGINT");
@@ -397,7 +403,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
     let exitCode: number | null;
     let exitSignal: NodeJS.Signals | null;
     if (firstOutcome.kind === "output_error") {
-      await stopChildAfterSupervisorFailure(child, childExit);
+      await stopChild(child, childExit, "SIGTERM", childStopTimeoutMs);
       throw new LaunchdSupervisorError("output_error", firstOutcome.error);
     }
     if (firstOutcome.kind === "spawn_error") {
@@ -448,7 +454,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
   } catch (error) {
     if (stopping) return 1;
     if (child && childExit && child.exitCode === null && child.signalCode === null) {
-      await stopChildAfterSupervisorFailure(child, childExit);
+      await stopChild(child, childExit, "SIGTERM", childStopTimeoutMs);
     }
     const supervisorError = error instanceof LaunchdSupervisorError
       ? error

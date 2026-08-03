@@ -133,6 +133,55 @@ describe("launchd startup safeguards", () => {
     expect(status).toMatchObject({ state: "exited", reason: "early_exit", exitCode: 1 });
   });
 
+  it("force-stops a child that ignores an operator restart signal", async () => {
+    const homeDir = await temporaryDirectory();
+    const listenersBefore = new Set(process.listeners("SIGTERM"));
+    let spawnedChild: (ChildProcess & { stdout: Readable; stderr: Readable }) | null = null;
+    let childReadyResolve: (() => void) | null = null;
+    const childReady = new Promise<void>((resolve) => {
+      childReadyResolve = resolve;
+    });
+    const childScript = [
+      'process.on("SIGTERM", () => undefined);',
+      'process.on("SIGINT", () => undefined);',
+      'process.send?.("ready");',
+      'setInterval(() => undefined, 1_000);',
+    ].join("\n");
+
+    const supervisor = runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: process.execPath,
+      childStopTimeoutMs: 20,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => {
+        const child = spawn(process.execPath, ["-e", childScript], {
+          stdio: ["ignore", "pipe", "pipe", "ipc"],
+        }) as ChildProcess & { stdout: Readable; stderr: Readable };
+        spawnedChild = child;
+        child.once("message", () => childReadyResolve?.());
+        return child;
+      },
+    });
+
+    await childReady;
+    let signalListener = process.listeners("SIGTERM").find((listener) => !listenersBefore.has(listener));
+    for (let attempt = 0; !signalListener && attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      signalListener = process.listeners("SIGTERM").find((listener) => !listenersBefore.has(listener));
+    }
+    expect(signalListener).toBeDefined();
+    signalListener?.("SIGTERM");
+
+    await expect(supervisor).resolves.toBe(1);
+    expect((spawnedChild as ChildProcess | null)?.signalCode).toBe("SIGKILL");
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; signal: string };
+    expect(status).toMatchObject({ state: "exited", reason: "operator_stop", signal: "SIGKILL" });
+  });
+
   it("persists an asynchronous child spawn error as an early failure", async () => {
     const homeDir = await temporaryDirectory();
 
