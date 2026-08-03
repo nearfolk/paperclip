@@ -168,6 +168,39 @@ describe("launchd startup safeguards", () => {
     expect(handlerInstalledAtFirstPidRead).toBe(true);
   });
 
+  it("stops the child when an operator signal arrives while spawn is returning", async () => {
+    const homeDir = await temporaryDirectory();
+    const listenersBefore = new Set(process.listeners("SIGTERM"));
+    let spawnedChild: ChildProcess | null = null;
+
+    const exitCode = await runLaunchdServiceSupervisor({
+      instanceId: "test",
+      homeDir,
+      shimPath: process.execPath,
+      freeDiskBytes: async () => LAUNCHD_MIN_FREE_DISK_BYTES,
+      spawnChild: () => {
+        const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1_000)"], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        spawnedChild = child;
+        const signalListener = process
+          .listeners("SIGTERM")
+          .find((listener) => !listenersBefore.has(listener));
+        expect(signalListener).toBeDefined();
+        signalListener?.("SIGTERM");
+        return child;
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect((spawnedChild as ChildProcess | null)?.signalCode).toBe("SIGTERM");
+    const status = JSON.parse(await fs.readFile(
+      path.join(homeDir, "instances", "test", "service-supervisor-status.json"),
+      "utf8",
+    )) as { state: string; reason: string; signal: string };
+    expect(status).toMatchObject({ state: "exited", reason: "operator_stop", signal: "SIGTERM" });
+  });
+
   it("force-stops a child that ignores an operator restart signal", async () => {
     const homeDir = await temporaryDirectory();
     const listenersBefore = new Set(process.listeners("SIGTERM"));

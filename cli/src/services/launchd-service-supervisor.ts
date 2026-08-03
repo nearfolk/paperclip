@@ -318,6 +318,7 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
   let child: (ChildProcess & { stdout: Readable; stderr: Readable }) | null = null;
   let childExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null;
   let stopping = false;
+  let pendingSignal: NodeJS.Signals | null = null;
   let onSigterm: (() => void) | null = null;
   let onSigint: (() => void) | null = null;
   try {
@@ -352,6 +353,19 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
       earlyFailureCount: failures.length,
     } satisfies SupervisorStatus);
 
+    const forwardSignal = (signal: NodeJS.Signals) => {
+      if (stopping) return;
+      stopping = true;
+      pendingSignal = signal;
+      if (child && childExit) {
+        void stopChild(child, childExit, signal, childStopTimeoutMs);
+      }
+    };
+    onSigterm = () => forwardSignal("SIGTERM");
+    onSigint = () => forwardSignal("SIGINT");
+    process.once("SIGTERM", onSigterm);
+    process.once("SIGINT", onSigint);
+
     try {
       child = spawnChild(options.shimPath, ["run", "--instance", options.instanceId], {
         ...process.env,
@@ -379,15 +393,9 @@ export async function runLaunchdServiceSupervisor(options: LaunchdServiceSupervi
       (error: unknown) => ({ kind: "output_error" as const, error }),
     );
 
-    const forwardSignal = (signal: NodeJS.Signals) => {
-      if (stopping) return;
-      stopping = true;
-      void stopChild(child!, childExit!, signal, childStopTimeoutMs);
-    };
-    onSigterm = () => forwardSignal("SIGTERM");
-    onSigint = () => forwardSignal("SIGINT");
-    process.once("SIGTERM", onSigterm);
-    process.once("SIGINT", onSigint);
+    if (pendingSignal) {
+      void stopChild(child, childExit, pendingSignal, childStopTimeoutMs);
+    }
 
     await writeJsonAtomically(statusPath, {
       state: "running",
