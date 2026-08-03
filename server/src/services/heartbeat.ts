@@ -76,7 +76,9 @@ import {
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
 } from "./git-credentials.js";
-export { scrubGitCredentialText } from "./git-credentials.js";
+// Re-exported because heartbeat's workspace surface exposed the scrubber before the
+// git-credentials module became its canonical home; existing importers keep working.
+export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
