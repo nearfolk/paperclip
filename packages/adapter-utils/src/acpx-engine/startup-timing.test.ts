@@ -7,6 +7,7 @@ import {
   getActiveStepContext,
   measureStartupStep,
   normalizeProviderFamily,
+  runWithoutActiveStep,
   SANDBOX_STARTUP_SPAN_ATTR_PREFIX,
   SANDBOX_STARTUP_SPAN_ATTRS,
   setSandboxRootSpanAttributes,
@@ -82,60 +83,9 @@ describe("measureStartupStep", () => {
     expect(events[0]!.message).toBe("startup step: stage.sync (150ms)");
   });
 
-  it("includes the roundTrips delta in the payload when a round-trip reader is supplied", async () => {
+  it("emits only the high-level fields (step, durationMs, outcome) on the payload", async () => {
     let t = 0;
     const now = () => t;
-    // Cumulative host→sandbox exec counter; the step performs 3 execs.
-    let execCount = 5;
-    const events: AdapterRuntimeEvent[] = [];
-    const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
-      events.push(event);
-    });
-
-    await measureStartupStep({ onEvent }, now, "stage.sync", async () => {
-      t = 90;
-      execCount += 3;
-      return "ok";
-    }, { roundTrips: () => execCount });
-
-    expect(events[0]!.payload).toMatchObject({
-      step: "stage.sync",
-      durationMs: 90,
-      roundTrips: 3,
-    });
-  });
-
-  it("reports roundTrips: 0 for a step that performs no execs (reader supplied)", async () => {
-    const now = () => 0;
-    const events: AdapterRuntimeEvent[] = [];
-    const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
-      events.push(event);
-    });
-
-    await measureStartupStep({ onEvent }, now, "workspace.resolve", async () => "ok", {
-      roundTrips: () => 7,
-    });
-
-    expect(events[0]!.payload).toMatchObject({ step: "workspace.resolve", roundTrips: 0 });
-  });
-
-  it("omits roundTrips from the payload when no reader is supplied", async () => {
-    const now = () => 0;
-    const events: AdapterRuntimeEvent[] = [];
-    const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
-      events.push(event);
-    });
-
-    await measureStartupStep({ onEvent }, now, "workspace.resolve", async () => "ok");
-
-    expect(events[0]!.payload).not.toHaveProperty("roundTrips");
-  });
-
-  it("accumulates provider exec/get durations and merges extra fields into the payload", async () => {
-    let t = 0;
-    const now = () => t;
-    let execMs = 100;
-    let getMs = 40;
     const events: AdapterRuntimeEvent[] = [];
     const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
       events.push(event);
@@ -143,23 +93,18 @@ describe("measureStartupStep", () => {
 
     await measureStartupStep({ onEvent }, now, "acp.handshake", async () => {
       t = 7000;
-      execMs += 600; // one provider executeCommand round-trip
-      getMs += 15; // one client.get re-fetch
       return "handle";
-    }, {
-      providerExecMs: () => execMs,
-      providerGetMs: () => getMs,
-      extra: () => ({ createRuntimeMs: 12, ensureSessionMs: 6988 }),
     });
 
-    expect(events[0]!.payload).toMatchObject({
-      step: "acp.handshake",
-      durationMs: 7000,
-      providerExecMs: 600,
-      providerGetMs: 15,
-      createRuntimeMs: 12,
-      ensureSessionMs: 6988,
-    });
+    // The detailed per-step round-trip and provider-duration numbers ride the
+    // OTel spans now, so the run-log payload keeps only the high-level fields.
+    const payload = events[0]!.payload as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(["durationMs", "outcome", "step"]);
+    expect(payload).not.toHaveProperty("roundTrips");
+    expect(payload).not.toHaveProperty("providerExecMs");
+    expect(payload).not.toHaveProperty("providerGetMs");
+    expect(payload).not.toHaveProperty("createRuntimeMs");
+    expect(payload).not.toHaveProperty("ensureSessionMs");
   });
 
   it("returns the wrapped fn result unchanged", async () => {
@@ -282,64 +227,27 @@ describe("measureStartupStep", () => {
     expect(spans[0]!.status?.code).toBe(2);
   });
 
-  it("keeps the roundTrips / providerExecMs / providerGetMs deltas on the payload but off the span", async () => {
-    let t = 0;
-    const now = () => t;
-    let execCount = 5;
-    let execMs = 100;
-    let getMs = 40;
+  it("carries only the allowlisted attributes on the step span, never the removed round-trip detail", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
       events.push(event);
     });
     const { tracer, spans } = makeMockTracer();
 
-    await measureStartupStep({ onEvent }, now, "stage.sync", async () => {
-      t = 90;
-      execCount += 3;
-      execMs += 600;
-      getMs += 15;
-      return "ok";
-    }, {
+    await measureStartupStep({ onEvent }, () => 0, "stage.sync", async () => "ok", {
       tracer,
-      roundTrips: () => execCount,
-      providerExecMs: () => execMs,
-      providerGetMs: () => getMs,
+      provider: "daytona",
     });
 
-    // The counter deltas still ride the event payload.
-    const payload = events[0]!.payload as Record<string, unknown>;
-    expect(payload.roundTrips).toBe(3);
-    expect(payload.providerExecMs).toBe(600);
-    expect(payload.providerGetMs).toBe(15);
-    // The per-execution `sandbox.exec` spans now carry the round-trip detail, so
-    // the step span no longer duplicates it.
-    expect(spans[0]!.attributes).not.toHaveProperty(A.roundTripsCount);
-    expect(spans[0]!.attributes).not.toHaveProperty(A.providerExecSumMs);
-    expect(spans[0]!.attributes).not.toHaveProperty(A.providerGetSumMs);
-  });
-
-  it("sets no span attribute (and no payload field) when a reader returns undefined", async () => {
-    const events: AdapterRuntimeEvent[] = [];
-    const onEvent = vi.fn(async (event: AdapterRuntimeEvent) => {
-      events.push(event);
-    });
-    const { tracer, spans } = makeMockTracer();
-
-    await measureStartupStep({ onEvent }, () => 0, "workspace.resolve", async () => "ok", {
-      tracer,
-      // A reader may return undefined when the counter is unavailable. The guard
-      // must omit the attribute rather than emit NaN or 0.
-      roundTrips: () => undefined as unknown as number,
-      providerExecMs: () => undefined as unknown as number,
-    });
-
-    expect(spans[0]!.attributes).not.toHaveProperty(A.roundTripsCount);
-    expect(spans[0]!.attributes).not.toHaveProperty(A.providerExecSumMs);
-    expect(Object.values(spans[0]!.attributes).some((v) => Number.isNaN(v))).toBe(false);
+    // The step span carries only the closed allowlist. The per-execution
+    // `sandbox.exec` spans carry the round-trip and provider-duration detail.
+    expect(Object.keys(spans[0]!.attributes).sort()).toEqual(
+      [A.provider, A.stepWallMs, A.outcome].sort(),
+    );
     const payload = events[0]!.payload as Record<string, unknown>;
     expect(payload).not.toHaveProperty("roundTrips");
     expect(payload).not.toHaveProperty("providerExecMs");
+    expect(payload).not.toHaveProperty("providerGetMs");
   });
 
   it("normalizes a plugin-backed provider key to plugin and keeps a built-in family as-is", async () => {
@@ -376,20 +284,11 @@ describe("measureStartupStep", () => {
     await measureStartupStep({ onEvent }, () => 0, "acp.handshake", async () => "ok", {
       tracer,
       provider: "daytona",
-      roundTrips: () => 3,
-      providerExecMs: () => 600,
-      providerGetMs: () => 15,
-      // extra() carries caller-measured numbers into the EVENT payload only.
-      // It must never widen the span-attribute set.
-      extra: () => ({ createRuntimeMs: 12, ensureSessionMs: 6988 }),
     });
 
     expect(Object.keys(spans[0]!.attributes).sort()).toEqual(
       [A.provider, A.stepWallMs, A.outcome].sort(),
     );
-    // extra() keys stay off the span.
-    expect(spans[0]!.attributes).not.toHaveProperty("createRuntimeMs");
-    expect(spans[0]!.attributes).not.toHaveProperty("ensureSessionMs");
     // Every key uses the closed prefix, so no free-form command / path / id key
     // can ride the span.
     for (const key of Object.keys(spans[0]!.attributes)) {
@@ -411,9 +310,7 @@ describe("measureStartupStep", () => {
 
     // No tracer supplied. The helper must still emit the event and return the
     // value without throwing.
-    const result = await measureStartupStep({ onEvent }, () => 0, "stage.sync", async () => "ok", {
-      roundTrips: () => 3,
-    });
+    const result = await measureStartupStep({ onEvent }, () => 0, "stage.sync", async () => "ok");
 
     expect(result).toBe("ok");
     expect(events[0]!.payload).toMatchObject({ step: "stage.sync" });
@@ -471,9 +368,6 @@ describe("measureStartupStep", () => {
     await measureStartupStep({ onEvent: vi.fn(async () => {}) }, () => 0, "stage.sync", async () => "ok", {
       tracer,
       provider: "daytona",
-      roundTrips: () => 3,
-      providerExecMs: () => 600,
-      providerGetMs: () => 15,
     });
 
     const keys = Object.keys(spans[0]!.attributes);
@@ -481,12 +375,9 @@ describe("measureStartupStep", () => {
     for (const key of keys) {
       expect(key.startsWith(SANDBOX_STARTUP_SPAN_ATTR_PREFIX)).toBe(true);
     }
-    // The step wall time and the counters use their type suffixes.
+    // The step wall time uses its type suffix.
     expect(keys).toContain(A.stepWallMs);
     expect(A.stepWallMs.endsWith(".wall_ms")).toBe(true);
-    expect(A.roundTripsCount.endsWith(".count")).toBe(true);
-    expect(A.providerExecSumMs.endsWith(".sum_ms")).toBe(true);
-    expect(A.providerGetSumMs.endsWith(".sum_ms")).toBe(true);
   });
 });
 
@@ -604,6 +495,86 @@ describe("getActiveStepContext", () => {
       seen = getActiveStepContext();
     }, { criticalPath: false });
     expect(seen!.criticalPath).toBe(false);
+  });
+
+  it("keeps the ended step store in a timer scheduled inside the step body", async () => {
+    // Node snapshots the active store on each async resource at creation time.
+    // A timer scheduled inside a measured step body keeps that step store, even
+    // after the step span ends. A later run-time exec then reads the ended step
+    // and parents its `sandbox.exec` span to a dead startup step. This test locks
+    // that leak, so the fix and its guard test stay honest.
+    let storeInTimer: ReturnType<typeof getActiveStepContext> = null;
+    let fireTimer!: () => void;
+    const timerRan = new Promise<void>((resolve) => {
+      fireTimer = resolve;
+    });
+
+    await measureStartupStep(
+      { onEvent: vi.fn(async () => {}) },
+      () => 0,
+      "bridge.process-session",
+      async () => {
+        setTimeout(() => {
+          storeInTimer = getActiveStepContext();
+          fireTimer();
+        }, 0);
+        return "started";
+      },
+      { criticalPath: false },
+    );
+
+    // The step span already ended, so the main line reads no active step.
+    expect(getActiveStepContext()).toBeNull();
+
+    await timerRan;
+
+    // Yet the timer callback still reads the ended step context. This is the
+    // store leak the bridge boundary fix removes.
+    expect(storeInTimer).not.toBeNull();
+    expect(storeInTimer!.criticalPath).toBe(false);
+  });
+
+  it("clears the active step for a continuation wrapped in runWithoutActiveStep", async () => {
+    // The bridge boundary wraps its long-lived poll timer in `runWithoutActiveStep`.
+    // A timer scheduled inside that empty store scope reads no active step, so a
+    // later run-time exec opens an unparented span instead of one under the ended
+    // startup step.
+    let storeInTimer: ReturnType<typeof getActiveStepContext> = null;
+    let sawTimer = false;
+    let fireTimer!: () => void;
+    const timerRan = new Promise<void>((resolve) => {
+      fireTimer = resolve;
+    });
+
+    await measureStartupStep(
+      { onEvent: vi.fn(async () => {}) },
+      () => 0,
+      "bridge.process-session",
+      async () => {
+        runWithoutActiveStep(() => {
+          setTimeout(() => {
+            storeInTimer = getActiveStepContext();
+            sawTimer = true;
+            fireTimer();
+          }, 0);
+        });
+        return "started";
+      },
+      { criticalPath: false },
+    );
+
+    await timerRan;
+
+    expect(sawTimer).toBe(true);
+    expect(storeInTimer).toBeNull();
+  });
+
+  it("returns the work result and restores the previous active step", async () => {
+    // Outside any measured step the previous store is empty, so the helper both
+    // returns the work value and leaves the store empty afterward.
+    const value = runWithoutActiveStep(() => "value");
+    expect(value).toBe("value");
+    expect(getActiveStepContext()).toBeNull();
   });
 });
 
