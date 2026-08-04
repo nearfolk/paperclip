@@ -9990,6 +9990,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  function isServerStdioBoundHotRestartRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    adapterType: string;
+    adapterConfig: unknown;
+  }) {
+    const context = parseObject(input.run.contextSnapshot);
+    if (context.processTopology === "server_stdio" || context.executionEngine === "acp") {
+      return true;
+    }
+    if (context.processTopology === "detached" || context.executionEngine === "cli") {
+      return false;
+    }
+    if (!["claude_local", "codex_local", "gemini_local"].includes(input.adapterType)) {
+      return false;
+    }
+    return readNonEmptyString(parseObject(input.adapterConfig).engine) !== "cli";
+  }
+
   async function prepareHotRestartShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
@@ -10013,6 +10031,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .select({
         run: heartbeatRuns,
         adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -10022,6 +10041,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
+
+    const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
+    if (serverStdioRuns.length > 0) {
+      const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
+      await writeHotRestartShutdownSnapshot({
+        intent: intentWithVersion,
+        signal,
+        activeRuns: snapshotRuns,
+        drainReason: "active_acp_run",
+        drainRunIds: activeServerStdioRunIds,
+        capturedAt: now,
+      });
+
+      logger.warn(
+        {
+          signal,
+          previousServerPid: intent.previousServerPid,
+          activeRunIds: snapshotRuns.map((run) => run.runId),
+          activeServerStdioRunIds,
+          drainReason: "active_acp_run",
+        },
+        "server-stdio agent run prevents hot-restart adoption; using graceful drain and retry",
+      );
+
+      return {
+        mode: "acp_drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: snapshotRuns.map((run) => run.runId),
+        activeAcpRunIds: activeServerStdioRunIds,
+        drainRunIds: activeServerStdioRunIds,
+        drainReason: "active_acp_run" as const,
+      };
+    }
 
     await writeHotRestartShutdownSnapshot({
       intent: intentWithVersion,
@@ -10083,12 +10135,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (!intent.shutdownSnapshot) {
-      logger.warn(
+      const log = intent.drainRequired ? logger.info.bind(logger) : logger.warn.bind(logger);
+      log(
         {
           previousServerPid: intent.previousServerPid,
           preflightActiveRunIds: intent.preflightActiveRunIds,
+          drainReason: intent.drainReason ?? null,
         },
-        "hot-restart intent present but shutdown snapshot is missing; no runs can be adopted",
+        intent.drainRequired
+          ? "drain-required restart intent has no adoption snapshot"
+          : "hot-restart intent present but shutdown snapshot is missing; no runs can be adopted",
       );
     }
     const candidates = intent.shutdownSnapshot?.activeRuns ?? [];
@@ -10170,7 +10226,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      if (intent.drainRequired) {
+      const hasSelectiveAcpDrain = intent.drainReason === "active_acp_run"
+        && (intent.drainRunIds?.length ?? 0) > 0;
+      if (hasSelectiveAcpDrain && intent.drainRunIds?.includes(candidate.runId)) {
+        // A selective ACP drain is expected to persist a terminal row before
+        // the new server starts. If the process was terminated but that write
+        // failed, surface the run as lost instead of hiding it as an expected
+        // drain skip.
+        classify(candidate, "lost", "selective_drain_not_finalized", patch);
+        continue;
+      }
+      if (
+        intent.drainRequired
+        && !hasSelectiveAcpDrain
+      ) {
         classify(candidate, "skipped", "drain_required", patch);
         continue;
       }
@@ -10250,6 +10319,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       requestedAt: intent.requestedAt,
       completedAt: now.toISOString(),
       drainRequired: intent.drainRequired,
+      drainReason: intent.drainReason ?? (intent.drainRequired ? "requested" : null),
       previousServerPid: intent.previousServerPid,
       newServerPid: process.pid,
       previousServerVersion: intent.previousServerVersion,
@@ -10284,7 +10354,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
+  async function drainRunningRunsForShutdown(
+    signal: "SIGINT" | "SIGTERM",
+    now = new Date(),
+    runIds: readonly string[] | null = null,
+  ) {
+    const selectedRunIds = runIds ? [...new Set(runIds)] : null;
+    if (selectedRunIds?.length === 0) {
+      return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
+    }
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
@@ -10292,7 +10370,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+      .where(
+        selectedRunIds
+          ? and(
+            eq(heartbeatRuns.status, "running"),
+            inArray(heartbeatRuns.id, selectedRunIds),
+          )
+          : eq(heartbeatRuns.status, "running"),
+      );
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
