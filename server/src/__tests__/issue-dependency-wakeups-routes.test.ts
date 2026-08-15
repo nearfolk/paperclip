@@ -46,6 +46,8 @@ vi.mock("../services/index.js", () => ({
     getDefaultCompanyGoal: vi.fn(),
   }),
   heartbeatService: () => ({
+    getActiveRunForAgent: vi.fn(async () => null),
+    getRun: vi.fn(async () => null),
     wakeup: mockWakeup,
     reportRunActivity: vi.fn(async () => undefined),
   }),
@@ -168,8 +170,7 @@ describe("issue dependency wakeups in issue routes", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
 
-  it("returns the atomic blocker clear and terminal status result", async () => {
-    const cancelledBlockerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  it("cancels a blocked issue while retaining an already-cancelled blocker", async () => {
     const blockedIssue = {
       id: "issue-1",
       companyId: "company-1",
@@ -188,32 +189,25 @@ describe("issue dependency wakeups in issue routes", () => {
       labelIds: [],
     };
     mockIssueService.getById.mockResolvedValue(blockedIssue);
-    mockIssueService.getRelationSummaries
-      .mockResolvedValueOnce({
-        blockedBy: [{ id: cancelledBlockerId, status: "cancelled" }],
-        blocks: [],
-      })
-      .mockResolvedValueOnce({ blockedBy: [], blocks: [] });
     mockIssueService.update.mockResolvedValue({
       ...blockedIssue,
-      status: "done",
+      status: "cancelled",
       blockerAttention: { state: "none" },
     });
 
     const res = await request(await createApp())
       .patch("/api/issues/issue-1")
-      .send({ status: "done", blockedByIssueIds: [] });
+      .send({ status: "cancelled" });
 
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "issue-1",
-      expect.objectContaining({ status: "done", blockedByIssueIds: [] }),
+      expect.objectContaining({ status: "cancelled" }),
       expect.anything(),
-      expect.any(Array),
     );
+    expect(mockIssueService.update.mock.calls[0]?.[1]).not.toHaveProperty("blockedByIssueIds");
     expect(res.body).toMatchObject({
-      status: "done",
-      blockedBy: [],
+      status: "cancelled",
       blockerAttention: { state: "none" },
     });
   });
