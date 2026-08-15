@@ -1335,6 +1335,27 @@ async function listUnresolvedBlockerIssueIds(
     .then((rows) => rows.map((row) => row.id));
 }
 
+async function excludeCancelledBlockerIssueIds(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  blockerIssueIds: string[],
+) {
+  const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+  if (uniqueBlockerIssueIds.length === 0) return [];
+  const cancelledRows = await dbOrTx
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, uniqueBlockerIssueIds),
+        eq(issues.status, "cancelled"),
+      ),
+    );
+  const cancelledIds = new Set(cancelledRows.map((row) => row.id));
+  return uniqueBlockerIssueIds.filter((issueId) => !cancelledIds.has(issueId));
+}
+
 async function listProposedBlockerReadiness(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -7590,9 +7611,12 @@ export function issueService(db: Db) {
         const proposedReadiness = blockedByIssueIds !== undefined
           ? await listProposedBlockerReadiness(dbOrTx, existing.companyId, blockedByIssueIds)
           : null;
-        const unresolvedBlockerIssueIds = proposedReadiness?.unresolvedBlockerIssueIds
+        const readinessBlockerIssueIds = proposedReadiness?.unresolvedBlockerIssueIds
           ?? dependencyReadiness?.unresolvedBlockerIssueIds
           ?? [];
+        const unresolvedBlockerIssueIds = patch.status === "done" || patch.status === "cancelled"
+          ? await excludeCancelledBlockerIssueIds(dbOrTx, existing.companyId, readinessBlockerIssueIds)
+          : readinessBlockerIssueIds;
         if (unresolvedBlockerIssueIds.length > 0) {
           const unresolvedBlockers = await listUnresolvedBlockerDetails(
             dbOrTx,

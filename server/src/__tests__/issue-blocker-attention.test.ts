@@ -335,6 +335,51 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(completed?.blockerAttention).toMatchObject({ state: "none" });
   });
 
+  it("allows a blocked issue to be cancelled while retaining a cancelled blocker", async () => {
+    const { companyId } = await createCompany("PBC");
+    const blockedIssueId = await insertIssue({
+      companyId,
+      identifier: "PBC-1",
+      title: "Blocked issue",
+      status: "blocked",
+    });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBC-2",
+      title: "Cancelled dependency",
+      status: "cancelled",
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId });
+
+    const updated = await svc.update(blockedIssueId, { status: "cancelled" });
+    const relations = await svc.getRelationSummaries(blockedIssueId);
+
+    expect(updated?.status).toBe("cancelled");
+    expect(relations.blockedBy.map((relation) => relation.id)).toEqual([cancelledBlockerId]);
+  });
+
+  it("rejects cancelling a blocked issue while a live blocker remains", async () => {
+    const { companyId } = await createCompany("PBL");
+    const blockedIssueId = await insertIssue({
+      companyId,
+      identifier: "PBL-1",
+      title: "Blocked issue",
+      status: "blocked",
+    });
+    const liveBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBL-2",
+      title: "Live dependency",
+      status: "todo",
+    });
+    await block({ companyId, blockerIssueId: liveBlockerId, blockedIssueId });
+
+    await expect(svc.update(blockedIssueId, { status: "cancelled" })).rejects.toMatchObject({
+      status: 422,
+      details: { unresolvedBlockerIssueIds: [liveBlockerId] },
+    });
+  });
+
   it("rejects a blocked-to-done transition when the proposed blockers remain unresolved", async () => {
     const { companyId } = await createCompany("PBE");
     const blockedIssueId = await insertIssue({
