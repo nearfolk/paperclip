@@ -298,6 +298,60 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention?.sampleBlockerIdentifier).not.toBe("PBD-4");
   });
 
+  it("atomically clears a cancelled blocker while completing a blocked issue", async () => {
+    const { companyId } = await createCompany("PBA");
+    const blockedIssueId = await insertIssue({
+      companyId,
+      identifier: "PBA-1",
+      title: "Blocked issue",
+      status: "blocked",
+    });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBA-2",
+      title: "Cancelled dependency",
+      status: "cancelled",
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId });
+
+    const updated = await svc.update(blockedIssueId, {
+      status: "done",
+      blockedByIssueIds: [],
+    });
+    const relations = await svc.getRelationSummaries(blockedIssueId);
+    const completed = (await svc.list(companyId, { status: "done" }))
+      .find((issue) => issue.id === blockedIssueId);
+
+    expect(updated?.status).toBe("done");
+    expect(relations.blockedBy).toEqual([]);
+    expect(completed?.blockerAttention).toMatchObject({ state: "none" });
+  });
+
+  it("rejects a blocked-to-done transition when the proposed blockers remain unresolved", async () => {
+    const { companyId } = await createCompany("PBE");
+    const blockedIssueId = await insertIssue({
+      companyId,
+      identifier: "PBE-1",
+      title: "Blocked issue",
+      status: "blocked",
+    });
+    const liveBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBE-2",
+      title: "Live dependency",
+      status: "todo",
+    });
+    await block({ companyId, blockerIssueId: liveBlockerId, blockedIssueId });
+
+    await expect(svc.update(blockedIssueId, {
+      status: "done",
+      blockedByIssueIds: [liveBlockerId],
+    })).rejects.toMatchObject({ status: 422 });
+
+    const relations = await svc.getRelationSummaries(blockedIssueId);
+    expect(relations.blockedBy.map((relation) => relation.id)).toEqual([liveBlockerId]);
+  });
+
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {
     const { companyId, agentId } = await createCompany("PBR");
     const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });

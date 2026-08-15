@@ -168,6 +168,56 @@ describe("issue dependency wakeups in issue routes", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
 
+  it("returns the atomic blocker clear and terminal status result", async () => {
+    const cancelledBlockerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const blockedIssue = {
+      id: "issue-1",
+      companyId: "company-1",
+      identifier: "PAP-99",
+      title: "Blocked issue",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue(blockedIssue);
+    mockIssueService.getRelationSummaries
+      .mockResolvedValueOnce({
+        blockedBy: [{ id: cancelledBlockerId, status: "cancelled" }],
+        blocks: [],
+      })
+      .mockResolvedValueOnce({ blockedBy: [], blocks: [] });
+    mockIssueService.update.mockResolvedValue({
+      ...blockedIssue,
+      status: "done",
+      blockerAttention: { state: "none" },
+    });
+
+    const res = await request(await createApp())
+      .patch("/api/issues/issue-1")
+      .send({ status: "done", blockedByIssueIds: [] });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({ status: "done", blockedByIssueIds: [] }),
+      expect.anything(),
+      expect.any(Array),
+    );
+    expect(res.body).toMatchObject({
+      status: "done",
+      blockedBy: [],
+      blockerAttention: { state: "none" },
+    });
+  });
+
   it("wakes dependents when the final blocker transitions to done", async () => {
     mockIssueService.getById.mockResolvedValue({
       id: "issue-1",

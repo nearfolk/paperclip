@@ -7548,7 +7548,10 @@ export function issueService(db: Db) {
       if (patch.status === "in_progress" && !nextAssigneeAgentId && !nextAssigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      if (patch.status === "in_progress") {
+      const validatesBlockerReadiness =
+        patch.status === "in_progress" ||
+        (existing.status === "blocked" && (patch.status === "done" || patch.status === "cancelled"));
+      if (validatesBlockerReadiness) {
         const dependencyReadiness = blockedByIssueIds === undefined
           ? (await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])).get(id)
           : null;
