@@ -8,11 +8,14 @@ import {
   approvals,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueRelations,
   issueThreadInteractions,
   issues,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -48,8 +51,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(workspaceOperations);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -101,6 +107,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     originFingerprint?: string | null;
     executionState?: Record<string, unknown> | null;
     description?: string | null;
+    executionWorkspaceId?: string | null;
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -118,6 +125,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
       description: input.description ?? null,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
     });
     return id;
   }
@@ -350,6 +358,66 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     const relations = await svc.getRelationSummaries(blockedIssueId);
     expect(relations.blockedBy.map((relation) => relation.id)).toEqual([liveBlockerId]);
+  });
+
+  it("rejects atomic completion while a retained done blocker is pending workspace finalization", async () => {
+    const { companyId } = await createCompany("PBF");
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const blockedIssueId = await insertIssue({
+      companyId,
+      identifier: "PBF-1",
+      title: "Blocked issue",
+      status: "blocked",
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Pending finalization project",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "pending-finalization-workspace",
+      status: "active",
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBF-2",
+      title: "Done dependency pending finalization",
+      status: "done",
+      executionWorkspaceId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date(),
+    });
+
+    await expect(svc.update(blockedIssueId, {
+      status: "done",
+      blockedByIssueIds: [blockerId],
+    })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        unresolvedBlockerIssueIds: [blockerId],
+        unresolvedBlockers: [expect.objectContaining({
+          issueId: blockerId,
+          reason: "pending_finalize",
+        })],
+      },
+    });
+
+    const relations = await svc.getRelationSummaries(blockedIssueId);
+    expect(relations.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
   });
 
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {

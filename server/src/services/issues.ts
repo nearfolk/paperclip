@@ -1334,6 +1334,38 @@ async function listUnresolvedBlockerIssueIds(
     )
     .then((rows) => rows.map((row) => row.id));
 }
+
+async function listProposedBlockerReadiness(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  blockerIssueIds: string[],
+) {
+  const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+  if (uniqueBlockerIssueIds.length === 0) {
+    return { unresolvedBlockerIssueIds: [], pendingFinalizeBlockerIssueIds: [] };
+  }
+  const blockerRows = await dbOrTx
+    .select({
+      id: issues.id,
+      status: issues.status,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueBlockerIssueIds)));
+  const pendingFinalizeBlockerIssueIds = await listPendingFinalizeBlockerIssueIds(
+    dbOrTx,
+    companyId,
+    blockerRows.flatMap((row) => row.status === "done" && row.executionWorkspaceId
+      ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+      : []),
+  );
+  return {
+    unresolvedBlockerIssueIds: blockerRows
+      .filter((row) => row.status !== "done" || pendingFinalizeBlockerIssueIds.has(row.id))
+      .map((row) => row.id),
+    pendingFinalizeBlockerIssueIds: [...pendingFinalizeBlockerIssueIds],
+  };
+}
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
   companyId: string,
@@ -7555,15 +7587,19 @@ export function issueService(db: Db) {
         const dependencyReadiness = blockedByIssueIds === undefined
           ? (await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])).get(id)
           : null;
-        const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
-          ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
-          : dependencyReadiness?.unresolvedBlockerIssueIds ?? [];
+        const proposedReadiness = blockedByIssueIds !== undefined
+          ? await listProposedBlockerReadiness(dbOrTx, existing.companyId, blockedByIssueIds)
+          : null;
+        const unresolvedBlockerIssueIds = proposedReadiness?.unresolvedBlockerIssueIds
+          ?? dependencyReadiness?.unresolvedBlockerIssueIds
+          ?? [];
         if (unresolvedBlockerIssueIds.length > 0) {
           const unresolvedBlockers = await listUnresolvedBlockerDetails(
             dbOrTx,
             existing.companyId,
             unresolvedBlockerIssueIds,
-            dependencyReadiness?.pendingFinalizeBlockerIssueIds,
+            proposedReadiness?.pendingFinalizeBlockerIssueIds
+              ?? dependencyReadiness?.pendingFinalizeBlockerIssueIds,
           );
           throw unprocessable("Issue is blocked by unresolved blockers", {
             unresolvedBlockerIssueIds,
