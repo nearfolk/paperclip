@@ -8829,6 +8829,7 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       typeof updateFields.status === "string" &&
       updateFields.status !== existing.status &&
+      !isClosedIssueStatus(updateFields.status) &&
       (isBlocked || (isClosed && !isClosedIssueStatus(updateFields.status)));
     if (resumeRequested !== true && req.actor.type === "agent" && reopenRequested === true) {
       if (!(await assertExplicitResumeIntentAllowed(req, res, existing))) return;
