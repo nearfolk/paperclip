@@ -386,6 +386,7 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  launchEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -2172,6 +2173,7 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    launchEnv: runtimeEnv,
     loggedEnv,
     stateDir,
     permissionMode,
@@ -2260,16 +2262,28 @@ async function applySessionConfigOptions(input: {
   }
 }
 
+const AGENT_SUBPROCESS_ENV_DENYLIST = new Set([
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "DATABASE_URL",
+]);
+
 /**
  * Build the process-session launch env: the host env overlaid with the run's
  * `env` (so the merged paperclip bridge vars win) and a guaranteed `PATH`,
  * narrowed to string values. Shared by the remote concurrent bring-up and the
  * local / runner-less lane so both resolve the runtime env identically.
+ *
+ * Server-only credentials are removed after the merge so neither the host
+ * environment nor adapter-supplied overrides can expose them to an agent.
+ * Run-scoped PAPERCLIP_* values remain available to the child.
  */
 function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
+      (entry): entry is [string, string] =>
+        typeof entry[1] === "string" && !AGENT_SUBPROCESS_ENV_DENYLIST.has(entry[0]),
     ),
   );
 }
@@ -3573,7 +3587,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   mode: prepared.mode,
                   cwd: prepared.cwd,
                   resumeSessionId,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: { env: prepared.launchEnv },
                 });
                 ensureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3604,7 +3618,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   agent: prepared.acpxAgent,
                   mode: prepared.mode,
                   cwd: prepared.cwd,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: { env: prepared.launchEnv },
                 });
                 retryEnsureSessionMs = now() - ensureSessionStart;
                 return established;
