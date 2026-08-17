@@ -25,8 +25,12 @@ import type {
   IssueWorkMode,
   ModelProfileKey,
   IssueThreadInteractionContinuationPolicy,
+  IssueThreadInteractionCanonicalResolverPolicy,
+  IssueThreadInteractionEffectiveResolverPolicySource,
   IssueThreadInteractionKind,
+  IssueThreadInteractionLegacyResolverPolicyAlias,
   IssueThreadInteractionResolverPolicy,
+  IssueThreadInteractionResolverPolicyProvenance,
   IssueThreadInteractionStatus,
   IssueStatus,
 } from "../constants.js";
@@ -1295,7 +1299,9 @@ export interface RequestItemVerdictsResultItem {
   id: string;
   verdict: RequestItemVerdictValue;
   reason?: string | null;
-  resolvedByUserId: string;
+  resolvedByUserId?: string | null;
+  resolvedByAgentId?: string | null;
+  resolvedByRunId?: string | null;
   resolvedAt: Date | string;
   commentId?: string | null;
 }
@@ -1323,9 +1329,16 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   summary?: string | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
-  resolverPolicy: IssueThreadInteractionResolverPolicy;
-  requestedResolverPolicy: IssueThreadInteractionResolverPolicy;
-  effectiveResolverPolicy: IssueThreadInteractionResolverPolicy;
+  /** @deprecated Read requestedResolverPolicy. Kept for API compatibility. */
+  resolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
+  requestedResolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
+  effectiveResolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
+  resolverPolicyProvenance: IssueThreadInteractionResolverPolicyProvenance;
+  effectiveResolverPolicySource: IssueThreadInteractionEffectiveResolverPolicySource;
+  legacyResolverPolicyAliases: {
+    requested: IssueThreadInteractionLegacyResolverPolicyAlias | null;
+    effective: IssueThreadInteractionLegacyResolverPolicyAlias | null;
+  };
   createdAt: Date | string;
   updatedAt: Date | string;
   resolvedAt?: Date | string | null;
