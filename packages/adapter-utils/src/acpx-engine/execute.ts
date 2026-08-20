@@ -3981,7 +3981,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         for await (const event of turn.events) {
           if (event.type === "text_delta" && event.stream !== "thought") {
             currentOutputChunk.push(event.text);
-          } else if (event.type === "tool_call" && event.status === "pending") {
+          } else if (event.type === "tool_call" && event.tag !== "tool_call_update") {
+            // ACP makes tool-call status optional. The normalized event tag is
+            // the reliable boundary between an initial call and its updates,
+            // so a statusless initial call must still end the preceding output
+            // segment while updates must not create extra boundaries.
             flushOutputSegment();
           }
           if (event.type === "status" && event.tag === "usage_update") {
