@@ -373,9 +373,6 @@ export interface AcpxEngineExecutorOptions {
 
 interface AcpxPreparedRuntime {
   acpxAgent: string;
-  // See the config parsing site: adapter-declared engine behavior knobs with
-  // behavior-preserving defaults.
-  summaryStrategy: "full" | "lastOutputSegment";
   coalescePlaceholderToolUpdates: boolean;
   mode: "persistent" | "oneshot";
   cwd: string;
@@ -1608,13 +1605,8 @@ async function buildRuntime(input: {
   );
 
   const acpxAgent = normalizeAgent(config);
-  // Engine behavior knobs set by the invoking adapter's acpx config builder
-  // (never by the engine itself): a verbose streaming backend opts into
-  // last-segment run summaries and placeholder tool-update coalescing here.
-  // The defaults preserve the engine's long-standing behavior, and the engine
-  // carries no knowledge of which adapters opt in.
-  const summaryStrategy: "full" | "lastOutputSegment" =
-    config.summaryStrategy === "lastOutputSegment" ? "lastOutputSegment" : "full";
+  // Run summaries always fail closed to the final output segment so internal
+  // thought text and intermediate narration cannot become issue comments.
   const coalescePlaceholderToolUpdates = config.coalescePlaceholderToolUpdates === true;
   const mode = normalizeMode(config);
   const permissionMode = normalizePermissionMode(config);
@@ -2170,7 +2162,6 @@ async function buildRuntime(input: {
 
   return {
     acpxAgent,
-    summaryStrategy,
     coalescePlaceholderToolUpdates,
     mode,
     // Remote runner-backed → the in-sandbox workspace dir; local / runner-less
@@ -2459,8 +2450,7 @@ async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string,
 
 /**
  * Build the short run summary that Paperclip may auto-post as an issue comment
- * when the agent leaves no comment of its own. Used only for agents whose
- * traits opt into the "lastOutputSegment" summary strategy.
+ * when the agent leaves no comment of its own.
  *
  * Prefer the last non-empty *output* segment after a tool call. Intermediate
  * "let me check…" narration between tools must not become a 50k-char dump.
@@ -3872,12 +3862,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // controller and never rejects; it returns a `TurnCompletion`. The step
       // bodies below record the external result for the coordinator to reproduce.
       const runTurn = async (_ready: StartupReady): Promise<TurnCompletion> => {
-      // Summary accumulation, per the adapter-declared strategy. "full" (the
-      // default) collects every text delta exactly as before.
-      // "lastOutputSegment" collects output text only (never thought stream),
+      // Summary accumulation collects output text only (never thought stream),
       // segmented on tool starts so multi-step narration is not glued into one
-      // auto-comment dump.
-      const textParts: string[] = [];
+      // automatic comment dump.
       const outputSegments: string[] = [];
       let currentOutputChunk: string[] = [];
       const flushOutputSegment = () => {
@@ -3987,12 +3974,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const turn = activeTurn as AcpRuntimeTurn;
         const toolTitles = new Map<string, string>();
         for await (const event of turn.events) {
-          if (event.type === "text_delta") {
-            if (prepared.summaryStrategy === "full") {
-              textParts.push(event.text);
-            } else if (event.stream !== "thought") {
-              currentOutputChunk.push(event.text);
-            }
+          if (event.type === "text_delta" && event.stream !== "thought") {
+            currentOutputChunk.push(event.text);
           } else if (event.type === "tool_call" && event.status === "pending") {
             flushOutputSegment();
           }
@@ -4083,13 +4066,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               ? { cumulativeCostUsd: turnUsage.cumulativeCostUsd }
               : {}),
           },
-          summary:
-            prepared.summaryStrategy === "lastOutputSegment"
-              ? buildAcpxRunSummary({
-                  outputSegments,
-                  fallback: terminalStopReason || terminal.status,
-                })
-              : textParts.join("").trim() || terminalStopReason || terminal.status,
+          summary: buildAcpxRunSummary({
+            outputSegments,
+            fallback: terminalStopReason || terminal.status,
+          }),
           clearSession,
         };
         // The turn phase finished. A completed, non-timed-out turn is `ok`; every
