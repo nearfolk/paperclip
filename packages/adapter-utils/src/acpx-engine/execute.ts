@@ -1608,13 +1608,12 @@ async function buildRuntime(input: {
   );
 
   const acpxAgent = normalizeAgent(config);
-  // Engine behavior knobs set by the invoking adapter's acpx config builder
-  // (never by the engine itself): a verbose streaming backend opts into
-  // last-segment run summaries and placeholder tool-update coalescing here.
-  // The defaults preserve the engine's long-standing behavior, and the engine
-  // carries no knowledge of which adapters opt in.
+  // Engine behavior knobs set by the invoking adapter's acpx config builder.
+  // Run summaries fail closed to the final output segment so internal thought
+  // text and intermediate narration cannot become issue comments. An adapter
+  // may explicitly retain the legacy full summary when that output is safe.
   const summaryStrategy: "full" | "lastOutputSegment" =
-    config.summaryStrategy === "lastOutputSegment" ? "lastOutputSegment" : "full";
+    config.summaryStrategy === "full" ? "full" : "lastOutputSegment";
   const coalescePlaceholderToolUpdates = config.coalescePlaceholderToolUpdates === true;
   const mode = normalizeMode(config);
   const permissionMode = normalizePermissionMode(config);
@@ -2459,8 +2458,8 @@ async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string,
 
 /**
  * Build the short run summary that Paperclip may auto-post as an issue comment
- * when the agent leaves no comment of its own. Used only for agents whose
- * traits opt into the "lastOutputSegment" summary strategy.
+ * when the agent leaves no comment of its own. This is the default summary
+ * strategy; adapters must explicitly opt into legacy full summaries.
  *
  * Prefer the last non-empty *output* segment after a tool call. Intermediate
  * "let me check…" narration between tools must not become a 50k-char dump.
@@ -3872,11 +3871,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // controller and never rejects; it returns a `TurnCompletion`. The step
       // bodies below record the external result for the coordinator to reproduce.
       const runTurn = async (_ready: StartupReady): Promise<TurnCompletion> => {
-      // Summary accumulation, per the adapter-declared strategy. "full" (the
-      // default) collects every text delta exactly as before.
+      // Summary accumulation, per the adapter-declared strategy. The default
       // "lastOutputSegment" collects output text only (never thought stream),
       // segmented on tool starts so multi-step narration is not glued into one
-      // auto-comment dump.
+      // auto-comment dump. "full" is retained only for explicit compatibility.
       const textParts: string[] = [];
       const outputSegments: string[] = [];
       let currentOutputChunk: string[] = [];

@@ -628,7 +628,7 @@ describe("shared ACPX engine runtime behavior", () => {
     });
   });
 
-  it("pins the existing summary and tool-event behavior when no engine knobs are set", async () => {
+  it("defaults run summaries to the final output segment without thought text", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const logs: Array<{ stream: string; text: string }> = [];
@@ -705,13 +705,9 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(result.exitCode).toBe(0);
-    // The summary is the full concatenation of every text delta, thought
-    // stream included — the engine's long-standing behavior for claude,
-    // codex, gemini, and custom agents. If this assertion breaks, a change
-    // is altering summaries for existing adapters.
-    expect(result.summary).toBe(
-      "Let me get oriented and inspect the PRs…hidden chain of thought## Update\n\n- Checked PR status\n- Continue burn-in",
-    );
+    expect(result.summary).toBe("## Update\n\n- Checked PR status\n- Continue burn-in");
+    expect(result.summary).not.toContain("Let me get oriented");
+    expect(result.summary).not.toContain("hidden chain of thought");
     const toolCallEvents = logs
       .map((entry) => {
         try {
@@ -732,7 +728,7 @@ describe("shared ACPX engine runtime behavior", () => {
     ]);
   });
 
-  it("summarizes only the final output segment when the adapter sets summaryStrategy", async () => {
+  it("preserves full summaries when the adapter explicitly sets summaryStrategy", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const execute = createAcpxEngineExecutor({
@@ -803,7 +799,7 @@ describe("shared ACPX engine runtime behavior", () => {
         agent: "custom",
         agentCommand: "node ./fake-acp.js",
         stateDir,
-        summaryStrategy: "lastOutputSegment",
+        summaryStrategy: "full",
       },
       context: {},
       onLog: async () => {},
@@ -811,10 +807,9 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(result.exitCode).toBe(0);
-    // Must not include intermediate narration or thought stream.
-    expect(result.summary).toBe("## Update\n\n- Checked PR status\n- Continue burn-in");
-    expect(result.summary).not.toContain("Let me get oriented");
-    expect(result.summary).not.toContain("hidden chain of thought");
+    expect(result.summary).toBe(
+      "Let me get oriented and inspect the PRs…hidden chain of thought## Update\n\n- Checked PR status\n- Continue burn-in",
+    );
   });
 
   it("buildAcpxRunSummary prefers the last non-empty segment", () => {
