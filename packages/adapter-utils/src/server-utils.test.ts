@@ -403,6 +403,7 @@ describe("runChildProcess", () => {
           "agentJwtSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_AGENT_JWT_SECRET'),",
           "toolActionSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET'),",
           "betterAuthSecretPresent: Object.hasOwn(process.env, 'BETTER_AUTH_SECRET'),",
+          "otherServerSecretsPresent: ['PAPERCLIP_DECISION_SIGNING_SECRET','PAPERCLIP_SECRETS_MASTER_KEY','PAPERCLIP_SECRETS_MASTER_KEY_FILE','DATABASE_URL','DATABASE_MIGRATION_URL'].some((key) => Object.hasOwn(process.env, key)),",
           "runtimeApiKeyPresent: process.env.PAPERCLIP_API_KEY === 'run-token',",
           "safeValuePresent: process.env.SAFE_VALUE === 'visible'",
           "}));",
@@ -413,7 +414,12 @@ describe("runChildProcess", () => {
         env: {
           PAPERCLIP_AGENT_JWT_SECRET: "must-not-forward",
           PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "must-not-forward",
+          PAPERCLIP_DECISION_SIGNING_SECRET: "must-not-forward",
+          PAPERCLIP_SECRETS_MASTER_KEY: "must-not-forward",
+          PAPERCLIP_SECRETS_MASTER_KEY_FILE: "must-not-forward",
           BETTER_AUTH_SECRET: "must-not-forward",
+          DATABASE_URL: "must-not-forward",
+          DATABASE_MIGRATION_URL: "must-not-forward",
           PAPERCLIP_API_KEY: "run-token",
           SAFE_VALUE: "visible",
         },
@@ -428,6 +434,7 @@ describe("runChildProcess", () => {
       agentJwtSecretPresent: false,
       toolActionSecretPresent: false,
       betterAuthSecretPresent: false,
+      otherServerSecretsPresent: false,
       runtimeApiKeyPresent: true,
       safeValuePresent: true,
     });
@@ -2652,7 +2659,12 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
         PAPERCLIP_API_KEY: "explicit-key",
         PAPERCLIP_AGENT_JWT_SECRET: "explicit-key",
         PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "explicit-key",
+        PAPERCLIP_DECISION_SIGNING_SECRET: "explicit-key",
+        PAPERCLIP_SECRETS_MASTER_KEY: "explicit-key",
+        PAPERCLIP_SECRETS_MASTER_KEY_FILE: "explicit-key",
         BETTER_AUTH_SECRET: "explicit-key",
+        DATABASE_URL: "explicit-key",
+        DATABASE_MIGRATION_URL: "explicit-key",
       },
       workspaceCwd: null,
     });
@@ -2660,7 +2672,12 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
     expect(env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
     expect(env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_DECISION_SIGNING_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_SECRETS_MASTER_KEY_FILE).toBeUndefined();
     expect(env.BETTER_AUTH_SECRET).toBeUndefined();
+    expect(env.DATABASE_URL).toBeUndefined();
+    expect(env.DATABASE_MIGRATION_URL).toBeUndefined();
   });
 });
 

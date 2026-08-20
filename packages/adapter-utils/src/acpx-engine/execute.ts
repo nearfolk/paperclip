@@ -51,6 +51,8 @@ import {
   renderPaperclipWakePrompt,
   renderTemplate,
   resolvePaperclipInstanceRootForAdapter,
+  sanitizeAgentSpawnEnv,
+  sanitizeInheritedPaperclipEnv,
   selectPaperclipTaskMarkdown,
   resolvePaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
@@ -2262,13 +2264,6 @@ async function applySessionConfigOptions(input: {
   }
 }
 
-const AGENT_SUBPROCESS_ENV_DENYLIST = new Set([
-  "PAPERCLIP_AGENT_JWT_SECRET",
-  "BETTER_AUTH_SECRET",
-  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
-  "DATABASE_URL",
-]);
-
 /**
  * Build the process-session launch env: the host env overlaid with the run's
  * `env` (so the merged paperclip bridge vars win) and a guaranteed `PATH`,
@@ -2280,10 +2275,13 @@ const AGENT_SUBPROCESS_ENV_DENYLIST = new Set([
  * Run-scoped PAPERCLIP_* values remain available to the child.
  */
 function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
+  const launchEnv = ensurePathInEnv(sanitizeAgentSpawnEnv({
+    ...sanitizeInheritedPaperclipEnv(process.env),
+    ...env,
+  }));
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] =>
-        typeof entry[1] === "string" && !AGENT_SUBPROCESS_ENV_DENYLIST.has(entry[0]),
+    Object.entries(launchEnv).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
 }

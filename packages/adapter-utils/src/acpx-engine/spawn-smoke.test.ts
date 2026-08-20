@@ -51,9 +51,18 @@ it("does not export server-only secrets to the spawned agent", async () => {
   tempRoots.push(root);
   const secretKeys = [
     "PAPERCLIP_AGENT_JWT_SECRET",
+    "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+    "PAPERCLIP_DECISION_SIGNING_SECRET",
+    "PAPERCLIP_SECRETS_MASTER_KEY",
     "BETTER_AUTH_SECRET",
     "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+    "PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN",
+    "PAPERCLIP_DEV_SERVER_STATUS_TOKEN",
+    "PAPERCLIP_FEEDBACK_EXPORT_BACKEND_TOKEN",
+    "PAPERCLIP_TELEMETRY_BACKEND_TOKEN",
+    "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
     "DATABASE_URL",
+    "DATABASE_MIGRATION_URL",
   ];
   const inspectedKeys = [...secretKeys, "PAPERCLIP_API_KEY"];
   const previousValues = Object.fromEntries(secretKeys.map((key) => [key, process.env[key]]));
