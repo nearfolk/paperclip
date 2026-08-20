@@ -392,6 +392,47 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("strips server-only signing secrets from the final child environment", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        [
+          "process.stdout.write(JSON.stringify({",
+          "agentJwtSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_AGENT_JWT_SECRET'),",
+          "toolActionSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET'),",
+          "betterAuthSecretPresent: Object.hasOwn(process.env, 'BETTER_AUTH_SECRET'),",
+          "runtimeApiKeyPresent: process.env.PAPERCLIP_API_KEY === 'run-token',",
+          "safeValuePresent: process.env.SAFE_VALUE === 'visible'",
+          "}));",
+        ].join(""),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          PAPERCLIP_AGENT_JWT_SECRET: "must-not-forward",
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "must-not-forward",
+          BETTER_AUTH_SECRET: "must-not-forward",
+          PAPERCLIP_API_KEY: "run-token",
+          SAFE_VALUE: "visible",
+        },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      agentJwtSecretPresent: false,
+      toolActionSecretPresent: false,
+      betterAuthSecretPresent: false,
+      runtimeApiKeyPresent: true,
+      safeValuePresent: true,
+    });
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
@@ -2602,20 +2643,24 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_CLOUD_PROVIDER_TOKEN).toBe("cloud-token");
   });
 
-  it("never accepts PAPERCLIP_API_KEY from config env", () => {
+  it("never accepts runtime authentication or server signing keys from config env", () => {
     const env: Record<string, string> = {};
 
     refreshPaperclipWorkspaceEnvForExecution({
       env,
       envConfig: {
         PAPERCLIP_API_KEY: "explicit-key",
+        PAPERCLIP_AGENT_JWT_SECRET: "explicit-key",
+        PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "explicit-key",
+        BETTER_AUTH_SECRET: "explicit-key",
       },
       workspaceCwd: null,
     });
 
-    // The harness-minted run token is the only PAPERCLIP_API_KEY source;
-    // a configured value is dropped even when Paperclip has not set one.
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+    expect(env.BETTER_AUTH_SECRET).toBeUndefined();
   });
 });
 
