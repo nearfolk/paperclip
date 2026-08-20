@@ -75,6 +75,7 @@ it("does not export server-only secrets to the spawned agent", async () => {
     const result = await execute({
       runId: "spawn-env-smoke",
       agent: { id: "spawn-agent", companyId: "spawn-company" },
+      authToken: "run-scoped-value",
       runtime: {},
       config: {
         agent: "custom",
@@ -84,7 +85,6 @@ it("does not export server-only secrets to the spawned agent", async () => {
         cwd: repoRoot,
         env: {
           PAPERCLIP_ACPX_INSPECT_ENV_KEYS: inspectedKeys.join(","),
-          PAPERCLIP_API_KEY: "run-scoped-value",
           DATABASE_URL: marker,
         },
       },
