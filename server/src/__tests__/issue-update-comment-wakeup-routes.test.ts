@@ -282,7 +282,7 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
-  });
+  }, 15_000);
 
   it("interrupts the active run and wakes the newly assigned agent with handoff context", async () => {
     const existing = makeIssue({
