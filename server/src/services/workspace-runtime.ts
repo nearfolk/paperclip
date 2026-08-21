@@ -223,6 +223,7 @@ interface RuntimeServiceRecord extends RuntimeServiceRef {
   /** Loopback URL used for backend readiness/adoption; never serialized. */
   backendUrl: string | null;
   exposureConfig: RuntimeExposureConfigInput | null;
+  exitCleanupPromise?: Promise<void>;
 }
 
 type LocalRuntimeServiceStart = {
@@ -6164,11 +6165,16 @@ async function stopRuntimeService(serviceId: string) {
   // row non-stopped until verified termination succeeds.
   await cleanupRecordExposure(record);
   if (record.child && record.child.pid) {
+    const childExit = record.child.exitCode === null && record.child.signalCode === null
+      ? new Promise<void>((resolve) => record.child!.once("exit", () => resolve()))
+      : Promise.resolve();
     await terminateLocalService({
       pid: record.child.pid,
       processGroupId: record.processGroupId ?? record.child.pid,
       port: record.port,
     });
+    await childExit;
+    await record.exitCleanupPromise;
   } else if (record.providerRef) {
     const pid = Number.parseInt(record.providerRef, 10);
     if (Number.isInteger(pid) && pid > 0) {
@@ -6431,11 +6437,12 @@ function registerRuntimeService(db: Db | undefined, record: RuntimeServiceRecord
     if (current.reuseKey && runtimeServicesByReuseKey.get(current.reuseKey) === current.id) {
       runtimeServicesByReuseKey.delete(current.reuseKey);
     }
-    void (async () => {
+    current.exitCleanupPromise = (async () => {
       await cleanupRecordExposure(current);
       await removeLocalServiceRegistryRecord(current.serviceKey);
       await persistRuntimeServiceRecord(db, current);
     })();
+    void current.exitCleanupPromise.catch(() => undefined);
   });
 }
 
