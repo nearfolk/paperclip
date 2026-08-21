@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { createAcpxEngineExecutor } from "./execute.js";
 
 const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -53,6 +53,9 @@ it("does not export server-only secrets to the spawned agent", async () => {
     "PAPERCLIP_AGENT_JWT_SECRET",
     "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
     "PAPERCLIP_DECISION_SIGNING_SECRET",
+    "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
+    "PAPERCLIP_WORKSPACE_HANDOFF_KEY",
+    "PAPERCLIP_WORKSPACE_READINESS_TOKEN",
     "PAPERCLIP_SECRETS_MASTER_KEY",
     "BETTER_AUTH_SECRET",
     "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
@@ -61,13 +64,16 @@ it("does not export server-only secrets to the spawned agent", async () => {
     "PAPERCLIP_FEEDBACK_EXPORT_BACKEND_TOKEN",
     "PAPERCLIP_TELEMETRY_BACKEND_TOKEN",
     "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
+    "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
+    "PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY",
+    "PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY_PATH",
     "DATABASE_URL",
     "DATABASE_MIGRATION_URL",
   ];
-  const inspectedKeys = [...secretKeys, "PAPERCLIP_API_KEY"];
-  const previousValues = Object.fromEntries(secretKeys.map((key) => [key, process.env[key]]));
+  const ordinaryEnvKey = "ORDINARY_AGENT_ENV";
+  const inspectedKeys = [...secretKeys, "PAPERCLIP_API_KEY", ordinaryEnvKey];
   const marker = "must-not-reach-agent";
-  for (const key of secretKeys) process.env[key] = marker;
+  for (const key of secretKeys) vi.stubEnv(key, marker);
 
   try {
     const logs: string[] = [];
@@ -86,6 +92,7 @@ it("does not export server-only secrets to the spawned agent", async () => {
         env: {
           PAPERCLIP_ACPX_INSPECT_ENV_KEYS: inspectedKeys.join(","),
           DATABASE_URL: marker,
+          ORDINARY_AGENT_ENV: "visible",
         },
       },
       context: {},
@@ -97,13 +104,10 @@ it("does not export server-only secrets to the spawned agent", async () => {
     const output = logs.join("");
     for (const key of secretKeys) expect(output).toContain(`\\"${key}\\":false`);
     expect(output).toContain(`\\"PAPERCLIP_API_KEY\\":true`);
+    expect(output).toContain(`\\"${ordinaryEnvKey}\\":true`);
     expect(output).not.toContain(marker);
   } finally {
-    for (const key of secretKeys) {
-      const previous = previousValues[key];
-      if (previous === undefined) delete process.env[key];
-      else process.env[key] = previous;
-    }
+    vi.unstubAllEnvs();
   }
 });
 

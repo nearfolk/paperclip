@@ -1693,8 +1693,8 @@ async function buildRuntime(input: {
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
     // Paperclip has already assigned this run. PAPERCLIP_API_KEY is never
     // accepted from config — the harness-minted run token is the only source.
-    // A PAPERCLIP_* key Paperclip did NOT set is stable per-run config, so it
-    // applies and feeds the fingerprint hash below.
+    // A non-server-only PAPERCLIP_* key Paperclip did NOT set is stable per-run
+    // config, so it applies and feeds the fingerprint hash below.
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;

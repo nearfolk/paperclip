@@ -1486,14 +1486,18 @@ describe("shared ACPX engine runtime behavior", () => {
         close: async () => {},
       }) as never,
     });
-    const previousApiKey = process.env.PAPERCLIP_API_KEY;
+    vi.stubEnv("PAPERCLIP_API_KEY", "host-value-must-not-win");
+    vi.stubEnv("PAPERCLIP_WORKSPACE_HANDOFF_SECRET", "server-only-marker");
     try {
-      delete process.env.PAPERCLIP_API_KEY;
       const result = await execute({
         runId: "run-1",
         agent: { id: "agent-1", companyId: "company-1" },
         runtime: {},
-        config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+        config: {
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          env: { ORDINARY_AGENT_ENV: "visible" },
+        },
         context: {},
         authToken: "runtime-key",
         onLog: async () => {},
@@ -1501,10 +1505,10 @@ describe("shared ACPX engine runtime behavior", () => {
       } as never);
       expect(result.exitCode).toBe(0);
       expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
-      expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
+      expect(Object.hasOwn(observedSessionEnv ?? {}, "PAPERCLIP_WORKSPACE_HANDOFF_SECRET")).toBe(false);
+      expect(Object.hasOwn(observedSessionEnv ?? {}, "ORDINARY_AGENT_ENV")).toBe(true);
     } finally {
-      if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
-      else process.env.PAPERCLIP_API_KEY = previousApiKey;
+      vi.unstubAllEnvs();
     }
   });
 

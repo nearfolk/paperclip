@@ -392,7 +392,7 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
-  it("strips server-only signing secrets from the final child environment", async () => {
+  it("strips server-only credentials from the final child environment", async () => {
     const result = await runChildProcess(
       randomUUID(),
       process.execPath,
@@ -402,10 +402,15 @@ describe("runChildProcess", () => {
           "process.stdout.write(JSON.stringify({",
           "agentJwtSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_AGENT_JWT_SECRET'),",
           "toolActionSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET'),",
+          "handoffRootSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_WORKSPACE_HANDOFF_SECRET'),",
+          "handoffKeyPresent: Object.hasOwn(process.env, 'PAPERCLIP_WORKSPACE_HANDOFF_KEY'),",
+          "readinessTokenPresent: Object.hasOwn(process.env, 'PAPERCLIP_WORKSPACE_READINESS_TOKEN'),",
+          "providerOauthSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET'),",
+          "liveSshSecretPresent: Object.hasOwn(process.env, 'PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY'),",
           "betterAuthSecretPresent: Object.hasOwn(process.env, 'BETTER_AUTH_SECRET'),",
           "otherServerSecretsPresent: ['PAPERCLIP_DECISION_SIGNING_SECRET','PAPERCLIP_SECRETS_MASTER_KEY','PAPERCLIP_SECRETS_MASTER_KEY_FILE','DATABASE_URL','DATABASE_MIGRATION_URL'].some((key) => Object.hasOwn(process.env, key)),",
-          "runtimeApiKeyPresent: process.env.PAPERCLIP_API_KEY === 'run-token',",
-          "safeValuePresent: process.env.SAFE_VALUE === 'visible'",
+          "runtimeApiKeyPresent: Object.hasOwn(process.env, 'PAPERCLIP_API_KEY'),",
+          "safeValuePresent: Object.hasOwn(process.env, 'SAFE_VALUE')",
           "}));",
         ].join(""),
       ],
@@ -415,8 +420,13 @@ describe("runChildProcess", () => {
           PAPERCLIP_AGENT_JWT_SECRET: "must-not-forward",
           PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "must-not-forward",
           PAPERCLIP_DECISION_SIGNING_SECRET: "must-not-forward",
+          PAPERCLIP_WORKSPACE_HANDOFF_SECRET: "must-not-forward",
+          PAPERCLIP_WORKSPACE_HANDOFF_KEY: "must-not-forward",
+          PAPERCLIP_WORKSPACE_READINESS_TOKEN: "must-not-forward",
           PAPERCLIP_SECRETS_MASTER_KEY: "must-not-forward",
           PAPERCLIP_SECRETS_MASTER_KEY_FILE: "must-not-forward",
+          PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET: "must-not-forward",
+          PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY: "must-not-forward",
           BETTER_AUTH_SECRET: "must-not-forward",
           DATABASE_URL: "must-not-forward",
           DATABASE_MIGRATION_URL: "must-not-forward",
@@ -433,6 +443,11 @@ describe("runChildProcess", () => {
     expect(JSON.parse(result.stdout)).toEqual({
       agentJwtSecretPresent: false,
       toolActionSecretPresent: false,
+      handoffRootSecretPresent: false,
+      handoffKeyPresent: false,
+      readinessTokenPresent: false,
+      providerOauthSecretPresent: false,
+      liveSshSecretPresent: false,
       betterAuthSecretPresent: false,
       otherServerSecretsPresent: false,
       runtimeApiKeyPresent: true,
@@ -2650,7 +2665,7 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_CLOUD_PROVIDER_TOKEN).toBe("cloud-token");
   });
 
-  it("never accepts runtime authentication or server signing keys from config env", () => {
+  it("never accepts runtime authentication or server-only credentials from config env", () => {
     const env: Record<string, string> = {};
 
     refreshPaperclipWorkspaceEnvForExecution({
@@ -2660,8 +2675,13 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
         PAPERCLIP_AGENT_JWT_SECRET: "explicit-key",
         PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "explicit-key",
         PAPERCLIP_DECISION_SIGNING_SECRET: "explicit-key",
+        PAPERCLIP_WORKSPACE_HANDOFF_SECRET: "explicit-key",
+        PAPERCLIP_WORKSPACE_HANDOFF_KEY: "explicit-key",
+        PAPERCLIP_WORKSPACE_READINESS_TOKEN: "explicit-key",
         PAPERCLIP_SECRETS_MASTER_KEY: "explicit-key",
         PAPERCLIP_SECRETS_MASTER_KEY_FILE: "explicit-key",
+        PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET: "explicit-key",
+        PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY: "explicit-key",
         BETTER_AUTH_SECRET: "explicit-key",
         DATABASE_URL: "explicit-key",
         DATABASE_MIGRATION_URL: "explicit-key",
@@ -2673,8 +2693,13 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
     expect(env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
     expect(env.PAPERCLIP_DECISION_SIGNING_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_WORKSPACE_HANDOFF_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_WORKSPACE_HANDOFF_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_WORKSPACE_READINESS_TOKEN).toBeUndefined();
     expect(env.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
     expect(env.PAPERCLIP_SECRETS_MASTER_KEY_FILE).toBeUndefined();
+    expect(env.PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET).toBeUndefined();
+    expect(env.PAPERCLIP_ENV_LIVE_SSH_PRIVATE_KEY).toBeUndefined();
     expect(env.BETTER_AUTH_SECRET).toBeUndefined();
     expect(env.DATABASE_URL).toBeUndefined();
     expect(env.DATABASE_MIGRATION_URL).toBeUndefined();
