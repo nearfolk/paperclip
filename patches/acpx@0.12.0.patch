@@ -58,9 +58,10 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
 diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
-@@ -2926,0 +2927,8 @@ function buildAgentEnvironment(authCredentials, sessionEnv) {
+@@ -2926,0 +2927,9 @@ function buildAgentEnvironment(authCredentials, sessionEnv) {
 +	for (const key of [
-+		"PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
++		"PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
++		"PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
 +		"PAPERCLIP_DECISION_SIGNING_SECRET", "PAPERCLIP_SECRETS_MASTER_KEY",
 +		"PAPERCLIP_SECRETS_MASTER_KEY_FILE", "PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN",
 +		"PAPERCLIP_DEV_SERVER_STATUS_TOKEN", "PAPERCLIP_FEEDBACK_EXPORT_BACKEND_TOKEN",

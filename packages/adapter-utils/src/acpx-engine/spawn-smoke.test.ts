@@ -51,6 +51,7 @@ it("does not export server-only secrets to the spawned agent", async () => {
   tempRoots.push(root);
   const secretKeys = [
     "PAPERCLIP_AGENT_JWT_SECRET",
+    "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
     "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
     "PAPERCLIP_DECISION_SIGNING_SECRET",
     "PAPERCLIP_SECRETS_MASTER_KEY",
