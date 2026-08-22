@@ -45,6 +45,7 @@ import {
 import {
   createDuplexBridgeBroker,
   DEFAULT_DUPLEX_BROKER_BUDGETS,
+  DUPLEX_CHANNEL_LOST_ERROR_CODE,
   isSafeBridgeMethod,
   typedDuplexLossReason,
   type DuplexBridgeBroker,
@@ -235,6 +236,18 @@ export interface AdapterExecutionTargetProcessOptions {
    * onLog is suppressed and incremental chunks flow through `onLog` instead.
    */
   runLogTail?: SandboxRunLogTailFactory | null;
+  /**
+   * Sandbox-only: the atomic run-disposition settle from the Paperclip bridge
+   * handle. When provided, `runAdapterExecutionTargetProcess` calls it once at
+   * the clean-completion boundary of the process, synchronously and before the
+   * run-log tail finishes. The call reads the disposition and marks the
+   * host-observed orderly completion in one broker step, so a gateway exit
+   * after the clean process completion cannot latch a false mid-run loss. A
+   * control channel that died before the clean completion still fails the run
+   * closed with the typed `duplex_channel_lost` code. The file bridge path
+   * never sets it.
+   */
+  settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
 }
 
@@ -263,6 +276,15 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
    * whose control channel died mid-turn.
    */
   readRunDisposition?(): DuplexBrokerRunDisposition;
+  /**
+   * Atomically read the run disposition and mark the host-observed orderly
+   * completion in one broker step. The ACP lane calls it at the terminal
+   * finalization boundary for a success-eligible completion, so no `await` can
+   * separate the read from the mark and a teardown loss cannot slip in between.
+   * A loss that already latched keeps the failure, because the broker no-ops the
+   * mark after a latched loss. The file bridge path never sets it.
+   */
+  settleRunDisposition?(): DuplexBrokerRunDisposition;
   /**
    * Mark the host-observed orderly completion of the agent turn on the broker's
    * ordered lifecycle. The caller marks it at the ACP terminal-finalization
@@ -720,6 +742,35 @@ export async function resolveAdapterExecutionTargetCommandForLogs(
   });
 }
 
+// Apply the run-disposition seam to one clean process result. Only a clean
+// completion is success-eligible: a timed-out, signalled, or non-zero-exit
+// result is already a failure, so the seam leaves it unchanged. This is the same
+// success-eligibility rule the ACP lane applies. For a success-eligible result
+// the seam settles the disposition in one atomic broker step: it reads the
+// disposition and marks the host-observed orderly completion together, so a
+// gateway exit after the clean completion cannot latch a false mid-run loss. A
+// duplex control channel that died before the clean completion fails the run
+// closed: the seam sets a non-zero exit code, the typed `duplex_channel_lost`
+// error code, and a stderr note that names only the typed loss reason.
+function applyRunDispositionSeam(
+  result: RunProcessResult,
+  settleRunDisposition: (() => DuplexBrokerRunDisposition) | null | undefined,
+): RunProcessResult {
+  const successEligible = result.exitCode === 0 && !result.timedOut && result.signal === null;
+  if (!successEligible || !settleRunDisposition) return result;
+  const disposition = settleRunDisposition();
+  if (!disposition.failed) return result;
+  const lossReason = disposition.lossReason ?? "other";
+  const note = `[paperclip] The sandbox duplex control channel was lost (${lossReason}) before the run completed.\n`;
+  const separator = result.stderr.length > 0 && !result.stderr.endsWith("\n") ? "\n" : "";
+  return {
+    ...result,
+    exitCode: 1,
+    errorCode: DUPLEX_CHANNEL_LOST_ERROR_CODE,
+    stderr: `${result.stderr}${separator}${note}`,
+  };
+}
+
 export async function runAdapterExecutionTargetProcess(
   runId: string,
   target: AdapterExecutionTarget | null | undefined,
@@ -756,10 +807,17 @@ export async function runAdapterExecutionTargetProcess(
           ? async (meta) => options.onSpawn?.({ ...meta, processGroupId: null })
           : undefined,
       });
+      // Settle the duplex run disposition synchronously at the clean-completion
+      // boundary, before the run-log tail finishes. The atomic settle marks the
+      // host-observed orderly completion in one broker step, so a gateway exit
+      // after the clean process completion cannot latch a false mid-run loss. A
+      // control channel that died before this clean completion still fails the
+      // run closed.
+      const settled = applyRunDispositionSeam(result, options.settleRunDisposition);
       if (runLogTail) {
         await runLogTail.finish({ stdout: result.stdout, stderr: result.stderr });
       }
-      return result;
+      return settled;
     } catch (error) {
       if (runLogTail) {
         await runLogTail.abort();
@@ -3144,6 +3202,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             // seam. A loss ordered before an orderly completion reports a failure
             // with the typed loss reason; every other state reports a success.
             readRunDisposition: (): DuplexBrokerRunDisposition => activeBroker.runDisposition,
+            // Atomically read the latch and mark the orderly completion for the
+            // ACP success-eligible terminal, so no await separates the read from
+            // the mark and a teardown loss cannot slip in between.
+            settleRunDisposition: (): DuplexBrokerRunDisposition => activeBroker.settleRunDisposition(),
             // Surface the broker's orderly-completion mark to the run-disposition
             // seam. The seam marks the completion for a success-eligible terminal,
             // so a teardown loss after the completion stays a normal teardown.
