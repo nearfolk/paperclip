@@ -350,6 +350,24 @@ field.
 | `sandbox_duplex_loss_total` | One terminal duplex channel loss. The `loss_class` dimension records the phase. |
 | `sandbox_duplex_session_leak_total` | One leaked provider session at teardown. |
 
+### Aggregate byte ledger metrics
+
+The host aggregate byte ledger owns one process-scoped gauge and two
+process-scoped counters. The ledger bounds the retained bytes across every live
+duplex route in one process. It sets the gauge on each reserve and each release.
+It increments a counter on a rejected reservation and on an accounting defect.
+These records carry no dimension label. The guarded counter store keys each
+counter on `(companyId, metric)`, and the gauge reports one process value, so no
+dynamic dimension rides them. The code owner is
+`packages/adapter-utils/src/duplex-aggregate-byte-ledger.ts`, and the metric
+names are literal constants in `duplex-telemetry.ts`.
+
+| Metric | Type | Scope |
+| --- | --- | --- |
+| `sandbox_duplex_aggregate_bytes_in_use` | gauge | The aggregate retained bytes across every live duplex route. The ledger sets it on each reserve and each release. |
+| `sandbox_duplex_aggregate_byte_reservation_rejections_total` | counter | One rejected aggregate byte reservation. The ledger increments it when a reservation would pass the aggregate ceiling. |
+| `sandbox_duplex_aggregate_byte_accounting_underflow_total` | counter | One aggregate byte accounting defect. The ledger increments it on a double release or on a transfer of a token it does not hold. |
+
 ### Dimension keys
 
 Counters carry no dimension labels. The guarded counter store keys each counter
@@ -366,6 +384,7 @@ key never reaches a sink by accident.
 | `outcome` | string | yes | `ok` or `error`. |
 | `fallback_reason` | string | yes | `gate_off`, `capability_absent`, `open_failed`, `ready_invalid`, `ready_nonce_mismatch`, `ready_timeout`, or `contaminated`. It rides only a fallback record. |
 | `loss_class` | string | yes | `pre_dispatch` or `post_dispatch`, relative to the first request dispatch. It rides only a loss record. |
+| `loss_reason` | string | yes | `stdin_eof`, `provider_exit`, `heartbeat_timeout`, `rpc_failure`, `write_error`, `transport_closed`, or `other`. The host maps every loss cause to one of these values, so no raw provider text reaches a sink. `write_error` marks a rejected host-to-sandbox write. `transport_closed` marks a reason-less provider transport close with no exit data. It rides only a loss record. |
 
 To add a name or an enum value, extend the literal constant in
 `duplex-telemetry.ts` first, then update the test that asserts the closed set.

@@ -19,6 +19,14 @@ const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
+// The default cap on the aggregate raw bytes the in-sandbox duplex frame decoder
+// retains between chunks. The generated gateway runs in a separate operating-system
+// process, so it cannot share the host aggregate byte ledger. It enforces this
+// separate cap locally under the `sandbox_process` scope, and the provider memory
+// allocation bounds it. The host passes the value through
+// PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES. The default is well above one maximum
+// frame, so a legitimate single frame never trips it.
+const DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES = 8 * 1024 * 1024;
 // Per-iteration timeout for one poll-loop client call. A healthy control-plane
 // round trip finishes in well under one second, so 10s is far above a normal
 // iteration and never false-fires on a slow-but-live call. It is also well
@@ -88,6 +96,18 @@ const CALLBACK_BRIDGE_RELAY_REQUEST_SPAN = "sandbox.callbackBridge.relayRequest"
 const CALLBACK_BRIDGE_WORKER_FAILED_SPAN = "sandbox.callbackBridge.workerFailed";
 
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES = DEFAULT_BRIDGE_MAX_BODY_BYTES;
+
+/**
+ * The default cap on the aggregate raw bytes the generated in-sandbox duplex frame
+ * decoder retains. The host passes it through
+ * `PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES`. The in-sandbox decoder enforces the
+ * cap locally under the `sandbox_process` scope; it never touches the host
+ * aggregate byte ledger.
+ */
+export const DEFAULT_SANDBOX_DUPLEX_DECODER_MAX_BYTES = DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES;
+
+/** The scope label the in-sandbox duplex decoder reports for its local byte counter. */
+export const SANDBOX_DUPLEX_DECODER_SCOPE = "sandbox_process";
 
 export interface SandboxCallbackBridgeRouteRule {
   method: string;
@@ -1746,6 +1766,8 @@ export async function startSandboxCallbackBridgeServer(input: {
 const DUPLEX_GATEWAY_CODEC_SOURCE = `const DUPLEX_FRAME_VERSION = 1;
 const DEFAULT_MAX_DUPLEX_FRAME_BYTES = 1000000;
 const DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES = 256;
+const DEFAULT_MAX_DUPLEX_DECODER_BYTES = ${DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES};
+const DUPLEX_DECODER_SCOPE = "${SANDBOX_DUPLEX_DECODER_SCOPE}";
 const DUPLEX_NEWLINE_BYTE = 0x0a;
 const DUPLEX_EMPTY = Buffer.alloc(0);
 const DUPLEX_RESPONSE_OUTCOMES = new Set(["completed", "indeterminate", "unavailable"]);
@@ -1772,6 +1794,15 @@ function duplexIsStringRecord(value) {
 
 function encodeDuplexFrame(frame) {
   return JSON.stringify(frame) + "\\n";
+}
+
+function encodeDuplexFrameChecked(frame, maxFrameBytes) {
+  const limit = maxFrameBytes != null ? maxFrameBytes : DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+  const json = JSON.stringify(frame);
+  if (Buffer.byteLength(json, "utf8") > limit) {
+    return { ok: false, error: { code: "frame_too_large", message: "frame exceeds the maximum size" } };
+  }
+  return { ok: true, line: json + "\\n" };
 }
 
 function decodeDuplexLine(line) {
@@ -1872,10 +1903,32 @@ class DuplexFrameDecoder {
     this.discarding = false;
     this.maxFrameBytes =
       options && options.maxFrameBytes != null ? options.maxFrameBytes : DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+    // The in-sandbox decoder runs in a separate operating-system process, so it
+    // cannot share the host aggregate byte ledger. It bounds its own retained
+    // bytes with a local cap under the "sandbox_process" scope. The counters here
+    // never increment or release a host aggregate token.
+    this.scope = DUPLEX_DECODER_SCOPE;
+    this.maxAggregateBytes =
+      options && options.maxAggregateBytes != null
+        ? options.maxAggregateBytes
+        : DEFAULT_MAX_DUPLEX_DECODER_BYTES;
+    this.bytesInUse = 0;
+    this.aggregateRejections = 0;
   }
 
   push(chunk) {
     const incoming = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
+    // Enforce the local sandbox-process cap before the concat allocates the peak
+    // "old + incoming" buffer. A rejection fails closed: the decoder drops the
+    // retained buffer and the incoming chunk, resynchronizes at the next newline,
+    // and reports the aggregate rejection. It retains nothing over the cap.
+    if (this.buffer.length + incoming.length > this.maxAggregateBytes) {
+      this.buffer = DUPLEX_EMPTY;
+      this.discarding = true;
+      this.bytesInUse = 0;
+      this.aggregateRejections += 1;
+      return [duplexFail("aggregate_bytes_exceeded", "aggregate retained bytes exceeded the sandbox-process cap")];
+    }
     this.buffer = this.buffer.length === 0 ? incoming : Buffer.concat([this.buffer, incoming]);
     const results = [];
     for (;;) {
@@ -1907,6 +1960,8 @@ class DuplexFrameDecoder {
       }
       results.push(decodeDuplexLine(line));
     }
+    // Reconcile the local sandbox-process counter to the bytes still retained.
+    this.bytesInUse = this.buffer.length;
     return results;
   }
 }`;
@@ -1915,9 +1970,10 @@ class DuplexFrameDecoder {
  * Return the exact zero-dependency codec source the generated duplex gateway
  * embeds. A test runs every fixture vector against this source, so it proves the
  * embedded copy decodes the same bytes as the host codec. The source declares
- * `encodeDuplexFrame`, `decodeDuplexLine`, `DuplexFrameDecoder`,
- * `DUPLEX_FRAME_VERSION`, and `DEFAULT_MAX_DUPLEX_FRAME_BYTES`, but exports none
- * of them; a caller wraps it to read those names.
+ * `encodeDuplexFrame`, `encodeDuplexFrameChecked`, `decodeDuplexLine`,
+ * `DuplexFrameDecoder`, `DUPLEX_FRAME_VERSION`, and
+ * `DEFAULT_MAX_DUPLEX_FRAME_BYTES`, but exports none of them; a caller wraps it to
+ * read those names.
  */
 export function getSandboxDuplexGatewayCodecSource(): string {
   return DUPLEX_GATEWAY_CODEC_SOURCE;
@@ -1949,6 +2005,12 @@ const responseTimeoutMs = Number(
 );
 const maxQueueDepth = Number(process.env.PAPERCLIP_BRIDGE_MAX_QUEUE_DEPTH || "${DEFAULT_BRIDGE_MAX_QUEUE_DEPTH}");
 const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_BODY_BYTES}");
+// The host passes the separate sandbox-process raw-decoder cap here. The in-sandbox
+// decoder enforces it locally under the "sandbox_process" scope; it never shares the
+// host aggregate byte ledger.
+const maxDuplexDecoderBytes = Number(
+  process.env.PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES || "${DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES}",
+);
 const heartbeatIntervalMs = Number(
   process.env.PAPERCLIP_BRIDGE_HEARTBEAT_INTERVAL_MS || "${DEFAULT_DUPLEX_GATEWAY_HEARTBEAT_INTERVAL_MS}",
 );
@@ -2210,7 +2272,7 @@ function runDuplexGateway() {
     // local action here.
   }
 
-  const decoder = new DuplexFrameDecoder();
+  const decoder = new DuplexFrameDecoder({ maxAggregateBytes: maxDuplexDecoderBytes });
   process.stdin.on("data", (chunk) => {
     lastInboundAt = Date.now();
     for (const result of decoder.push(chunk)) {
@@ -2273,6 +2335,16 @@ function runDuplexGateway() {
         headers: normalizeHeaders(req.headers),
         body: requestBody,
       };
+      // Enforce the frame size bound on encode. When the request body makes the
+      // frame exceed the bound, fail this one local request with a clean 413. Do
+      // not write the frame and do not trigger loss. The frame never leaves the
+      // gateway, so no other in-flight request is affected and the channel stays
+      // open.
+      const encodedRequest = encodeDuplexFrameChecked(requestFrame);
+      if (!encodedRequest.ok) {
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
       const response = await new Promise((resolve) => {
         const timer = setTimeout(() => {
           if (pending.delete(requestId)) {
@@ -2284,7 +2356,7 @@ function runDuplexGateway() {
           }
         }, responseTimeoutMs);
         pending.set(requestId, { resolve: resolve, timer: timer });
-        writeFrame(requestFrame);
+        process.stdout.write(encodedRequest.line);
       });
       res.statusCode = typeof response.status === "number" ? response.status : 200;
       for (const [key, value] of Object.entries(response.headers || {})) {
