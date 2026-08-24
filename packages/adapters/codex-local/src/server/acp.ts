@@ -283,7 +283,62 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
   };
 }
 
-function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
+const CODEX_ACP_STREAM_DISCONNECTED_RE =
+  /^(?:warning:\s+falling back from websockets to https transport\.\s*)?stream disconnected before completion:/i;
+const CODEX_ACP_SKILL_BUDGET_WARNING_RE =
+  /^warning:\s+skill descriptions were shortened to fit the .+ skills context budget\./i;
+
+function completedCodexAcpStreamFailure(result: AdapterExecutionResult): string | null {
+  if ((result.exitCode ?? 0) !== 0) return null;
+
+  const resultJson = parseObject(result.resultJson);
+  if (asString(resultJson.status, "") !== "completed") return null;
+
+  const paragraphs = (result.summary ?? "")
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const failureParagraphs = paragraphs.filter((paragraph) => CODEX_ACP_STREAM_DISCONNECTED_RE.test(paragraph));
+  if (failureParagraphs.length === 0) return null;
+
+  // Codex currently reports this transport failure as a normal end_turn and
+  // emits the diagnostics as agent-message chunks. Only reinterpret a summary
+  // made entirely of those diagnostics plus Codex's benign skill-budget
+  // warning, so ordinary agent prose that quotes the error remains successful.
+  if (
+    paragraphs.some(
+      (paragraph) =>
+        !CODEX_ACP_STREAM_DISCONNECTED_RE.test(paragraph) &&
+        !CODEX_ACP_SKILL_BUDGET_WARNING_RE.test(paragraph),
+    )
+  ) {
+    return null;
+  }
+
+  return failureParagraphs.at(-1) ?? null;
+}
+
+function withCodexAcpFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
+  const streamFailure = completedCodexAcpStreamFailure(result);
+  if (streamFailure) {
+    const resultJson = parseObject(result.resultJson);
+    return {
+      ...result,
+      exitCode: 1,
+      errorMessage: streamFailure,
+      errorCode: "codex_transient_upstream",
+      errorFamily: "transient_upstream",
+      clearSession: true,
+      resultJson: {
+        ...(result.resultJson ?? {}),
+        status: "failed",
+        stopReason: "codex_stream_disconnected",
+        originalStopReason: asString(resultJson.stopReason, "") || null,
+        errorFamily: "transient_upstream",
+      },
+    };
+  }
+
   if ((result.exitCode ?? 0) === 0) return result;
   const resultJson = parseObject(result.resultJson);
   const stopReason = asString(resultJson.stopReason, "");
@@ -353,7 +408,7 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       ...ctx,
       config: buildCodexAcpConfig(ctx.config),
     });
-    return withCodexAuthRefreshFailureClassification(result);
+    return withCodexAcpFailureClassification(result);
   };
 }
 
