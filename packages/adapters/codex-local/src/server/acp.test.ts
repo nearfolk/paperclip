@@ -1024,6 +1024,76 @@ describe("codex_local ACP lane", () => {
     expect(result.resultJson).not.toHaveProperty("codexCredentialTelemetry");
   });
 
+  it("classifies completed ACP turns containing only Codex stream-disconnect diagnostics as transient failures", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-stream-disconnect-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) =>
+        new FakeRuntime(
+          options,
+          [
+            {
+              type: "text_delta",
+              text: "Warning: Skill descriptions were shortened to fit the 2% skills context budget.\n\n",
+              stream: "output",
+              tag: "agent_message_chunk",
+            },
+            {
+              type: "text_delta",
+              text: "Warning: Falling back from WebSockets to HTTPS transport. stream disconnected before completion: failed to lookup address information: nodename nor servname provided, or not known\n\n",
+              stream: "output",
+              tag: "agent_message_chunk",
+            },
+            {
+              type: "text_delta",
+              text: "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)\n\n",
+              stream: "output",
+              tag: "agent_message_chunk",
+            },
+          ],
+          { status: "completed", stopReason: "end_turn" },
+        ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("codex_transient_upstream");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorMessage).toContain("stream disconnected before completion");
+    expect(result.clearSession).toBe(true);
+    expect(result.resultJson).toMatchObject({
+      status: "failed",
+      stopReason: "codex_stream_disconnected",
+      originalStopReason: "end_turn",
+      errorFamily: "transient_upstream",
+    });
+  });
+
+  it("keeps a completed ACP turn successful when normal agent prose quotes a stream-disconnect diagnostic", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-stream-disconnect-prose-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) =>
+        new FakeRuntime(
+          options,
+          [
+            {
+              type: "text_delta",
+              text: "I investigated stream disconnected before completion: error sending request for url. The issue is now fixed.",
+              stream: "output",
+              tag: "agent_message_chunk",
+            },
+          ],
+          { status: "completed", stopReason: "end_turn" },
+        ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect(result.resultJson).toMatchObject({ status: "completed", stopReason: "end_turn" });
+  });
+
   it("resumes compatible ACP sessions on later Codex ACP runs", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-resume-");
     const runtimes: FakeRuntime[] = [];
