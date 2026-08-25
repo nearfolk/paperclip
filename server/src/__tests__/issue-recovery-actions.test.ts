@@ -1307,6 +1307,95 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  it("cancels stale recovery while preserving the exact backlog source state", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "backlog", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const [sourceBefore] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:intentional-backlog",
+      evidence: { latestIssueStatus: "backlog" },
+      nextAction: "Confirm the source disposition before retrying.",
+      wakePolicy: { type: "manual" },
+    });
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+
+    const resolved = await request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup,
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "backlog",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "backlog",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action cancelled because the source issue remains intentionally backlogged.",
+    });
+    expect(resolved.body.recoveryAction.resolvedAt).toBeTruthy();
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceAfter).toEqual(sourceBefore);
+    expect(sourceAfter).toMatchObject({
+      status: "backlog",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action cancelled because the source issue remains intentionally backlogged.",
+    });
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+    expect(await db.select().from(issueRelations)).toEqual([]);
+    const issueRows = await db.select().from(issues);
+    expect(issueRows).toHaveLength(1);
+    expect(issueRows.filter((row) => row.status === "blocked")).toEqual([]);
+    expect(enqueueRecoveryActionWakeup).not.toHaveBeenCalled();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.some((row) => row.action === "issue.updated")).toBe(false);
+    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
+      recoveryActionId: action.id,
+      recoveryActionStatus: "cancelled",
+      outcome: "cancelled",
+      sourceIssueStatus: "backlog",
+      resolutionNote: "Recovery action cancelled because the source issue remains intentionally backlogged.",
+    });
+  });
+
   it("hands restored work back to the recorded return owner and records the outcome", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
@@ -1552,6 +1641,50 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("folds stale recovery during read projection when the source remains intentionally backlogged", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:backlog-projection",
+      evidence: { latestIssueStatus: "backlog" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp();
+
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+    expect(detail.body).toMatchObject({
+      id: sourceIssueId,
+      status: "backlog",
+      activeRecoveryAction: null,
+    });
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue remains intentionally backlogged.",
+    });
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({ status: "backlog", checkoutRunId: null, executionRunId: null });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+    expect(await db.select().from(issueRelations)).toEqual([]);
+  });
+
   it("keeps active recovery visible when a plain comment does not create a live path", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
@@ -1785,6 +1918,50 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "resolved",
       outcome: "owner_completed",
     });
+  });
+
+  it("keeps backlog-preserving cancellation board-only even for the named recovery owner", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:backlog-board-only",
+      evidence: { latestIssueStatus: "backlog" },
+      nextAction: "Confirm whether recovery should remain active.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: sourceIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: managerId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "backlog",
+      })
+      .expect(403);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("backlog");
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null, resolvedAt: null });
   });
 
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
