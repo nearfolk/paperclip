@@ -2944,6 +2944,9 @@ export function issueRoutes(
     if (issue.status === "done" || issue.status === "cancelled") {
       return `Recovery action became stale because the source issue reached ${issue.status}.`;
     }
+    if (issue.status === "backlog" && input.resumeRequested !== true) {
+      return "Recovery action became stale because the source issue remains intentionally backlogged.";
+    }
     if (input.blockedToTodoRecovery === true) {
       return "Recovery action became stale because the source issue was manually moved from blocked to todo.";
     }
@@ -5621,6 +5624,11 @@ export function issueRoutes(
       assertBoard(req);
     }
 
+    const preserveBacklog = outcome === "cancelled" && sourceIssueStatus === "backlog";
+    if (preserveBacklog && existing.status !== "backlog") {
+      throw conflict("Backlog-preserving recovery cancellation requires the source issue to remain backlog");
+    }
+
     const actor = getActorInfo(req);
     const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
       ? activeRecoveryAction?.returnOwnerAgentId ?? null
@@ -5630,7 +5638,7 @@ export function issueRoutes(
       : outcome === "restored" && sourceIssueStatus === "done"
         ? "owner_completed"
         : outcome;
-    const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
+    const updateFields = preserveBacklog ? {} : { status: sourceIssueStatus };
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
@@ -5640,6 +5648,19 @@ export function issueRoutes(
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const result = await db.transaction(async (tx) => {
       let issue = existing;
+      if (preserveBacklog) {
+        const lockedSource = await tx
+          .select({ status: issueRows.status })
+          .from(issueRows)
+          .where(and(eq(issueRows.id, id), eq(issueRows.companyId, existing.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedSource) throw notFound("Issue not found");
+        if (lockedSource.status !== "backlog") {
+          throw conflict("Backlog-preserving recovery cancellation requires the source issue to remain backlog");
+        }
+      }
+
       if (outcome === "blocked") {
         const unresolvedBlockers = await tx
           .select({ id: issueRows.id })
@@ -5659,7 +5680,7 @@ export function issueRoutes(
         }
       }
 
-      if (sourceIssueStatus) {
+      if (!preserveBacklog) {
         const updatedIssue = await svc.update(
           id,
           {
@@ -5681,7 +5702,9 @@ export function issueRoutes(
           actionId: actionId ?? null,
           status: actionStatus,
           outcome: recordedOutcome,
-          resolutionNote: resolutionNote ?? null,
+          resolutionNote: preserveBacklog
+            ? resolutionNote ?? "Recovery action cancelled because the source issue remains intentionally backlogged."
+            : resolutionNote ?? null,
         },
         tx,
       );
@@ -5690,7 +5713,9 @@ export function issueRoutes(
       return { issue, recoveryAction };
     });
 
-    await routinesSvc.syncRunStatusForIssue(result.issue.id);
+    if (!preserveBacklog) {
+      await routinesSvc.syncRunStatusForIssue(result.issue.id);
+    }
 
     if (sourceIssueStatus && existing.status !== result.issue.status) {
       await logActivity(db, {

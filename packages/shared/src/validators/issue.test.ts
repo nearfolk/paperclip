@@ -161,7 +161,17 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
-  it("allows cancelled recovery resolutions to atomically restore the source issue status", () => {
+  it("allows cancelled recovery resolutions to preserve an intentional backlog status", () => {
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "backlog",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "backlog",
+    });
+
     expect(
       resolveIssueRecoveryActionSchema.parse({
         outcome: "cancelled",
@@ -176,6 +186,13 @@ describe("issue validators", () => {
       resolveIssueRecoveryActionSchema.safeParse({
         outcome: "cancelled",
         sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "false_positive",
+        sourceIssueStatus: "backlog",
       }).success,
     ).toBe(false);
 
