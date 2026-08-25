@@ -2430,7 +2430,7 @@ export function IssueDetail() {
     mutationFn: (data: {
       actionId?: string;
       outcome: ResolveRecoveryActionOutcome;
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      sourceIssueStatus: "backlog" | "todo" | "done" | "in_review" | "blocked";
       resolutionNote?: string | null;
     }) => issuesApi.resolveRecoveryAction(issueId!, data),
     onSuccess: ({ issue: nextIssue }) => {

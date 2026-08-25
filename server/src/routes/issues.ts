@@ -6882,6 +6882,11 @@ export function issueRoutes(
         { source: "recovery_action_resolution" },
       );
 
+      const preservesBacklog = sourceIssueStatus === "backlog";
+      if (preservesBacklog && lockedIssue.status !== "backlog") {
+        throw conflict("Backlog-preserving recovery resolution requires the source issue to remain backlog");
+      }
+
       let issue = lockedIssue;
       const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
       if (outcome === "blocked" && sourceStatusChanged) {
@@ -7018,7 +7023,9 @@ export function issueRoutes(
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
 
-    await routinesSvc.syncRunStatusForIssue(result.issue.id);
+    if (sourceIssueStatus !== "backlog") {
+      await routinesSvc.syncRunStatusForIssue(result.issue.id);
+    }
 
     if (sourceIssueStatus && existing.status !== result.issue.status) {
       await logActivity(db, {
