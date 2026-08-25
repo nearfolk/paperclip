@@ -7,6 +7,7 @@ import { normalizeIssueExecutionPolicy } from "../services/issue-execution-polic
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
@@ -113,6 +114,7 @@ function registerModuleMocks() {
     }),
     issueThreadInteractionService: () => ({
       listForIssue: vi.fn(async () => []),
+      expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
       expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
       expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
     }),
@@ -199,6 +201,7 @@ describe("issue activity event routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -473,6 +476,12 @@ describe("issue activity event routes", () => {
       ...issue,
       ...patch,
       updatedAt: new Date(),
+      changes: {
+        executionWorkspaceId: {
+          from: issue.executionWorkspaceId,
+          to: nextExecutionWorkspaceId,
+        },
+      },
     }));
 
     const dbMock = {
@@ -548,6 +557,7 @@ describe("issue activity event routes", () => {
       createdAt: new Date("2026-05-01T00:00:00.000Z"),
     };
     const dbMock = {
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
       select: () => ({
         from: () => ({
           where: () => ({

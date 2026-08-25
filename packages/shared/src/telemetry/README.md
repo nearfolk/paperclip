@@ -1,7 +1,9 @@
 # Telemetry Data Contract
 
 This document explains how contributors should use Paperclip's public telemetry
-contract. It intentionally does not list individual events or dimensions.
+contract. It does not duplicate the full list of individual events or
+dimensions. It documents extra semantic and privacy rules where the generated
+shape is not sufficient.
 
 The canonical source for first-party event names, dimensions, optionality,
 allowed primitive value types, and enum descriptions is
@@ -55,67 +57,34 @@ If a dimension is privacy-protected before emission, emit only the protected
 value and its matching public marker as defined by the typed helper or generated
 contract. Do not emit private source material in telemetry dimensions.
 
-## Sandbox Startup Trace Spans
+## Interaction Resolver Events
 
-Paperclip opens OpenTelemetry spans on the sandbox start path. These spans are a
-separate telemetry surface from the first-party events above. The generated
-telemetry contract does not cover them, so this section is their canonical
-contract.
+`interaction.created` records the interaction kind and whether the create
+request used a deprecated resolver-policy alias. It does not record the prompt,
+title, options, questions, target identifier, creator identifier, or resolver
+identifier.
 
-The spans are opt-in. Paperclip exports them only when an OTLP endpoint is
-configured. With no endpoint the whole span path is a no-op. Paperclip opens the
-spans only for a run that targets a remote sandbox. A local run and an SSH run
-stay out of these spans.
+`interaction.resolved` records the low-cardinality interaction outcome defined
+in the generated contract. Its `legacy_inherited_restriction` dimension is
+`true` only when stored migration provenance preserves a legacy resolver-policy
+restriction. It is `false` for canonical new writes. This dimension describes
+policy provenance. It does not contain user content or an identifier.
 
-Span attributes use a closed allowlist. A command, an argument, an environment
-value, a file path, an identifier, or program output never rides a span. It rides
-neither as an attribute nor as an event. Each numeric attribute is finite.
-Paperclip omits an attribute when its value is absent.
+Use `trackInteractionCreated()` and `trackInteractionResolved()` from
+`events.ts` to emit these events. The generated contract remains the authority
+for their exact dimensions and optionality.
 
-### Spans
+### Other Data Paths
 
-| Span | Scope | Parent |
-| --- | --- | --- |
-| `sandbox.startup` | The one root span for a sandbox bring-up. | none (root) |
-| `workspace.resolve` | Workspace resolution step. | `sandbox.startup` |
-| `codex-home.seed` | Managed-home seed step. | `sandbox.startup` |
-| `skills.reconcile` | Skills reconcile step. | `sandbox.startup` |
-| `stage.sync` | Workspace stage-sync step. | `sandbox.startup` |
-| `bridge.paperclip` | Paperclip bridge start step. | `sandbox.startup` |
-| `bridge.process-session` | Process-session bridge start step. | `sandbox.startup` |
-| `acp.handshake` | ACP session handshake step. | `sandbox.startup` |
-| `provider.execute` | One host-to-sandbox provider exec call. | none |
+This document covers Paperclip Telemetry only. The generated Telemetry
+contract covers neither the Observability path nor the run-log path. Two other
+data paths document their own contract in their own file:
 
-The root span sets the error status when the bring-up fails. Each step span sets
-the error status when its step fails.
-
-### Startup span attributes
-
-The bring-up step spans use this closed attribute allowlist.
-
-| Attribute | Type | Optional | Meaning |
-| --- | --- | --- | --- |
-| `step` | string | no | The bring-up step name. |
-| `provider` | string | yes | The normalized provider family. |
-| `roundTrips` | number | yes | Host-to-sandbox round trips for the step. |
-| `providerExecMs` | number | yes | Provider-reported exec time for the step, in milliseconds. |
-| `providerGetMs` | number | yes | Provider-reported fetch time for the step, in milliseconds. |
-
-### Provider exec span attributes
-
-The `provider.execute` span uses this closed attribute allowlist. Paperclip omits
-a duration attribute when the provider does not report the value.
-
-| Attribute | Type | Optional | Meaning |
-| --- | --- | --- | --- |
-| `provider` | string | no | The normalized provider family. |
-| `exit` | string | no | `ok` when the exit code is 0, else `error`. |
-| `provider.exec.duration_ms` | number | yes | Provider-reported exec wall time, in milliseconds. |
-| `provider.get.duration_ms` | number | yes | Provider-reported fetch wall time, in milliseconds. |
-
-To add a startup span attribute or a provider span attribute, extend the
-allowlist in the code first. Keep the attribute low-cardinality and free of user
-content.
+- [Observability](../../../../doc/observability.md) — the OpenTelemetry trace
+  path, the sandbox startup trace spans, and the sandbox duplex transport
+  instrumentation.
+- [Run-Log Events](../../../../doc/run-log-events.md) — events written to the
+  local `heartbeat_run_events` table.
 
 ## Dimension Values
 
