@@ -3531,10 +3531,7 @@ export function issueRoutes(
         && (
           input.actorType === "agent"
             ? interaction.createdByAgentId === input.actorAgentId
-              && (
-                interaction.sourceRunId === input.actorRunId
-                || nextAssigneeAgentId === input.actorAgentId
-              )
+              && nextAssigneeAgentId === input.actorAgentId
             : interaction.createdByUserId === input.actorId
         )
         && !(

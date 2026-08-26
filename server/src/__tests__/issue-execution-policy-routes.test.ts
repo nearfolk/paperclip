@@ -641,7 +641,10 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("rejects a prior-run confirmation binding when the same update reassigns the issue", async () => {
+  it.each([
+    ["current-run", "55555555-5555-4555-8555-555555555555"],
+    ["prior-run", "44444444-4444-4444-8444-444444444444"],
+  ])("rejects a %s confirmation binding when the same update reassigns the issue", async (_runKind, sourceRunId) => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -660,7 +663,7 @@ describe("issue execution policy routes", () => {
       kind: "request_confirmation",
       status: "pending",
       createdByAgentId: "33333333-3333-4333-8333-333333333333",
-      sourceRunId: "44444444-4444-4444-8444-444444444444",
+      sourceRunId,
       payload: { version: 1, prompt: "Approve another run's request?" },
     }]);
 
