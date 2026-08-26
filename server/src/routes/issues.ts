@@ -3522,6 +3522,9 @@ export function issueRoutes(
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
     const pendingInteractions = interactions.filter((interaction) => interaction.status === "pending");
     if (input.reviewInteractionId) {
+      const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
+        ? input.existing.assigneeAgentId
+        : input.updateFields.assigneeAgentId;
       const designatedReviewConfirmation = pendingInteractions.find((interaction) =>
         interaction.id === input.reviewInteractionId
         && (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation")
@@ -3530,7 +3533,7 @@ export function issueRoutes(
             ? interaction.createdByAgentId === input.actorAgentId
               && (
                 interaction.sourceRunId === input.actorRunId
-                || input.existing.assigneeAgentId === input.actorAgentId
+                || nextAssigneeAgentId === input.actorAgentId
               )
             : interaction.createdByUserId === input.actorId
         )
