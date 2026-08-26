@@ -3501,6 +3501,7 @@ export function issueRoutes(
       id: string;
       companyId: string;
       status: string;
+      assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
@@ -3527,7 +3528,10 @@ export function issueRoutes(
         && (
           input.actorType === "agent"
             ? interaction.createdByAgentId === input.actorAgentId
-              && interaction.sourceRunId === input.actorRunId
+              && (
+                interaction.sourceRunId === input.actorRunId
+                || input.existing.assigneeAgentId === input.actorAgentId
+              )
             : interaction.createdByUserId === input.actorId
         )
         && !(
@@ -3542,7 +3546,7 @@ export function issueRoutes(
       );
       if (!designatedReviewConfirmation) {
         const creatorDescription = input.actorType === "agent"
-          ? "this agent run"
+          ? "this agent's current run or an earlier run while the agent remains the issue assignee"
           : "this user";
         throw unprocessable(`reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}`, {
           code: "invalid_review_interaction",
