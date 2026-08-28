@@ -677,6 +677,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const sourceRunId = randomUUID();
     const retryRunId = randomUUID();
     const wakeupRequestId = randomUUID();
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: sourceRunId,
+      issueId: sourceIssueId,
+      status: "succeeded",
+    });
     let publishRetry!: () => void;
     const retryMayPublish = new Promise<void>((resolve) => {
       publishRetry = resolve;
