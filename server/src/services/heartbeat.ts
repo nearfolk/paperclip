@@ -460,7 +460,6 @@ const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retr
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
-const PROCESS_LOSS_RETRY_ISSUE_STATUSES = ["todo", "in_progress", "in_review"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -10357,47 +10356,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const queued = await db.transaction(async (tx) => {
       if (issueId) {
-        // Successful-run recovery holds this same row lock from its final path
-        // scan through the blocked transition. Publish the process-loss retry
-        // behind that boundary so recovery cannot miss a newly durable wake and
-        // then overwrite the issue with a stale blocked disposition.
-        const lockedIssue = await tx
-          .select()
+        // Serialize retry publication with recovery transitions for this issue.
+        // Recovery holds this same row lock while it scans for durable paths and
+        // decides whether to block. Taking the lock before inserting either the
+        // wake or run prevents those rows from becoming provisionally durable
+        // while their issue mutation is still waiting behind recovery.
+        const currentIssue = await tx
+          .select({ status: issues.status, executionRunId: issues.executionRunId })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
           .for("update")
           .then((rows) => rows[0] ?? null);
+
+        // A recovery/terminal transition that won the lock must remain
+        // authoritative. In particular, do not attach a newly queued retry to
+        // an issue that recovery just blocked or whose execution ownership has
+        // already moved away from the lost run.
         if (
-          !lockedIssue ||
-          !PROCESS_LOSS_RETRY_ISSUE_STATUSES.includes(
-            lockedIssue.status as (typeof PROCESS_LOSS_RETRY_ISSUE_STATUSES)[number],
-          ) ||
-          (lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== run.id) ||
-          (lockedIssue.checkoutRunId !== null && lockedIssue.checkoutRunId !== run.id)
+          !currentIssue ||
+          currentIssue.status === "blocked" ||
+          currentIssue.status === "done" ||
+          currentIssue.status === "cancelled" ||
+          currentIssue.executionRunId !== run.id
         ) {
           return null;
         }
-
-        const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
-          issue: lockedIssue,
-          excludeRunId: run.id,
-        });
-        if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
-          return null;
-        }
       }
-
-      // The optimistic lookup above avoids taking the issue lock for the common
-      // already-retried case. Recheck while holding the publication boundary so
-      // concurrent reapers cannot create duplicate process-loss continuations.
-      const concurrentRetry = await tx
-        .select()
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (concurrentRetry) return concurrentRetry;
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -10462,7 +10446,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return retryRun;
     });
 
-    if (!queued) return null;
+    if (!queued) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because issue recovery or execution ownership changed first",
+        payload: {
+          issueId: issueId ?? null,
+        },
+      });
+      return null;
+    }
 
     publishLiveEvent({
       companyId: queued.companyId,

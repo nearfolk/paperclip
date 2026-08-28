@@ -106,7 +106,6 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
-import { recoveryService } from "../services/recovery/service.ts";
 import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
@@ -573,45 +572,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
 
     return { companyId, agentId, runId, wakeupRequestId, issueId };
-  }
-
-  async function holdIssueRowLock(issueId: string) {
-    let signalLocked!: () => void;
-    let releaseLock!: () => void;
-    const locked = new Promise<void>((resolve) => {
-      signalLocked = resolve;
-    });
-    const release = new Promise<void>((resolve) => {
-      releaseLock = resolve;
-    });
-    const transaction = db.transaction(async (tx) => {
-      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
-      signalLocked();
-      await release;
-    });
-    await locked;
-    return async () => {
-      releaseLock();
-      await transaction;
-    };
-  }
-
-  async function waitForIssueRowLockWait() {
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const [waiting] = await db.execute<{ waiting: boolean }>(sql`
-        SELECT EXISTS (
-          SELECT 1
-          FROM pg_stat_activity
-          WHERE state = 'active'
-            AND wait_event_type = 'Lock'
-            AND query ILIKE '%from "issues"%'
-            AND query ILIKE '%for update%'
-        ) AS waiting
-      `);
-      if (waiting?.waiting) return true;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    return false;
   }
 
   async function seedEnvironmentLeaseFixture(input: {
@@ -1374,125 +1334,78 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
-  it("serializes a process-loss retry before successful-run recovery can block the issue", async () => {
-    let releaseRetryExecution!: () => void;
-    const retryExecutionCanFinish = new Promise<void>((resolve) => {
-      releaseRetryExecution = resolve;
-    });
-    mockAdapterExecute.mockImplementationOnce(async () => {
-      await retryExecutionCanFinish;
-      return {
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        errorMessage: null,
-        summary: "Recovered the process-loss continuation.",
-        provider: "test",
-        model: "test-model",
-      };
-    });
-
-    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+  it("does not publish a process-loss retry after concurrent recovery wins the issue lock", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: 999_999_999,
     });
-    const sourceIssue = await db
-      .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0]!);
     const heartbeat = heartbeatService(db);
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-    const releaseInitialLock = await holdIssueRowLock(issueId);
-
-    const reapPromise = heartbeat.reapOrphanedRuns();
-    const publisherWaiting = await waitForIssueRowLockWait();
-    expect(publisherWaiting).toBe(true);
-
-    const recoveryPromise = recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun: {
-        id: randomUUID(),
-        agentId,
-        status: "succeeded",
-        error: null,
-        errorCode: null,
-        contextSnapshot: { issueId },
-        livenessState: "needs_followup",
-      },
-      recoveryCause: "successful_run_missing_state",
-      successfulRunHandoffEvidence: {
-        sourceRunId: runId,
-        correctiveRunId: null,
-        missingDisposition: "clear_next_step",
-        handoffAttempt: 0,
-        maxHandoffAttempts: 1,
-        handoffDenialReason: "corrective wake was not durably queued",
-      },
+    let releaseRecoveryLock!: () => void;
+    const recoveryMayCommit = new Promise<void>((resolve) => {
+      releaseRecoveryLock = resolve;
     });
-    const activeAction = await waitForValue(() =>
-      db
-        .select()
-        .from(issueRecoveryActions)
-        .where(and(eq(issueRecoveryActions.sourceIssueId, issueId), eq(issueRecoveryActions.status, "active")))
-        .then((rows) => rows[0] ?? null)
-    );
-    expect(activeAction).not.toBeNull();
+    let recoveryLocked!: () => void;
+    const recoveryHasLock = new Promise<void>((resolve) => {
+      recoveryLocked = resolve;
+    });
 
-    await releaseInitialLock();
-    const [reapResult, escalationResult] = await Promise.all([reapPromise, recoveryPromise]);
-    expect(reapResult).toEqual({ reaped: 1, runIds: [runId] });
-    expect(escalationResult).toBeNull();
+    const recoveryTransition = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      recoveryLocked();
+      await recoveryMayCommit;
+      await tx
+        .update(issues)
+        .set({
+          status: "blocked",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date("2026-03-19T00:01:00.000Z"),
+        })
+        .where(eq(issues.id, issueId));
+    });
+    await recoveryHasLock;
 
-    const retryRun = await db
+    const reap = heartbeat.reapOrphanedRuns();
+    await waitForValue(async () => db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]?.status === "failed" ? true : null));
+    releaseRecoveryLock();
+
+    await recoveryTransition;
+    await expect(reap).resolves.toEqual({ reaped: 1, runIds: [runId] });
+
+    const retryRuns = await db
       .select()
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)))
-      .then((rows) => rows[0] ?? null);
-    expect(retryRun).toMatchObject({
-      agentId,
-      retryOfRunId: runId,
-      processLossRetryCount: 1,
-    });
-    if (!retryRun) throw new Error("Expected a durable process-loss retry run");
-    const retryWake = await db
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.retryOfRunId, runId)));
+    expect(retryRuns).toHaveLength(0);
+    const retryWakeups = await db
       .select()
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.id, retryRun.wakeupRequestId!))
-      .then((rows) => rows[0] ?? null);
-    expect(retryWake).toMatchObject({
-      runId: retryRun.id,
-      reason: "process_lost_retry",
-    });
-    expect(["queued", "claimed"]).toContain(retryWake?.status);
-
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "process_lost_retry"),
+      ));
+    expect(retryWakeups).toHaveLength(0);
     const currentIssue = await db
       .select()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(currentIssue).toMatchObject({
-      status: "in_progress",
-      executionRunId: retryRun.id,
+      status: "blocked",
+      executionRunId: null,
       checkoutRunId: null,
     });
-
-    const [recoveryAction] = await db
-      .select()
-      .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(recoveryAction).toMatchObject({
-      id: activeAction?.id,
-      status: "resolved",
-      outcome: "restored",
-      resolutionNote: "concurrent_source_path_restored",
-    });
-
-    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, issueId));
-    releaseRetryExecution();
-    await waitForRunToSettle(heartbeat, retryRun.id, 5_000);
-  }, 15_000);
+  });
 
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
