@@ -184,10 +184,11 @@ type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
-  correctiveRunId: string;
+  correctiveRunId: string | null;
   missingDisposition: string;
   handoffAttempt: number;
   maxHandoffAttempts: number;
+  handoffDenialReason?: string | null;
 };
 
 function compactRecoveryPresentation(title: string): IssueCommentPresentation {
@@ -2101,6 +2102,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       missingDisposition: input.successfulRunHandoffEvidence?.missingDisposition ?? null,
       handoffAttempt: input.successfulRunHandoffEvidence?.handoffAttempt ?? null,
       maxHandoffAttempts: input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
+      handoffDenialReason: input.successfulRunHandoffEvidence?.handoffDenialReason ?? null,
       ...(workspaceValidation ? { workspaceValidation } : {}),
     };
   }
@@ -3265,7 +3267,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       notice = buildSuccessfulRunHandoffExhaustedNotice({
         issue: input.issue,
         sourceRun: sourceRun ?? null,
-        correctiveRun: input.latestRun
+        correctiveRun: input.successfulRunHandoffEvidence.correctiveRunId && input.latestRun
           ? { id: input.latestRun.id, status: input.latestRun.status, agentId: input.latestRun.agentId }
           : null,
         sourceAssignee,
@@ -3273,8 +3275,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryActionId: recoveryAction.id,
         recoveryOwner,
         latestIssueStatus: input.issue.status,
-        latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
+        latestHandoffRunStatus: input.successfulRunHandoffEvidence.correctiveRunId
+          ? input.latestRun?.status ?? "unknown"
+          : "not_started",
         missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
+        handoffDenialReason: input.successfulRunHandoffEvidence.handoffDenialReason,
       });
     }
     const escalationNotice = buildStrandedRecoveryEscalationNotice({

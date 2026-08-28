@@ -222,6 +222,7 @@ import {
   isExecutionForcedToKubernetes,
 } from "./execution-allowlist.js";
 import {
+  DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -233,6 +234,7 @@ import {
   decideSuccessfulRunHandoff,
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
+  isSuccessfulRunHandoffRecoveryRequiredSkip,
   isSuccessfulRunHandoffValidPathSkip,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
@@ -9426,30 +9428,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
+  async function handleSuccessfulRunHandoff(
+    run: typeof heartbeatRuns.$inferSelect,
+    options: {
+      persistRecoveryIfStillUnqueued?: boolean;
+      handoffDenialReason?: string;
+    } = {},
+  ) {
     if (run.status !== "succeeded") return;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
 
-    const issue = await db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        identifier: issues.identifier,
-        title: issues.title,
-        description: issues.description,
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-        assigneeUserId: issues.assigneeUserId,
-        executionState: issues.executionState,
-        monitorNextCheckAt: issues.monitorNextCheckAt,
-        projectId: issues.projectId,
-        originKind: issues.originKind,
-      })
-      .from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-      .then((rows) => rows[0] ?? null);
+    const [issue, currentAgent] = await Promise.all([
+      db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(agents)
+        .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null),
+    ]);
     const idempotencyKey = issue
       ? buildFinishSuccessfulRunHandoffIdempotencyKey({
         issueId: issue.id,
@@ -9631,7 +9633,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const decision = decideSuccessfulRunHandoff({
       run,
       issue,
-      agent,
+      agent: currentAgent,
       livenessState: run.livenessState as RunLivenessState | null,
       detectedProgressSummary,
       finalReport,
@@ -9660,7 +9662,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (decision.kind !== "enqueue" || !issue) return;
+    const recoveryRequired = isSuccessfulRunHandoffRecoveryRequiredSkip(decision) ||
+      (options.persistRecoveryIfStillUnqueued && decision.kind === "enqueue");
+    if (recoveryRequired && issue) {
+      const handoffDenialReason = options.handoffDenialReason ??
+        (decision.kind === "skip" ? decision.reason : "corrective wake was not durably queued");
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: run,
+        recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+        successfulRunHandoffEvidence: {
+          sourceRunId: run.id,
+          correctiveRunId: null,
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 0,
+          maxHandoffAttempts: DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
+          handoffDenialReason,
+        },
+      });
+      return;
+    }
+
+    if (decision.kind !== "enqueue" || !issue || !currentAgent) return;
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -9673,22 +9697,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id));
     }
 
-    const handoffRun = await enqueueWakeup(decision.targetAgentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
-      payload: decision.payload,
-      contextSnapshot: decision.contextSnapshot,
-      idempotencyKey: decision.idempotencyKey,
-      requestedByActorType: "system",
-      requestedByActorId: "heartbeat",
-    });
-    if (!handoffRun) return;
+    let handoffRun: Awaited<ReturnType<typeof enqueueWakeup>> = null;
+    try {
+      handoffRun = await enqueueWakeup(decision.targetAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        payload: decision.payload,
+        contextSnapshot: decision.contextSnapshot,
+        idempotencyKey: decision.idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, runId: run.id },
+        "successful run corrective handoff enqueue was denied",
+      );
+    }
+    if (!handoffRun) {
+      // Re-run the full decision query before persisting recovery. A concurrent
+      // actor may have created a valid execution/wait path while enqueueing, and
+      // that path must win over a stale blocked transition. If the issue is still
+      // eligible to enqueue, the second pass records explicit board recovery
+      // instead of attempting the same denied wake again.
+      await handleSuccessfulRunHandoff(run, {
+        persistRecoveryIfStillUnqueued: true,
+        handoffDenialReason: "corrective wake was denied or skipped before durable queueing",
+      });
+      return;
+    }
 
     await addSuccessfulRunHandoffCommentOnce({
       issue,
       run,
-      agent,
+      agent: currentAgent,
       detectedProgressSummary: detectedProgressSummary ?? "The run reported progress, but did not choose a next step.",
     });
     await logActivity(db, {
@@ -16695,7 +16738,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               issueCommentStatus: issueCommentPolicyResult.outcome,
             }
             : livenessRun,
-          agent,
         );
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,

@@ -3727,6 +3727,140 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("persists board recovery when a successful-run handoff is denied after the agent pauses", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Implemented the requested repair, but did not choose a final issue state.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+      ));
+    expect(handoffWakeups).toHaveLength(0);
+
+    const recoveryAction = await waitForValue(() => db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null), 5_000);
+    expect(recoveryAction).toMatchObject({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "missing_disposition",
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
+      returnOwnerAgentId: agentId,
+      evidence: expect.objectContaining({
+        sourceRunId: runId,
+        correctiveRunId: null,
+        handoffDenialReason: "agent status paused is not invokable",
+      }),
+    });
+    const sourceIssue = await waitForValue(() => db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.status === "blocked" ? rows[0] : null), 5_000);
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+  });
+
+  it("persists board recovery when a successful-run handoff is budget-blocked", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(budgetPolicies).values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 1,
+        hardStopEnabled: true,
+        isActive: true,
+      });
+      await db.insert(costEvents).values({
+        companyId,
+        agentId,
+        issueId,
+        provider: "test",
+        biller: "test",
+        billingType: "tokens",
+        model: "test-model",
+        costCents: 1,
+        occurredAt: new Date(),
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Implemented the requested repair, but did not choose a final issue state.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+      ));
+    expect(handoffWakeups).toHaveLength(0);
+
+    const recoveryAction = await waitForValue(() => db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null), 5_000);
+    expect(recoveryAction).toMatchObject({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "missing_disposition",
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
+      returnOwnerAgentId: agentId,
+      evidence: expect.objectContaining({
+        sourceRunId: runId,
+        correctiveRunId: null,
+        handoffDenialReason: "budget hard stop blocks corrective wake",
+      }),
+    });
+    const sourceIssue = await waitForValue(() => db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.status === "blocked" ? rows[0] : null), 5_000);
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
