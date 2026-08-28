@@ -114,6 +114,7 @@ import {
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
+  FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -3932,6 +3933,100 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]?.status === "blocked" ? rows[0] : null), 5_000);
     expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+  });
+
+  it("does not publish a corrective wake after successful-run recovery blocks the source first", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const heartbeat = heartbeatService(db);
+    const recoveryActionId = randomUUID();
+    const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
+
+    await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+        .for("update");
+      const now = new Date("2026-03-19T00:06:00.000Z");
+      await tx.insert(issueRecoveryActions).values({
+        id: recoveryActionId,
+        companyId,
+        sourceIssueId: issueId,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "board",
+        ownerAgentId: null,
+        previousOwnerAgentId: agentId,
+        returnOwnerAgentId: agentId,
+        cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+        fingerprint: `source_scoped_recovery:${companyId}:${issueId}:${SUCCESSFUL_RUN_MISSING_STATE_REASON}`,
+        evidence: { sourceRunId: runId },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: { type: "board_escalation" },
+        attemptCount: 1,
+        lastAttemptAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await tx
+        .update(issues)
+        .set({ status: "blocked", updatedAt: now })
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+    });
+
+    const correctiveWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+      payload: {
+        issueId,
+        sourceRunId: runId,
+        handoffRequired: true,
+        handoffReason: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+      },
+      idempotencyKey,
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+    });
+    expect(correctiveWake).toBeNull();
+
+    const [sourceIssue, recoveryAction, handoffRequests, correctiveRuns] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, recoveryActionId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey)),
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = ${FINISH_SUCCESSFUL_RUN_HANDOFF_REASON}`,
+        )),
+    ]);
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    expect(recoveryAction).toMatchObject({ status: "active", ownerType: "board" });
+    expect(handoffRequests).toEqual([
+      expect.objectContaining({
+        status: "skipped",
+        reason: "successful_run_handoff_source_changed",
+      }),
+    ]);
+    expect(correctiveRuns).toHaveLength(0);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

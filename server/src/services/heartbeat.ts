@@ -18274,6 +18274,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionWorkspacePreference: issues.executionWorkspacePreference,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
             assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
             createdAt: issues.createdAt,
@@ -18312,6 +18313,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 reason: "worktree_execution_cutoff",
                 cutoff: worktreeExecutionCutoff.toISOString(),
                 issueId: issue.id,
+              },
+            },
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
+        if (
+          reason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON &&
+          (
+            issue.status !== "in_progress" ||
+            issue.assigneeAgentId !== agentId ||
+            issue.assigneeUserId !== null
+          )
+        ) {
+          // Successful-run recovery holds this same issue-row lock while it
+          // scans for a durable path and, when none exists, blocks the issue.
+          // Revalidate the corrective wake under that lock so recovery-first
+          // cannot leave a newly queued wake attached to the blocked source.
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "successful_run_handoff_source_changed",
+            payload: {
+              ...(payload ?? {}),
+              issueId,
+              heartbeatSkip: {
+                reason: "successful_run_handoff_source_changed",
+                requestedReason: reason,
+                currentStatus: issue.status,
+                currentAssigneeAgentId: issue.assigneeAgentId,
+                currentAssigneeUserId: issue.assigneeUserId,
               },
             },
             status: "skipped",
