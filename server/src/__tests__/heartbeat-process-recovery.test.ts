@@ -1334,6 +1334,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
+  it("does not publish a process-loss retry after concurrent recovery wins the issue lock", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+    });
+    const heartbeat = heartbeatService(db);
+    let releaseRecoveryLock!: () => void;
+    const recoveryMayCommit = new Promise<void>((resolve) => {
+      releaseRecoveryLock = resolve;
+    });
+    let recoveryLocked!: () => void;
+    const recoveryHasLock = new Promise<void>((resolve) => {
+      recoveryLocked = resolve;
+    });
+
+    const recoveryTransition = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      recoveryLocked();
+      await recoveryMayCommit;
+      await tx
+        .update(issues)
+        .set({
+          status: "blocked",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date("2026-03-19T00:01:00.000Z"),
+        })
+        .where(eq(issues.id, issueId));
+    });
+    await recoveryHasLock;
+
+    const reap = heartbeat.reapOrphanedRuns();
+    await waitForValue(async () => db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]?.status === "failed" ? true : null));
+    releaseRecoveryLock();
+
+    await recoveryTransition;
+    await expect(reap).resolves.toEqual({ reaped: 1, runIds: [runId] });
+
+    const retryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.retryOfRunId, runId)));
+    expect(retryRuns).toHaveLength(0);
+    const retryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "process_lost_retry"),
+      ));
+    expect(retryWakeups).toHaveLength(0);
+    const currentIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(currentIssue).toMatchObject({
+      status: "blocked",
+      executionRunId: null,
+      checkoutRunId: null,
+    });
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",

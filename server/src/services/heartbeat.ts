@@ -10355,6 +10355,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
     const queued = await db.transaction(async (tx) => {
+      if (issueId) {
+        // Serialize retry publication with recovery transitions for this issue.
+        // Recovery holds this same row lock while it scans for durable paths and
+        // decides whether to block. Taking the lock before inserting either the
+        // wake or run prevents those rows from becoming provisionally durable
+        // while their issue mutation is still waiting behind recovery.
+        const currentIssue = await tx
+          .select({ status: issues.status, executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+        // A recovery/terminal transition that won the lock must remain
+        // authoritative. In particular, do not attach a newly queued retry to
+        // an issue that recovery just blocked or whose execution ownership has
+        // already moved away from the lost run.
+        if (
+          !currentIssue ||
+          currentIssue.status === "blocked" ||
+          currentIssue.status === "done" ||
+          currentIssue.status === "cancelled" ||
+          currentIssue.executionRunId !== run.id
+        ) {
+          return null;
+        }
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -10417,6 +10445,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       return retryRun;
     });
+
+    if (!queued) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because issue recovery or execution ownership changed first",
+        payload: {
+          issueId: issueId ?? null,
+        },
+      });
+      return null;
+    }
 
     publishLiveEvent({
       companyId: queued.companyId,
