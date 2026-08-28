@@ -7006,6 +7006,42 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+  it("serializes concurrent checkout and unowned ownership assertion without a deadlock", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+        executionAgentNameKey: null,
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    const [checkedOut, ownership] = await Promise.all([
+      svc.checkout(seeded.issueId, seeded.actorAgentId, ["in_progress"], seeded.actorRunId),
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ]);
+
+    expect(checkedOut.checkoutRunId).toBe(seeded.actorRunId);
+    expect(checkedOut.executionRunId).toBe(seeded.actorRunId);
+    expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+    expect(ownership.executionRunId).toBe(seeded.actorRunId);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.actorRunId,
+      executionRunId: seeded.actorRunId,
+    });
+  });
+
 });
 
 describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {

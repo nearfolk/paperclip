@@ -5353,6 +5353,10 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      // Keep the issue -> heartbeat lock order aligned with checkout and stale-lock cleanup.
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`,
+      );
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
