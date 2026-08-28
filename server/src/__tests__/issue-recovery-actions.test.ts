@@ -615,6 +615,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     },
   );
 
+  it.each(["terminal", "active_execution"] as const)(
+    "does not overwrite a concurrent %s path during successful-run handoff escalation",
+    async (concurrentPath) => {
+      const { companyId, coderId, sourceIssueId, sourceIssue } = await seedCompany();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const sourceRunId = randomUUID();
+
+      if (concurrentPath === "terminal") {
+        await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, sourceIssueId));
+      } else {
+        await seedHeartbeatRun({
+          companyId,
+          agentId: coderId,
+          runId: randomUUID(),
+          issueId: sourceIssueId,
+          status: "queued",
+        });
+      }
+
+      const result = await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: sourceRunId,
+          agentId: coderId,
+          status: "succeeded",
+          error: null,
+          errorCode: null,
+          contextSnapshot: { issueId: sourceIssueId },
+          livenessState: "needs_followup",
+        },
+        recoveryCause: "successful_run_missing_state",
+        successfulRunHandoffEvidence: {
+          sourceRunId,
+          correctiveRunId: null,
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 0,
+          maxHandoffAttempts: 1,
+          handoffDenialReason: "corrective wake was not durably queued",
+        },
+      });
+
+      expect(result).toBeNull();
+      const [currentIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(currentIssue?.status).toBe(concurrentPath === "terminal" ? "done" : "in_progress");
+      const activeActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.status, "active"),
+        ));
+      expect(activeActions).toHaveLength(0);
+    },
+  );
+
   it("stands down while the latest run was cancelled by a board operator", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.insert(heartbeatRuns).values({

@@ -179,7 +179,7 @@ export async function collectDispositionRepairSourceState(
         .where(
           and(
             eq(agentWakeupRequests.companyId, issue.companyId),
-            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             input.excludeWakeupRequestId
               ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId)
