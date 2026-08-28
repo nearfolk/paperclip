@@ -6336,11 +6336,18 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const ensureSessionPromise = new Promise((resolve) => {
         resolveEnsure = resolve;
       });
+      let markEnsureSessionStarted!: () => void;
+      const ensureSessionStarted = new Promise<void>((resolve) => {
+        markEnsureSessionStarted = resolve;
+      });
       const closeSpy = vi.fn(async () => {});
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: () => {
+              markEnsureSessionStarted();
+              return ensureSessionPromise;
+            },
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6358,7 +6365,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      // Wait for the guard to install its deadline instead of guessing how
+      // many microtasks the real filesystem setup needs under runner load.
+      await ensureSessionStarted;
+      await vi.advanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       return { closeSpy, resolveEnsure, resultPromise };
     }
 
