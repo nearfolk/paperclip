@@ -8139,6 +8139,15 @@ export function issueService(db: Db) {
       }),
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+      const terminalExpectedStatuses = expectedStatuses.filter(
+        (status) => status === "done" || status === "cancelled",
+      );
+      if (terminalExpectedStatuses.length > 0) {
+        throw unprocessable("Issue checkout cannot expect terminal issue statuses", {
+          terminalExpectedStatuses,
+        });
+      }
+
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -8160,6 +8169,27 @@ export function issueService(db: Db) {
           mode: activePauseHold.mode,
           securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
         });
+      }
+
+      if (checkoutRunId) {
+        const checkoutRun = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, checkoutRunId),
+              eq(heartbeatRuns.companyId, issueCompany.companyId),
+              eq(heartbeatRuns.agentId, agentId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!checkoutRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status)) {
+          throw conflict("Issue checkout requires an active heartbeat run", {
+            code: "checkout_run_not_active",
+            checkoutRunId,
+            runStatus: checkoutRun?.status ?? "missing",
+          });
+        }
       }
 
       await clearExecutionRunIfTerminal(id);

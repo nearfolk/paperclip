@@ -5765,6 +5765,145 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("rejects the exact late checkout from a succeeded run without reopening the done issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const succeededRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: succeededRunId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      invocationSource: "manual",
+      finishedAt: new Date("2026-08-26T11:16:18.729Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Completed issue with a late tool call",
+      status: "done",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      completedAt: new Date("2026-08-26T11:16:18.000Z"),
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["done"], succeededRunId))
+      .rejects.toMatchObject({ status: 422 });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "done",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it.each([
+    ["succeeded", "succeeded"],
+    [null, "missing"],
+  ])("rejects a %s checkout run before acquiring an active issue lock", async (runStatus, expectedRunStatus) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    if (runStatus) {
+      await db.insert(heartbeatRuns).values({
+        id: checkoutRunId,
+        companyId,
+        agentId,
+        status: runStatus,
+        invocationSource: "manual",
+        finishedAt: new Date("2026-08-26T11:16:18.729Z"),
+      });
+    }
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Active issue with an invalid checkout run",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["todo"], checkoutRunId))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "checkout_run_not_active",
+          checkoutRunId,
+          runStatus: expectedRunStatus,
+        },
+      });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior
