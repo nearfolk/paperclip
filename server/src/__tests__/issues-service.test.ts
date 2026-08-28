@@ -5904,6 +5904,90 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("rejects checkout when the run becomes terminal before the issue mutation", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-08-26T11:16:18.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checkout racing run completion",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    const terminalWriteReady = deferred<void>();
+    const allowTerminalCommit = deferred<void>();
+    const terminalWrite = db.transaction(async (tx) => {
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "succeeded",
+          finishedAt: new Date("2026-08-26T11:16:19.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, checkoutRunId));
+      terminalWriteReady.resolve();
+      await allowTerminalCommit.promise;
+    });
+    await terminalWriteReady.promise;
+
+    const checkout = svc.checkout(issueId, agentId, ["todo"], checkoutRunId);
+    const checkoutAssertion = expect(checkout).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "checkout_run_not_active",
+        checkoutRunId,
+        runStatus: "succeeded",
+      },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    allowTerminalCommit.resolve();
+    await terminalWrite;
+    await checkoutAssertion;
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior
