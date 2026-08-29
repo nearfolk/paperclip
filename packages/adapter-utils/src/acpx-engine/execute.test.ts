@@ -217,20 +217,6 @@ async function runExecutor(
   return { logs, meta, events, runtimeOptions, configOptions, sessionInputs, result };
 }
 
-// Under `vi.useFakeTimers()`, the setup work before a run reaches its
-// `ensureSession` call (staging, warm-handle lookups, real `fs` calls) still
-// runs through ordinary promise chains, not timers. `advanceTimersByTimeAsync`
-// only drains microtasks in the windows between the timer ticks it processes;
-// with no timer due yet, a single call can return before that setup chain
-// finishes unwinding. Flushing a few zero-length advances first lets it fully
-// unwind before the real, deadline-length advance below.
-async function flushSetupThenAdvanceTimersByTimeAsync(ms: number): Promise<void> {
-  for (let i = 0; i < 50; i++) {
-    await vi.advanceTimersByTimeAsync(0);
-  }
-  await vi.advanceTimersByTimeAsync(ms);
-}
-
 // A recording span, used only in tests. It captures the span name, the parent
 // span (resolved from the explicit parent-context token), the attribute map,
 // the terminal status, and whether the span ended. The engine treats it purely
@@ -6277,6 +6263,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((resolve) => {
       resolveEnsure = resolve;
     });
+    let markEnsureSessionStarted!: () => void;
+    const ensureSessionStarted = new Promise<void>((resolve) => {
+      markEnsureSessionStarted = resolve;
+    });
     const startTurn = vi.fn(() => ({
       events: (async function* () {
         yield { type: "done", stopReason: "end_turn" };
@@ -6287,7 +6277,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const execute = createAcpxEngineExecutor({
       createRuntime: () =>
         ({
-          ensureSession: () => ensureSessionPromise,
+          ensureSession: () => {
+            markEnsureSessionStarted();
+            return ensureSessionPromise;
+          },
           startTurn,
           close: async () => {},
         }) as never,
@@ -6304,7 +6297,8 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await ensureSessionStarted;
+      await vi.advanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       expect(result.errorCode).toBe("acpx_handshake_timeout");
@@ -6413,11 +6407,18 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
   it("discards the reuse decision and leaves no warm entry after a guard rejection", async () => {
     const root = await makeTempRoot();
     const warmHandles = new Map();
+    let markEnsureSessionStarted!: () => void;
+    const ensureSessionStarted = new Promise<void>((resolve) => {
+      markEnsureSessionStarted = resolve;
+    });
     const execute = createAcpxEngineExecutor({
       warmHandles,
       createRuntime: () =>
         ({
-          ensureSession: () => new Promise(() => {}),
+          ensureSession: () => {
+            markEnsureSessionStarted();
+            return new Promise(() => {});
+          },
           startTurn: () => ({
             events: (async function* () {})(),
             result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6444,7 +6445,8 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await ensureSessionStarted;
+      await vi.advanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       expect(result.errorCode).toBe("acpx_handshake_timeout");
@@ -6509,6 +6511,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((_resolve, reject) => {
       rejectEnsure = reject;
     });
+    let markEnsureSessionStarted!: () => void;
+    const ensureSessionStarted = new Promise<void>((resolve) => {
+      markEnsureSessionStarted = resolve;
+    });
     const logs: Array<{ stream: string; text: string }> = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (err: unknown) => unhandledRejections.push(err);
@@ -6519,7 +6525,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: () => {
+              markEnsureSessionStarted();
+              return ensureSessionPromise;
+            },
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6539,7 +6548,8 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         },
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      await ensureSessionStarted;
+      await vi.advanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       const result = await resultPromise;
       expect(result.errorCode).toBe("acpx_handshake_timeout");
 
@@ -6735,6 +6745,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((resolve) => {
       resolveEnsure = resolve;
     });
+    let markEnsureSessionStarted!: () => void;
+    const ensureSessionStarted = new Promise<void>((resolve) => {
+      markEnsureSessionStarted = resolve;
+    });
     const logs: Array<{ stream: string; text: string }> = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (err: unknown) => unhandledRejections.push(err);
@@ -6745,7 +6759,10 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: () => {
+              markEnsureSessionStarted();
+              return ensureSessionPromise;
+            },
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6767,7 +6784,8 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         },
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      await ensureSessionStarted;
+      await vi.advanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       const result = await resultPromise;
       expect(result.errorCode).toBe("acpx_handshake_timeout");
 
