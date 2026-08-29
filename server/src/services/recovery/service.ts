@@ -3256,6 +3256,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!current) return null;
+      if (isTerminalIssueStatus(current.status)) return null;
 
       if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
         const snapshotUnchanged =
@@ -3265,14 +3266,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           current.executionRunId === input.issue.executionRunId &&
           current.assigneeAgentId === input.issue.assigneeAgentId &&
           current.assigneeUserId === input.issue.assigneeUserId;
-        if (!snapshotUnchanged || isTerminalIssueStatus(current.status)) return null;
-
-        const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
-          issue: current,
-          excludeRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? input.latestRun?.id ?? null,
-        });
-        if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) return null;
+        if (!snapshotUnchanged) return null;
       }
+
+      // Every recovery cause must repeat its active/durable-path scan while it
+      // holds the source issue lock. Process-loss retry publication, pause-hold
+      // creation, and active routine-continuation creation take this same lock,
+      // so whichever path commits first remains authoritative.
+      const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
+        issue: current,
+        // The terminal run being repaired, and its linked wake request, are
+        // source evidence rather than a competing continuation. A retry that
+        // publishes under the issue lock has a different run id and remains
+        // visible to this scan.
+        excludeRunId:
+          input.successfulRunHandoffEvidence?.sourceRunId ?? input.latestRun?.id ?? null,
+      });
+      // A pending execution stage whose participant is known to be
+      // misconfigured is the stranded path being repaired, not a competing
+      // continuation. A newly published run, pause, routine, or other durable
+      // wait still wins this in-lock check.
+      const hasCompetingDurablePath = sourceState.hasDurableWaitingPath && !(
+        (
+          recoveryCause === "configuration_incomplete" ||
+          recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON
+        ) &&
+        sourceState.durablePathReason === "execution_stage"
+      );
+      if (sourceState.hasActiveExecutionPath || hasCompetingDurablePath) return null;
 
       const blockerIds = await existingUnresolvedBlockerIssueIds(
         input.issue.companyId,
@@ -3286,16 +3307,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return updated ? { updated, blockerIds } : null;
     });
     if (!transition) {
-      if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
-        await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: input.issue.companyId,
-          sourceIssueId: input.issue.id,
-          actionId: recoveryAction.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote: "concurrent_source_path_restored",
-        });
-      }
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: input.issue.companyId,
+        sourceIssueId: input.issue.id,
+        actionId: recoveryAction.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "concurrent_source_path_restored",
+      });
       return null;
     }
     const { updated, blockerIds } = transition;
