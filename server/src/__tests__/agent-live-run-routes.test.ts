@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -92,28 +93,6 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: Record<string, unknown> = {}) {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
-    next();
-  });
-  app.use("/api", agentRoutes(db as any));
-  app.use(errorHandler);
-  return app;
-}
-
 function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
   const limit = vi.fn(async (value: number) => rows.slice(0, value));
   const orderedQuery = {
@@ -162,20 +141,39 @@ async function requestApp(
   }
 }
 
-describe("agent live run routes", () => {
+describe.sequential("agent live run routes", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    const [{ agentRoutes }, { errorHandler }] = await Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    return { agentRoutes, errorHandler };
+  });
+
+  function createApp(db: Record<string, unknown> = {}) {
+    const { agentRoutes, errorHandler } = routeModules.value;
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "board",
+        userId: "local-board",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    app.use("/api", agentRoutes(db as any));
+    app.use(errorHandler);
+    return app;
+  }
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/heartbeat.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/instance-settings.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../adapters/index.js");
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    mockRunSecretRedactionRegistry.redactForRun.mockImplementation(
+      async (_companyId: string, _runId: string, value: unknown) => value,
+    );
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-1",
       companyId: "company-1",
