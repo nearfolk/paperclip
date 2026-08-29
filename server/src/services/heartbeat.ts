@@ -7,6 +7,8 @@ import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte,
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  CONNECTION_INTENT_AGENT_GUIDANCE,
+  CONNECTION_RUNTIME_TOOL_NAMES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   MAX_TASK_DRAIN_TTL_MS,
@@ -67,7 +69,10 @@ import {
   routines,
   toolMcpGateways,
   toolMcpGatewayTokens,
+  toolCatalogEntries,
+  toolConnectionInstalls,
   toolConnections,
+  toolProfileEntries,
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
@@ -96,10 +101,12 @@ import type {
   AdapterRuntimeEvent,
   AdapterRuntimeMcpAccess,
   AdapterRuntimeMcpServer,
+  AdapterRuntimeToolAccess,
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -2748,6 +2755,10 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  issueStateGuard?: {
+    statuses: string[];
+    assigneeAgentId: string;
+  };
 }
 
 type UsageTotals = {
@@ -3466,12 +3477,19 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
-function paperclipApiBaseUrl(): string {
+function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
+  return configured
+    ? configured.replace(/\/+$/, "").replace(/\/api$/, "")
+    : null;
+}
+
+function paperclipApiBaseUrl(): string {
+  const configured = configuredPaperclipApiBaseUrl();
   if (!configured) {
     throw new Error("PAPERCLIP_API_URL is required to deliver managed runtime MCP servers");
   }
-  return configured.replace(/\/+$/, "").replace(/\/api$/, "");
+  return configured;
 }
 
 export async function revokeHeartbeatRunGatewayTokens(input: {
@@ -3606,7 +3624,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     });
     servers.push({
       name: connection.name,
-      url: `${paperclipApiBaseUrl()}/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      // Runtime MCP clients authenticate with a short-lived gateway bearer, not
+      // a Paperclip agent JWT. Route them through the public gateway protocol
+      // endpoint mounted ahead of the API auth middleware; the gateway service
+      // still validates the bearer and its run binding on every request.
+      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway.gatewayPublicId}`,
       token: token.token,
       connectionId: connection.id,
     });
@@ -3632,6 +3654,40 @@ function createAdapterRuntimeMcpAccess(
   });
 }
 
+function createAdapterRuntimeToolAccess(input: {
+  agentId: string;
+  companyId: string;
+  runId: string;
+  responsibleUserId: string | null;
+}): AdapterRuntimeToolAccess | undefined {
+  if (!input.responsibleUserId) return undefined;
+  const minted = createRuntimeToolsToken({
+    agentId: input.agentId,
+    companyId: input.companyId,
+    runId: input.runId,
+    responsibleUserId: input.responsibleUserId,
+  });
+  if (!minted) return undefined;
+  // The normal server bootstrap always exports PAPERCLIP_API_URL. Some service
+  // tests invoke heartbeat execution without booting an HTTP server, however;
+  // in that context there is no reachable endpoint to advertise and runtime
+  // tools should simply remain unavailable instead of failing the run.
+  const baseUrl = configuredPaperclipApiBaseUrl();
+  if (!baseUrl) return undefined;
+  return Object.freeze({
+    version: 1,
+    guidance: CONNECTION_INTENT_AGENT_GUIDANCE,
+    mcpEndpoint: `${baseUrl}/mcp/runtime-tools`,
+    rest: {
+      connectionsSearch: `${baseUrl}/runtime-tools/connections/search`,
+      connectionRequest: `${baseUrl}/runtime-tools/connections/request`,
+    },
+    bearerToken: minted.token,
+    expiresAt: minted.expiresAt,
+    tools: CONNECTION_RUNTIME_TOOL_NAMES,
+  });
+}
+
 const MANAGED_MCP_LOCAL_ADAPTERS = new Set(["codex_local"]);
 
 function adapterSupportsManagedMcpConfig(adapterType: string): boolean {
@@ -3654,7 +3710,68 @@ function gatewayAppliesToRun(input: {
   return true;
 }
 
-async function createManagedMcpRunConfig(input: {
+async function gatewayConnectionIds(input: {
+  db: Db;
+  companyId: string;
+  gateway: typeof toolMcpGateways.$inferSelect;
+}): Promise<Set<string>> {
+  const managedRuntimeConnectionId = readNonEmptyString(input.gateway.metadata?.managedRuntimeConnectionId);
+  if (managedRuntimeConnectionId) return new Set([managedRuntimeConnectionId]);
+
+  const [profile, entries, catalog, connections] = await Promise.all([
+    input.db
+      .select({ defaultAction: toolProfiles.defaultAction })
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, input.companyId), eq(toolProfiles.id, input.gateway.profileId)))
+      .then((rows) => rows[0] ?? null),
+    input.db
+      .select()
+      .from(toolProfileEntries)
+      .where(and(
+        eq(toolProfileEntries.companyId, input.companyId),
+        eq(toolProfileEntries.profileId, input.gateway.profileId),
+      )),
+    input.db
+      .select({
+        id: toolCatalogEntries.id,
+        connectionId: toolCatalogEntries.connectionId,
+        applicationId: toolCatalogEntries.applicationId,
+        toolName: toolCatalogEntries.toolName,
+        riskLevel: toolCatalogEntries.riskLevel,
+      })
+      .from(toolCatalogEntries)
+      .where(and(eq(toolCatalogEntries.companyId, input.companyId), eq(toolCatalogEntries.status, "active"))),
+    input.db
+      .select({ id: toolConnections.id, applicationId: toolConnections.applicationId })
+      .from(toolConnections)
+      .where(eq(toolConnections.companyId, input.companyId)),
+  ]);
+  if (!profile) return new Set();
+  if (profile.defaultAction === "allow") return new Set(catalog.map((entry) => entry.connectionId));
+
+  const connectionIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.effect !== "include") continue;
+    if (entry.connectionId) connectionIds.add(entry.connectionId);
+    if (entry.applicationId) {
+      for (const connection of connections) {
+        if (connection.applicationId === entry.applicationId) connectionIds.add(connection.id);
+      }
+    }
+    for (const catalogEntry of catalog) {
+      if (
+        (entry.catalogEntryId && entry.catalogEntryId === catalogEntry.id)
+        || (entry.toolName && entry.toolName === catalogEntry.toolName)
+        || (entry.riskLevel && entry.riskLevel === catalogEntry.riskLevel)
+      ) {
+        connectionIds.add(catalogEntry.connectionId);
+      }
+    }
+  }
+  return connectionIds;
+}
+
+export async function createManagedMcpRunConfig(input: {
   db: Db;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "adapterType">;
   runId: string;
@@ -3675,12 +3792,33 @@ async function createManagedMcpRunConfig(input: {
     ))
     .orderBy(asc(toolMcpGateways.name));
 
-  const gateways = rows.filter((gateway) => gatewayAppliesToRun({
+  const installRows = await input.db
+    .select({ connectionId: toolConnectionInstalls.connectionId })
+    .from(toolConnectionInstalls)
+    .where(and(
+      eq(toolConnectionInstalls.companyId, input.agent.companyId),
+      sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${input.agent.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agent.id}))`,
+    ));
+  const installedConnectionIds = new Set(installRows.map((install) => install.connectionId));
+
+  const applicableGateways = rows.filter((gateway) => gatewayAppliesToRun({
     gateway,
     agentId: input.agent.id,
     projectId: input.projectId,
     issueId: input.issueId,
   }));
+  const gateways = (await Promise.all(applicableGateways.map(async (gateway) => ({
+    gateway,
+    connectionIds: await gatewayConnectionIds({
+      db: input.db,
+      companyId: input.agent.companyId,
+      gateway,
+    }),
+  }))))
+    .filter(({ connectionIds }) =>
+      connectionIds.size > 0
+      && [...connectionIds].every((connectionId) => installedConnectionIds.has(connectionId)))
+    .map(({ gateway }) => gateway);
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
@@ -3704,7 +3842,9 @@ async function createManagedMcpRunConfig(input: {
     managedGateways.push({
       id: gateway.id,
       name: gateway.name,
-      endpointPath: `/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      // This path must bypass the normal /api agent-JWT middleware. The MCP
+      // gateway performs its own bearer validation for the run-scoped token.
+      endpointPath: `/mcp/gateways/${gateway.gatewayPublicId}`,
       bearerToken: token.token,
       tokenPrefix: token.tokenPrefix,
     });
@@ -6826,6 +6966,16 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /** Test seam for changing a continuation issue at the final pre-dispatch boundary. */
+  beforeResolvedInteractionContinuationDispatchCheck?: (input: {
+    runId: string;
+    issueId: string;
+  }) => Promise<void>;
+  /** Test seam for racing an issue mutation after validation while its row lock is held. */
+  afterResolvedInteractionContinuationDispatchCheck?: (input: {
+    runId: string;
+    issueId: string;
+  }) => Promise<void>;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -12919,7 +13069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
-        await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+        await cancelRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -13211,8 +13361,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     context: Record<string, unknown>,
+    dbOrTx: Db = db,
   ): Promise<QueuedRunStaleness> {
-    const issue = await db
+    const issue = await dbOrTx
       .select({
         id: issues.id,
         status: issues.status,
@@ -13240,6 +13391,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence = interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
+    const isResolvedInteractionContinuation = isResolvedInteractionContinuationWakeContext(context);
+
+    if (isResolvedInteractionContinuation && issue.status !== "in_progress") {
+      return {
+        stale: true,
+        errorCode: "issue_not_in_progress",
+        reason: `Cancelled because resolved-interaction continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
+        details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
+      };
+    }
+
+    if (isResolvedInteractionContinuation && issue.assigneeAgentId !== run.agentId) {
+      return {
+        stale: true,
+        errorCode: "issue_assignee_changed",
+        reason:
+          "Cancelled because resolved-interaction continuation issue changed assignee before the queued run could start",
+        details: {
+          issueId,
+          previousAssigneeAgentId: run.agentId,
+          currentAssigneeAgentId: issue.assigneeAgentId,
+        },
+      };
+    }
 
     if (
       issue.status === "in_progress" &&
@@ -13253,7 +13428,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
       const currentContinuationSummary = queuedContinuationSummary
         ? null
-        : await getIssueContinuationSummaryDocument(db, issueId);
+        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
       const continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
       if (continuationSummaryParksExecutor(continuationSummaryBody)) {
         return {
@@ -13280,7 +13455,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const authorizedSourceScopedRecovery = wakeReason === "source_scoped_recovery_action" && recoveryActionId
-      ? await db
+      ? await dbOrTx
         .select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions)
         .where(and(
@@ -13372,7 +13547,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { stale: false };
   }
 
-  async function cancelQueuedRunForStaleIssue(
+  async function cancelRunForStaleIssue(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     staleness: Extract<QueuedRunStaleness, { stale: true }>,
@@ -14559,9 +14734,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
       : null;
+    if (issueId && issueContext && isResolvedInteractionContinuationWakeContext(context)) {
+      try {
+        // Claim the issue under the same in_progress predicate used by the
+        // queued-run staleness gate. This is the final atomic guard before
+        // dispatch: an operator parking the issue after claim but before this
+        // checkout must not be overwritten by the continuation.
+        await issuesSvc.checkout(issueId, agent.id, ["in_progress"], run.id);
+        context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
+      } catch (error) {
+        if (!isCheckoutConflictError(error)) throw error;
+        const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
+        if (staleness.stale) {
+          await cancelRunForStaleIssue(run, issueId, staleness);
+          return;
+        }
+        throw error;
+      }
+      issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+    }
     if (
       issueId &&
       issueContext &&
+      !isResolvedInteractionContinuationWakeContext(context) &&
       shouldAutoCheckoutIssueForWake({
         contextSnapshot: context,
         issueStatus: issueContext.status,
@@ -16374,6 +16569,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionTarget,
       });
       const adapter = getServerAdapter(agent.adapterType);
+      const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
+        dispatch: (markDispatchStarted: () => void) => Promise<T>,
+      ): Promise<
+        | { dispatched: true; resultPromise: Promise<T> }
+        | { dispatched: false }
+      > => {
+        if (!issueId || !isResolvedInteractionContinuationWakeContext(context)) {
+          return { dispatched: true, resultPromise: dispatch(() => {}) };
+        }
+        await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+
+        const gate = await db.transaction(async (tx) => {
+          const lockedIssue = await tx
+            .select({ executionRunId: issues.executionRunId })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          const staleness = await evaluateQueuedRunStaleness(
+            run,
+            issueId,
+            context,
+            tx as unknown as Db,
+          );
+          if (staleness.stale) {
+            return { dispatched: false as const, staleness };
+          }
+          if (lockedIssue?.executionRunId !== run.id) {
+            return {
+              dispatched: false as const,
+              staleness: {
+                stale: true as const,
+                errorCode: "issue_execution_lock_changed" as const,
+                reason:
+                  "Cancelled because resolved-interaction continuation no longer owns the issue execution lock before adapter dispatch",
+                details: {
+                  issueId,
+                  expectedExecutionRunId: run.id,
+                  currentExecutionRunId: lockedIssue?.executionRunId ?? null,
+                },
+              },
+            };
+          }
+
+          await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+          let dispatchStarted = false;
+          let resolveDispatchStarted!: () => void;
+          const dispatchStartedPromise = new Promise<void>((resolve) => {
+            resolveDispatchStarted = resolve;
+          });
+          const markDispatchStarted = () => {
+            if (dispatchStarted) return;
+            dispatchStarted = true;
+            resolveDispatchStarted();
+          };
+
+          // Keep the issue row locked through the adapter's asynchronous
+          // preparation and release it only once the adapter reports an
+          // actual process spawn. If preparation fails or returns without a
+          // spawn, settling the adapter promise also releases the gate.
+          const resultPromise = dispatch(markDispatchStarted);
+          void resultPromise.then(markDispatchStarted, markDispatchStarted);
+          await dispatchStartedPromise;
+          return { dispatched: true as const, resultPromise };
+        });
+
+        if (gate.dispatched) return gate;
+        await cancelRunForStaleIssue(run, issueId, gate.staleness);
+        return { dispatched: false };
+      };
       const localAgentJwtScope =
         issueRef?.workMode === "skill_test"
           ? { kind: "skill_test" as const, issueId: issueRef.id }
@@ -16616,7 +16881,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             promptMetrics: { promptChars: prompt.length },
             context: { provider: "codex", protocolVersion: 1 },
           });
-          adapterResult = await executeNativeCodexRunner({
+          const guardedDispatch = await dispatchResolvedInteractionContinuationWithAtomicGate((markDispatchStarted) =>
+            executeNativeCodexRunner({
             db,
             companyId: agent.companyId,
             issueId: issueRef.id,
@@ -16635,16 +16901,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             timeoutMs,
             environment,
             onLog,
-            onSpawn,
-          });
+            onSpawn: async (meta) => {
+              markDispatchStarted();
+              await onSpawn(meta);
+            },
+            }),
+          );
+          if (!guardedDispatch.dispatched) return;
+          adapterResult = await guardedDispatch.resultPromise;
         } else {
           const adapterContext = { ...context };
+          const runtimeTools = createAdapterRuntimeToolAccess({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            runId: run.id,
+            responsibleUserId: run.responsibleUserId,
+          });
+          if (!runtimeTools) {
+            logger.warn(
+              {
+                companyId: agent.companyId,
+                agentId: agent.id,
+                runId: run.id,
+              },
+              "runtime connection tools could not be delivered",
+            );
+          }
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
             agent,
             runId: run.id,
           });
+          const runtimeToolDelivery = adapter.runtimeToolDelivery ?? "invocation_context";
+          if (runtimeTools && runtimeToolDelivery === "native_mcp") {
+            runtimeMcpServers.unshift({
+              name: "Paperclip connections",
+              url: runtimeTools.mcpEndpoint,
+              token: runtimeTools.bearerToken,
+              connectionId: "paperclip-runtime-tools",
+            });
+          }
           const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
+          if (runtimeTools && runtimeToolDelivery === "invocation_context") {
+            adapterContext.paperclipRuntimeTools = runtimeTools;
+          }
           const managedMcpConfig = await createManagedMcpRunConfig({
             db,
             agent,
@@ -16656,7 +16956,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (managedMcpConfig) {
             adapterContext.paperclipManagedMcp = managedMcpConfig;
           }
-          adapterResult = await adapter.execute({
+          const guardedDispatch = await dispatchResolvedInteractionContinuationWithAtomicGate((markDispatchStarted) =>
+            adapter.execute({
             runId: run.id,
             agent,
             runtime: runtimeForAdapter,
@@ -16668,6 +16969,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
               : undefined,
             runtimeMcp,
+            runtimeTools,
             onLog,
             onMeta: onAdapterMeta,
             onEvent: onAdapterEvent,
@@ -16679,9 +16981,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             onRuntimeProgress: async (progress) => {
               await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
             },
-            onSpawn,
+            onDispatch: markDispatchStarted,
+            onSpawn: async (meta) => {
+              markDispatchStarted();
+              await onSpawn(meta);
+            },
             authToken: authToken ?? undefined,
-          });
+            }),
+          );
+          if (!guardedDispatch.dispatched) return;
+          adapterResult = await guardedDispatch.resultPromise;
         }
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
@@ -18593,6 +18902,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail,
             reason: "issue_execution_issue_not_found",
             payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
+        const issueStateGuard = opts.issueStateGuard;
+        if (
+          issueStateGuard
+          && (
+            !issueStateGuard.statuses.includes(issue.status)
+            || issue.assigneeAgentId !== issueStateGuard.assigneeAgentId
+          )
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_state_guard_mismatch",
+            payload: {
+              ...(payload ?? {}),
+              heartbeatSkip: {
+                reason: "Issue status or assignee changed before the wake could be queued.",
+                issueId: issue.id,
+                expectedStatuses: issueStateGuard.statuses,
+                actualStatus: issue.status,
+                expectedAssigneeAgentId: issueStateGuard.assigneeAgentId,
+                actualAssigneeAgentId: issue.assigneeAgentId,
+              },
+            },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
