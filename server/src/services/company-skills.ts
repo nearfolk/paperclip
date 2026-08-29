@@ -4864,13 +4864,16 @@ export function companySkillService(db: Db) {
     const entries: CompanySkillProjectBrowseResult["entries"] = [];
     for (const entry of visibleDirectoryEntries.slice(0, 250)) {
       const entryPath = normalizedPath === "." ? entry.name : `${normalizedPath}/${entry.name}`;
+      const isSkillDirectory = entry.isDirectory()
+        ? await fs.readdir(path.join(targetPath, entry.name), { withFileTypes: true })
+          .then((children) => children.some((child) => child.name === "SKILL.md" && child.isFile()))
+          .catch(() => false)
+        : false;
       entries.push({
         name: entry.name,
         path: entryPath,
         kind: entry.isDirectory() ? "directory" : "file",
-        isSkill: entry.isDirectory()
-          ? Boolean((await statPath(path.join(targetPath, entry.name, "SKILL.md")))?.isFile())
-          : entry.name === "SKILL.md",
+        isSkill: entry.isDirectory() ? isSkillDirectory : entry.name === "SKILL.md",
       });
     }
     entries.sort((left, right) => {
