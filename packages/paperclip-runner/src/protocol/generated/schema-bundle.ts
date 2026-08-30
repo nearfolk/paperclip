@@ -1866,7 +1866,8 @@ export const semanticToolSchema = {
     "phase": {
       "enum": [
         "input",
-        "result"
+        "result",
+        "reconciled"
       ]
     },
     "operationId": {
@@ -2002,9 +2003,15 @@ export const semanticToolSchema = {
       "if": {
         "properties": {
           "phase": {
-            "const": "result"
+            "enum": [
+              "result",
+              "reconciled"
+            ]
           }
-        }
+        },
+        "required": [
+          "phase"
+        ]
       },
       "then": {
         "required": [

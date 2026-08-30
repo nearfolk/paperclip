@@ -11,6 +11,10 @@ export * from "./contracts/question-set.js";
 export * from "./contracts/runtime-context.js";
 export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
+export {
+  createNativeSessionBackend,
+  type NativeBackendFactoryOptions,
+} from "./backends/native-backend-factory.js";
 export * from "./native-session-runtime.js";
 export {
   DurablePrpControlPlane,
@@ -19,6 +23,7 @@ export {
 export type { DurableRecoveryIdentity } from "./control-plane/prp-transport-types.js";
 export * from "./protocol/replay-contract.js";
 export * from "./protocol/result-normalization.js";
+export * from "./protocol/semantic-tool-receipts.js";
 export * from "./provider-events.js";
 export * from "./reducer/session-reducer.js";
 export * from "./semantic-tools/index.js";
