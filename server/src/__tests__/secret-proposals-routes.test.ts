@@ -27,6 +27,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { issueRoutes } from "../routes/issues.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
@@ -290,6 +291,24 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       next();
     });
     app.use("/api", secretRoutes(db, { heartbeat: options?.heartbeat, issues: options?.issues }));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function createBoardIssueApp(fixture: Awaited<ReturnType<typeof seedRun>>) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        companyIds: [fixture.companyId],
+        source: "session",
+        memberships: [{ companyId: fixture.companyId, status: "active", membershipRole: "member" }],
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never, {}));
     app.use(errorHandler);
     return app;
   }
@@ -1318,6 +1337,125 @@ describeEmbeddedPostgres("secret proposal routes", () => {
   it.each(["target grant", "membership"] as const)(
     "serializes %s revocation ahead of recovery and rolls back every denied mutation",
     runConcurrentRevocationTest,
+  );
+
+  async function runConcurrentInteractionDecisionRevocationTest(
+    decision: "accept" | "reject",
+    revocationKind: "target grant" | "membership",
+  ) {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: `prod/decision/${decision}-${revocationKind.replace(" ", "-")}-source`,
+      key: `DECISION_${decision}_${revocationKind.replace(" ", "_")}_SOURCE`.toUpperCase(),
+      provider: "local_encrypted",
+      value: `decision-${decision}-${revocationKind}-secret`,
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: `access.DECISION_${decision.toUpperCase()}_${revocationKind.replace(" ", "_").toUpperCase()}`,
+        justification: `Prove ${decision} serializes with ${revocationKind} revocation`,
+      });
+    expect(proposed.status).toBe(201);
+
+    await accessService(db).setPrincipalPermission(
+      fixture.companyId,
+      "user",
+      "board-user",
+      "agents:configure",
+      true,
+      null,
+    );
+    const [grant] = await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, fixture.companyId),
+      eq(principalPermissionGrants.principalType, "user"),
+      eq(principalPermissionGrants.principalId, "board-user"),
+      eq(principalPermissionGrants.permissionKey, "agents:configure"),
+    ));
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, fixture.companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, "board-user"),
+    ));
+    expect(grant).toBeDefined();
+    expect(membership).toBeDefined();
+    const [issueBefore] = await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId));
+
+    const releaseRevocationRow = revocationKind === "target grant"
+      ? await holdPermissionGrantRowLock(grant!.id)
+      : await holdMembershipRowLock(membership!.id);
+    const revocation = revocationKind === "target grant"
+      ? accessService(db).setPrincipalPermission(
+          fixture.companyId,
+          "user",
+          "board-user",
+          "agents:configure",
+          false,
+          null,
+        )
+      : accessService(db).updateMember(
+          fixture.companyId,
+          membership!.id,
+          { status: "suspended" },
+        ).then(() => undefined);
+
+    try {
+      expect(await waitForBlockedQuery(
+        revocationKind === "target grant" ? "principal_permission_grants" : "company_memberships",
+      )).toBe(true);
+      const resolution = request(createBoardIssueApp(fixture))
+        .post(`/api/issues/${fixture.issueId}/interactions/${proposed.body.interactionId}/${decision}`)
+        .send(decision === "reject" ? { reason: "Do not create this binding" } : {})
+        .then((response) => response);
+      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+
+      await releaseRevocationRow();
+      await expect(revocation).resolves.toBeUndefined();
+      const denied = await resolution;
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toMatch(/Missing permission: agents:configure|not an active member/);
+    } catch (error) {
+      await releaseRevocationRow();
+      await revocation;
+      throw error;
+    }
+
+    expect(await db.select({ status: companySecretProposals.status })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ status: "pending" }]);
+    expect(await db.select({
+      status: issueThreadInteractions.status,
+      result: issueThreadInteractions.result,
+      resolvedAt: issueThreadInteractions.resolvedAt,
+    }).from(issueThreadInteractions).where(eq(issueThreadInteractions.id, proposed.body.interactionId)))
+      .toEqual([{ status: "pending", result: null, resolvedAt: null }]);
+    expect(await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId)))
+      .toEqual([{ updatedAt: issueBefore!.updatedAt }]);
+    expect(await db.select().from(activityLog).where(sql`
+      ${activityLog.action} in (
+        'issue.thread_interaction_accepted',
+        'issue.thread_interaction_rejected',
+        'secret.proposal.approved',
+        'secret.proposal.rejected'
+      )
+    `)).toHaveLength(0);
+  }
+
+  it.each([
+    ["accept", "target grant"],
+    ["accept", "membership"],
+    ["reject", "target grant"],
+    ["reject", "membership"],
+  ] as const)(
+    "serializes generic %s behind %s revocation with zero governed mutations",
+    runConcurrentInteractionDecisionRevocationTest,
   );
 
   it("preserves rejection lifecycle for a recovered binding confirmation", async () => {

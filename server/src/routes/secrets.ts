@@ -330,7 +330,15 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     });
     const resolvedByUserId = req.actor.userId ?? "board";
     const proposal = await proposals.transition(companyId, req.params.id as string, "rejected", {
-      resolvedByUserId, reason,
+      resolvedByUserId,
+      reason,
+      assertCanResolve: (lockedProposal, txDb) => assertCanResolveProposal({
+        db: txDb,
+        actor: req.actor,
+        companyId,
+        proposal: lockedProposal,
+        assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
+      }),
     });
     await notifySecretProposalResolution({
       proposal: existing,

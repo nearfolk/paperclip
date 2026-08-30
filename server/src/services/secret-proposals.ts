@@ -960,6 +960,9 @@ export function createSecretProposalsService(db: Db) {
   }) {
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      if (input.assertCanResolve) {
+        await lockPrincipalAuthorization(txDb, "user", input.resolvedByUserId, companyId);
+      }
       const proposal = await requirePending(companyId, proposalId, txDb, true);
       assertNotExpired(proposal);
       await input.assertCanResolve?.(proposal, txDb);
@@ -1011,14 +1014,24 @@ export function createSecretProposalsService(db: Db) {
     resolvedByUserId?: string | null;
     reason?: string | null;
     proposerAgentId?: string | null;
+    assertCanResolve?: (proposal: Proposal, txDb: Db) => Promise<void>;
   } = {}) {
-    const proposal = await requirePending(companyId, proposalId);
-    if (status === "withdrawn" && proposal.proposedByAgentId !== input.proposerAgentId) {
-      throw forbidden("Only the proposer can withdraw this proposal");
-    }
     const now = new Date();
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      if (input.assertCanResolve) {
+        await lockPrincipalAuthorization(
+          txDb,
+          "user",
+          input.resolvedByUserId ?? "board",
+          companyId,
+        );
+      }
+      const proposal = await requirePending(companyId, proposalId, txDb, true);
+      if (status === "withdrawn" && proposal.proposedByAgentId !== input.proposerAgentId) {
+        throw forbidden("Only the proposer can withdraw this proposal");
+      }
+      await input.assertCanResolve?.(proposal, txDb);
       const updated = await tx.update(companySecretProposals).set({
         status,
         resolvedByUserId: input.resolvedByUserId ?? null,
