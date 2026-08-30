@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { and, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -36,6 +37,19 @@ export type ProposalRunContext = {
 };
 
 type Proposal = typeof companySecretProposals.$inferSelect;
+type CanonicalBindingInteractionMetadata = Required<Pick<
+  typeof issueThreadInteractions.$inferInsert,
+  | "continuationPolicy"
+  | "requestedResolverPolicy"
+  | "effectiveResolverPolicy"
+  | "resolverPolicyProvenance"
+  | "effectiveResolverPolicySource"
+  | "title"
+  | "summary"
+  | "addresseeAgentId"
+  | "addresseeUserId"
+  | "payload"
+>>;
 
 async function loadRunContext(db: Db, context: Pick<ProposalRunContext, "companyId" | "heartbeatRunId">) {
   const run = await db.select().from(heartbeatRuns).where(and(
@@ -75,6 +89,47 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+function canonicalBindingInteractionMetadata(
+  proposal: Proposal,
+  sourceSecretLabel: string,
+  targetAgentName: string,
+): CanonicalBindingInteractionMetadata {
+  if (!proposal.targetId || !proposal.configPath) {
+    throw conflict("Binding proposal is incomplete");
+  }
+  return {
+    continuationPolicy: "wake_assignee",
+    requestedResolverPolicy: "human_only",
+    effectiveResolverPolicy: "human_only",
+    resolverPolicyProvenance: "explicit",
+    effectiveResolverPolicySource: "governed_action",
+    title: "Confirm secret binding",
+    summary: `Bind ${sourceSecretLabel} to ${targetAgentName} as ${proposal.configPath}`,
+    addresseeAgentId: null,
+    addresseeUserId: null,
+    payload: {
+      version: 1,
+      prompt: `Bind secret ${sourceSecretLabel} to ${targetAgentName} as ${proposal.configPath}?`,
+      acceptLabel: "Create binding",
+      rejectLabel: "Reject",
+      rejectRequiresReason: true,
+      rejectReasonLabel: "Why should this binding not be created?",
+      allowDeclineReason: true,
+      supersedeOnUserComment: false,
+      secretProposal: {
+        version: 1,
+        proposalId: proposal.id,
+        sourceSecretLabel,
+        configPath: proposal.configPath,
+        targetAgentId: proposal.targetId,
+        targetAgentName,
+        justification: proposal.justification,
+        expiresAt: proposal.expiresAt.toISOString(),
+      },
+    },
+  };
 }
 
 export function createSecretProposalsService(db: Db) {
@@ -180,6 +235,7 @@ export function createSecretProposalsService(db: Db) {
       .where(and(eq(agents.id, proposal.targetId), eq(agents.companyId, proposal.companyId)))
       .then((rows) => rows[0] ?? null);
     if (!target) throw notFound("Target agent not found");
+    const metadata = canonicalBindingInteractionMetadata(proposal, sourceSecretLabel, target.name);
 
     const [interaction] = await txDb
       .insert(issueThreadInteractions)
@@ -188,37 +244,10 @@ export function createSecretProposalsService(db: Db) {
         issueId: proposal.originIssueId,
         kind: "request_confirmation",
         status: "pending",
-        continuationPolicy: "wake_assignee",
-        requestedResolverPolicy: "human_only",
-        effectiveResolverPolicy: "human_only",
-        resolverPolicyProvenance: "explicit",
-        effectiveResolverPolicySource: "governed_action",
         idempotencyKey: `secret-proposal:${proposal.id}`,
         sourceRunId: proposal.originRunId,
-        title: "Confirm secret binding",
-        summary: `Bind ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}`,
         createdByAgentId: proposal.proposedByAgentId,
-        addresseeAgentId: null,
-        payload: {
-          version: 1,
-          prompt: `Bind secret ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}?`,
-          acceptLabel: "Create binding",
-          rejectLabel: "Reject",
-          rejectRequiresReason: true,
-          rejectReasonLabel: "Why should this binding not be created?",
-          allowDeclineReason: true,
-          supersedeOnUserComment: false,
-          secretProposal: {
-            version: 1,
-            proposalId: proposal.id,
-            sourceSecretLabel,
-            configPath: proposal.configPath,
-            targetAgentId: proposal.targetId,
-            targetAgentName: target.name,
-            justification: proposal.justification,
-            expiresAt: proposal.expiresAt.toISOString(),
-          },
-        },
+        ...metadata,
       })
       .returning();
 
@@ -254,6 +283,7 @@ export function createSecretProposalsService(db: Db) {
   function assertRecoverableBindingInteraction(
     proposal: Proposal,
     interaction: typeof issueThreadInteractions.$inferSelect,
+    expectedMetadata: CanonicalBindingInteractionMetadata,
   ) {
     const payload = asRecord(interaction.payload);
     const linkedProposal = asRecord(payload.secretProposal);
@@ -269,9 +299,12 @@ export function createSecretProposalsService(db: Db) {
       && interaction.idempotencyKey === `secret-proposal:${proposal.id}`
       && interaction.sourceRunId === proposal.originRunId
       && interaction.createdByAgentId === proposal.proposedByAgentId
-      && linkedProposal.proposalId === proposal.id
-      && linkedProposal.configPath === proposal.configPath
-      && linkedProposal.targetAgentId === proposal.targetId;
+      && interaction.title === expectedMetadata.title
+      && interaction.summary === expectedMetadata.summary
+      && interaction.addresseeAgentId === expectedMetadata.addresseeAgentId
+      && interaction.addresseeUserId === expectedMetadata.addresseeUserId
+      && isDeepStrictEqual(interaction.payload, expectedMetadata.payload)
+      && linkedProposal.proposalId === proposal.id;
     if (!isExactLink) {
       throw conflict("Secret proposal recovery found a conflicting interaction link");
     }
@@ -331,46 +364,6 @@ export function createSecretProposalsService(db: Db) {
       assertNotExpired(proposal);
       await assertBindingSnapshotCurrent(proposal, txDb, true);
 
-      if (proposal.interactionId) {
-        const interaction = await txDb
-          .select()
-          .from(issueThreadInteractions)
-          .where(eq(issueThreadInteractions.id, proposal.interactionId))
-          .for("update")
-          .then((rows) => rows[0] ?? null);
-        if (!interaction) throw conflict("Secret proposal interaction link is missing");
-        assertRecoverableBindingInteraction(proposal, interaction);
-        await assertOnlyPendingBindingInteraction(txDb, proposal, interaction.id);
-        return { proposal, interaction, created: false };
-      }
-
-      const idempotencyKey = `secret-proposal:${proposal.id}`;
-      const existing = await txDb
-        .select()
-        .from(issueThreadInteractions)
-        .where(and(
-          eq(issueThreadInteractions.companyId, proposal.companyId),
-          eq(issueThreadInteractions.issueId, originIssue.id),
-          eq(issueThreadInteractions.idempotencyKey, idempotencyKey),
-        ))
-        .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (existing) {
-        assertRecoverableBindingInteraction(proposal, existing);
-        await assertOnlyPendingBindingInteraction(txDb, proposal, existing.id);
-        const linked = await txDb
-          .update(companySecretProposals)
-          .set({ interactionId: existing.id, updatedAt: new Date() })
-          .where(and(
-            eq(companySecretProposals.id, proposal.id),
-            eq(companySecretProposals.status, "pending"),
-          ))
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        if (!linked) throw conflict("Proposal is no longer pending");
-        return { proposal: linked, interaction: existing, created: false };
-      }
-
       const target = await txDb
         .select({ name: agents.name })
         .from(agents)
@@ -398,6 +391,47 @@ export function createSecretProposalsService(db: Db) {
               .then((rows) => rows[0]?.name ?? null)
           : null;
       if (!sourceSecretLabel) throw conflict("Binding proposal source secret label is unavailable");
+      const expectedMetadata = canonicalBindingInteractionMetadata(proposal, sourceSecretLabel, target.name);
+
+      if (proposal.interactionId) {
+        const interaction = await txDb
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, proposal.interactionId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!interaction) throw conflict("Secret proposal interaction link is missing");
+        assertRecoverableBindingInteraction(proposal, interaction, expectedMetadata);
+        await assertOnlyPendingBindingInteraction(txDb, proposal, interaction.id);
+        return { proposal, interaction, created: false };
+      }
+
+      const idempotencyKey = `secret-proposal:${proposal.id}`;
+      const existing = await txDb
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, proposal.companyId),
+          eq(issueThreadInteractions.issueId, originIssue.id),
+          eq(issueThreadInteractions.idempotencyKey, idempotencyKey),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        assertRecoverableBindingInteraction(proposal, existing, expectedMetadata);
+        await assertOnlyPendingBindingInteraction(txDb, proposal, existing.id);
+        const linked = await txDb
+          .update(companySecretProposals)
+          .set({ interactionId: existing.id, updatedAt: new Date() })
+          .where(and(
+            eq(companySecretProposals.id, proposal.id),
+            eq(companySecretProposals.status, "pending"),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!linked) throw conflict("Proposal is no longer pending");
+        return { proposal: linked, interaction: existing, created: false };
+      }
 
       const [interaction] = await txDb
         .insert(issueThreadInteractions)
@@ -406,37 +440,10 @@ export function createSecretProposalsService(db: Db) {
           issueId: originIssue.id,
           kind: "request_confirmation",
           status: "pending",
-          continuationPolicy: "wake_assignee",
-          requestedResolverPolicy: "human_only",
-          effectiveResolverPolicy: "human_only",
-          resolverPolicyProvenance: "explicit",
-          effectiveResolverPolicySource: "governed_action",
           idempotencyKey,
           sourceRunId: proposal.originRunId,
-          title: "Confirm secret binding",
-          summary: `Bind ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}`,
           createdByAgentId: proposal.proposedByAgentId,
-          addresseeAgentId: null,
-          payload: {
-            version: 1,
-            prompt: `Bind secret ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}?`,
-            acceptLabel: "Create binding",
-            rejectLabel: "Reject",
-            rejectRequiresReason: true,
-            rejectReasonLabel: "Why should this binding not be created?",
-            allowDeclineReason: true,
-            supersedeOnUserComment: false,
-            secretProposal: {
-              version: 1,
-              proposalId: proposal.id,
-              sourceSecretLabel,
-              configPath: proposal.configPath,
-              targetAgentId: proposal.targetId,
-              targetAgentName: target.name,
-              justification: proposal.justification,
-              expiresAt: proposal.expiresAt.toISOString(),
-            },
-          },
+          ...expectedMetadata,
         })
         .returning();
       const linked = await txDb

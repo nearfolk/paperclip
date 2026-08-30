@@ -1000,6 +1000,92 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       })]);
   });
 
+  it("fails closed without relinking when server-owned confirmation metadata conflicts", async () => {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/conflict-source",
+      key: "RECOVERY_CONFLICT_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-conflict-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERY_CONFLICT_ALIAS",
+        justification: "Preserve the canonical confirmation metadata",
+      });
+    expect(proposed.status).toBe(201);
+
+    const interaction = await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId))
+      .then((rows) => rows[0]);
+    const payload = interaction.payload as {
+      prompt: string;
+      acceptLabel: string;
+      rejectLabel: string;
+      rejectRequiresReason: boolean;
+      rejectReasonLabel: string;
+      allowDeclineReason: boolean;
+      supersedeOnUserComment: boolean;
+      secretProposal: {
+        sourceSecretLabel: string;
+        targetAgentName: string;
+        justification: string;
+        expiresAt: string;
+      };
+    };
+    await db.update(companySecretProposals)
+      .set({ interactionId: null })
+      .where(eq(companySecretProposals.id, proposed.body.id));
+    await db.update(issueThreadInteractions)
+      .set({
+        title: "Confirm a different binding",
+        summary: "Conflicting server-owned summary",
+        addresseeAgentId: fixture.agentId,
+        addresseeUserId: "unexpected-board-user",
+        payload: {
+          ...payload,
+          prompt: "Approve a different action?",
+          acceptLabel: "Apply different action",
+          rejectLabel: "Allow",
+          rejectRequiresReason: false,
+          rejectReasonLabel: "Optional reason",
+          allowDeclineReason: false,
+          supersedeOnUserComment: true,
+          secretProposal: {
+            ...payload.secretProposal,
+            sourceSecretLabel: "prod/recovery/different-source",
+            targetAgentName: "Different target",
+            justification: "Different justification",
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+        },
+      })
+      .where(eq(issueThreadInteractions.id, interaction.id));
+
+    const recovered = await request(createBoardApp(fixture))
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+      .send({});
+    expect(recovered.status).toBe(409);
+    expect(await db.select({ interactionId: companySecretProposals.interactionId })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ interactionId: null }]);
+    expect(await db.select({
+      title: issueThreadInteractions.title,
+      addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+      addresseeUserId: issueThreadInteractions.addresseeUserId,
+    }).from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interaction.id)))
+      .toEqual([{
+        title: "Confirm a different binding",
+        addresseeAgentId: fixture.agentId,
+        addresseeUserId: "unexpected-board-user",
+      }]);
+  });
+
   it("preserves rejection lifecycle for a recovered binding confirmation", async () => {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
