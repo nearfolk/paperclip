@@ -46,6 +46,7 @@ import {
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+import { lockCompanyAuthorization } from "./principal-authorization-lock.js";
 import { builtInAgentService } from "./built-in-agents.js";
 
 
@@ -522,6 +523,9 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        // Company deletion revokes every membership and grant. Serialize it
+        // with authorization-sensitive transactions before touching rows.
+        await lockCompanyAuthorization(tx as unknown as Db, id);
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })

@@ -10,6 +10,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   companySecretBindings,
   companySecretProposals,
   companySecretProviderConfigs,
@@ -20,6 +21,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
@@ -31,6 +33,7 @@ import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wak
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import { accessService } from "../services/access.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -69,6 +72,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(companySecretProviderConfigs);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -169,6 +174,74 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         FOR UPDATE NOWAIT
       `);
     });
+  }
+
+  async function holdPermissionGrantRowLock(grantId: string) {
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const transaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: principalPermissionGrants.id })
+        .from(principalPermissionGrants)
+        .where(eq(principalPermissionGrants.id, grantId))
+        .for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    return async () => {
+      releaseLock();
+      await transaction;
+    };
+  }
+
+  async function holdMembershipRowLock(membershipId: string) {
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const transaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: companyMemberships.id })
+        .from(companyMemberships)
+        .where(eq(companyMemberships.id, membershipId))
+        .for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    return async () => {
+      releaseLock();
+      await transaction;
+    };
+  }
+
+  async function waitForBlockedQuery(fragment: string) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [waiting] = await db.execute<{ waiting: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1
+          FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid()
+            AND state = 'active'
+            AND wait_event_type = 'Lock'
+            AND query ILIKE ${`%${fragment}%`}
+        ) AS waiting
+      `);
+      if (waiting?.waiting) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
   }
 
   function createAgentApp(
@@ -1131,6 +1204,121 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       .toEqual([{ interactionId: null }]);
     expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
   });
+
+  async function runConcurrentRevocationTest(revocationKind: "target grant" | "membership") {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/concurrent-revocation-source",
+      key: "RECOVERY_CONCURRENT_REVOCATION_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-concurrent-revocation-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERY_CONCURRENT_REVOCATION_ALIAS",
+        justification: "Prove recovery and authorization revocation serialize",
+      });
+    expect(proposed.status).toBe(201);
+
+    await db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+    await accessService(db).setPrincipalPermission(
+      fixture.companyId,
+      "user",
+      "board-user",
+      "agents:configure",
+      true,
+      null,
+    );
+    const [grant] = await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, fixture.companyId),
+      eq(principalPermissionGrants.principalType, "user"),
+      eq(principalPermissionGrants.principalId, "board-user"),
+      eq(principalPermissionGrants.permissionKey, "agents:configure"),
+    ));
+    expect(grant).toBeDefined();
+    const [issueBefore] = await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId));
+
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, fixture.companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, "board-user"),
+    ));
+    expect(membership).toBeDefined();
+    const releaseRevocationRow = revocationKind === "target grant"
+      ? await holdPermissionGrantRowLock(grant!.id)
+      : await holdMembershipRowLock(membership!.id);
+    const revocation = revocationKind === "target grant"
+      ? accessService(db).setPrincipalPermission(
+          fixture.companyId,
+          "user",
+          "board-user",
+          "agents:configure",
+          false,
+          null,
+        )
+      : accessService(db).updateMember(
+          fixture.companyId,
+          membership!.id,
+          { status: "suspended" },
+        ).then(() => undefined);
+
+    try {
+      expect(await waitForBlockedQuery(
+        revocationKind === "target grant" ? "principal_permission_grants" : "company_memberships",
+      )).toBe(true);
+      const recovery = request(createBoardApp(fixture, { admin: false }))
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+        .send({})
+        .then((response) => response);
+      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+
+      await releaseRevocationRow();
+      await expect(revocation).resolves.toBeUndefined();
+      const denied = await recovery;
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toMatch(/Missing permission: agents:configure|not an active member/);
+    } catch (error) {
+      await releaseRevocationRow();
+      await revocation;
+      throw error;
+    }
+
+    if (revocationKind === "target grant") {
+      expect(await db.select().from(principalPermissionGrants).where(eq(
+        principalPermissionGrants.id,
+        grant!.id,
+      ))).toHaveLength(0);
+    } else {
+      expect(await db.select({ status: companyMemberships.status })
+        .from(companyMemberships)
+        .where(eq(companyMemberships.id, membership!.id)))
+        .toEqual([{ status: "suspended" }]);
+    }
+    expect(await db.select({ interactionId: companySecretProposals.interactionId })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ interactionId: null }]);
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+    expect(await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId)))
+      .toEqual([{ updatedAt: issueBefore!.updatedAt }]);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "secret.proposal.interaction_recovered",
+    ))).toHaveLength(0);
+  }
+
+  it.each(["target grant", "membership"] as const)(
+    "serializes %s revocation ahead of recovery and rolls back every denied mutation",
+    runConcurrentRevocationTest,
+  );
 
   it("preserves rejection lifecycle for a recovered binding confirmation", async () => {
     const fixture = await seedRun();

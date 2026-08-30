@@ -18,6 +18,7 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import { agentService } from "./agents.js";
 import { logActivity } from "./activity-log.js";
 import { normalizeSecretKey, secretService } from "./secrets.js";
+import { lockPrincipalAuthorization } from "./principal-authorization-lock.js";
 
 const CONFIG_PATH_RE = /^(?:env\.[A-Za-z_][A-Za-z0-9_]*|access\.[A-Za-z_][A-Za-z0-9_]*)$/;
 const SECRET_NAME_RE = /^[^/\s]+(?:\/[^/\s]+)*$/;
@@ -346,6 +347,11 @@ export function createSecretProposalsService(db: Db) {
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      // Authorization is the first transaction lock. Membership and grant
+      // revocation writers take this same lock before changing either input,
+      // so a recovery can never commit using an authorization snapshot that a
+      // concurrent writer has already revoked.
+      await lockPrincipalAuthorization(txDb, "user", input.recoveredByUserId, companyId);
       const originIssue = await txDb
         .select({ id: issues.id, status: issues.status })
         .from(issues)

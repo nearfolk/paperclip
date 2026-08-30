@@ -19,6 +19,7 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { lockPrincipalAuthorization } from "./principal-authorization-lock.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -448,10 +449,19 @@ export function accessService(db: Db) {
     grants: GrantInput[],
     grantedByUserId: string | null,
   ) {
-    const member = await getMemberById(companyId, memberId);
-    if (!member) return null;
+    const candidate = await getMemberById(companyId, memberId);
+    if (!candidate) return null;
 
-    await db.transaction(async (tx) => {
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockPrincipalAuthorization(txDb, candidate.principalType as PrincipalType, candidate.principalId, companyId);
+      const member = await tx
+        .select()
+        .from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!member) return null;
       await tx
         .delete(principalPermissionGrants)
         .where(
@@ -475,9 +485,8 @@ export function accessService(db: Db) {
           })),
         );
       }
+      return member;
     });
-
-    return member;
   }
 
   async function updateMemberAndPermissions(
@@ -490,7 +499,15 @@ export function accessService(db: Db) {
     },
     grantedByUserId: string | null,
   ) {
+    const candidate = await getMemberById(companyId, memberId);
+    if (!candidate) return null;
     return db.transaction(async (tx) => {
+      await lockPrincipalAuthorization(
+        tx as unknown as Db,
+        candidate.principalType as PrincipalType,
+        candidate.principalId,
+        companyId,
+      );
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
@@ -643,7 +660,15 @@ export function accessService(db: Db) {
   }
 
   async function archiveMember(companyId: string, memberId: string, input: MemberArchiveInput = {}) {
+    const candidate = await getMemberById(companyId, memberId);
+    if (!candidate) return null;
     return db.transaction(async (tx) => {
+      await lockPrincipalAuthorization(
+        tx as unknown as Db,
+        candidate.principalType as PrincipalType,
+        candidate.principalId,
+        companyId,
+      );
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
@@ -776,8 +801,16 @@ export function accessService(db: Db) {
     options: { actorUserId?: string | null } = {},
   ) {
     const target = new Set(companyIds);
+    const knownCompanyIds = await listUserCompanyAccess(userId)
+      .then((memberships) => memberships.map((membership) => membership.companyId));
 
     await db.transaction(async (tx) => {
+      await lockPrincipalAuthorization(
+        tx as unknown as Db,
+        "user",
+        userId,
+        [...new Set([...knownCompanyIds, ...companyIds])],
+      );
       // Serialize every company-access removal/reactivation with personal OAuth
       // completion, which locks the same membership row before writing secrets.
       const existing = await tx
@@ -868,17 +901,26 @@ export function accessService(db: Db) {
     return listUserCompanyAccess(userId);
   }
 
-  async function ensureMembership(
+  async function ensureMembershipWithClient(
+    dbClient: Db,
     companyId: string,
     principalType: PrincipalType,
     principalId: string,
     membershipRole: string | null = "member",
     status: "pending" | "active" | "suspended" = "active",
   ) {
-    const existing = await getMembership(companyId, principalType, principalId);
+    const existing = await dbClient
+      .select()
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, principalType),
+        eq(companyMemberships.principalId, principalId),
+      ))
+      .then((rows) => rows[0] ?? null);
     if (existing) {
       if (existing.status !== status || existing.membershipRole !== membershipRole) {
-        const updated = await db
+        const updated = await dbClient
           .update(companyMemberships)
           .set({ status, membershipRole, updatedAt: new Date() })
           .where(eq(companyMemberships.id, existing.id))
@@ -889,7 +931,7 @@ export function accessService(db: Db) {
       return existing;
     }
 
-    return db
+    return dbClient
       .insert(companyMemberships)
       .values({
         companyId,
@@ -902,6 +944,27 @@ export function accessService(db: Db) {
       .then((rows) => rows[0]);
   }
 
+  async function ensureMembership(
+    companyId: string,
+    principalType: PrincipalType,
+    principalId: string,
+    membershipRole: string | null = "member",
+    status: "pending" | "active" | "suspended" = "active",
+  ) {
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockPrincipalAuthorization(txDb, principalType, principalId, companyId);
+      return ensureMembershipWithClient(
+        txDb,
+        companyId,
+        principalType,
+        principalId,
+        membershipRole,
+        status,
+      );
+    });
+  }
+
   async function setPrincipalGrants(
     companyId: string,
     principalType: PrincipalType,
@@ -910,6 +973,7 @@ export function accessService(db: Db) {
     grantedByUserId: string | null,
   ) {
     await db.transaction(async (tx) => {
+      await lockPrincipalAuthorization(tx as unknown as Db, principalType, principalId, companyId);
       await tx
         .delete(principalPermissionGrants)
         .where(
@@ -996,9 +1060,28 @@ export function accessService(db: Db) {
     grantedByUserId: string | null,
     scope: Record<string, unknown> | null = null,
   ) {
-    if (!enabled) {
-      await db
-        .delete(principalPermissionGrants)
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockPrincipalAuthorization(txDb, principalType, principalId, companyId);
+      if (!enabled) {
+        await tx
+          .delete(principalPermissionGrants)
+          .where(
+            and(
+              eq(principalPermissionGrants.companyId, companyId),
+              eq(principalPermissionGrants.principalType, principalType),
+              eq(principalPermissionGrants.principalId, principalId),
+              eq(principalPermissionGrants.permissionKey, permissionKey),
+            ),
+          );
+        return;
+      }
+
+      await ensureMembershipWithClient(txDb, companyId, principalType, principalId, "member", "active");
+
+      const existing = await tx
+        .select()
+        .from(principalPermissionGrants)
         .where(
           and(
             eq(principalPermissionGrants.companyId, companyId),
@@ -1006,46 +1089,31 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, principalId),
             eq(principalPermissionGrants.permissionKey, permissionKey),
           ),
-        );
-      return;
-    }
+        )
+        .then((rows) => rows[0] ?? null);
 
-    await ensureMembership(companyId, principalType, principalId, "member", "active");
+      if (existing) {
+        await tx
+          .update(principalPermissionGrants)
+          .set({
+            scope,
+            grantedByUserId,
+            updatedAt: new Date(),
+          })
+          .where(eq(principalPermissionGrants.id, existing.id));
+        return;
+      }
 
-    const existing = await db
-      .select()
-      .from(principalPermissionGrants)
-      .where(
-        and(
-          eq(principalPermissionGrants.companyId, companyId),
-          eq(principalPermissionGrants.principalType, principalType),
-          eq(principalPermissionGrants.principalId, principalId),
-          eq(principalPermissionGrants.permissionKey, permissionKey),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-
-    if (existing) {
-      await db
-        .update(principalPermissionGrants)
-        .set({
-          scope,
-          grantedByUserId,
-          updatedAt: new Date(),
-        })
-        .where(eq(principalPermissionGrants.id, existing.id));
-      return;
-    }
-
-    await db.insert(principalPermissionGrants).values({
-      companyId,
-      principalType,
-      principalId,
-      permissionKey,
-      scope,
-      grantedByUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      await tx.insert(principalPermissionGrants).values({
+        companyId,
+        principalType,
+        principalId,
+        permissionKey,
+        scope,
+        grantedByUserId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
     });
   }
 
@@ -1057,7 +1125,15 @@ export function accessService(db: Db) {
       status?: "pending" | "active" | "suspended";
     },
   ) {
+    const candidate = await getMemberById(companyId, memberId);
+    if (!candidate) return null;
     return db.transaction(async (tx) => {
+      await lockPrincipalAuthorization(
+        tx as unknown as Db,
+        candidate.principalType as PrincipalType,
+        candidate.principalId,
+        companyId,
+      );
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
