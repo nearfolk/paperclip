@@ -242,6 +242,32 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     res.json(await Promise.all(rows.slice(0, page.limit).map((proposal) => boardProposalView(req, proposal))));
   });
 
+  router.post("/companies/:companyId/secret-proposals/:id/recover-interaction", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanySecretWrite(req, companyId);
+    const recovered = await proposals.recoverBindingInteraction(companyId, req.params.id as string, {
+      recoveredByUserId: req.actor.userId ?? "board",
+    });
+    const payload = recovered.interaction.payload && typeof recovered.interaction.payload === "object"
+      ? recovered.interaction.payload as { secretProposal?: { proposalId?: unknown } }
+      : null;
+    res.json({
+      proposalId: recovered.proposal.id,
+      proposalStatus: recovered.proposal.status,
+      proposalInteractionId: recovered.proposal.interactionId,
+      interactionId: recovered.interaction.id,
+      interactionStatus: recovered.interaction.status,
+      interactionProposalId: typeof payload?.secretProposal?.proposalId === "string"
+        ? payload.secretProposal.proposalId
+        : null,
+      issueId: recovered.interaction.issueId,
+      idempotencyKey: recovered.interaction.idempotencyKey,
+      continuationPolicy: recovered.interaction.continuationPolicy,
+      resolverPolicy: recovered.interaction.effectiveResolverPolicy,
+      created: recovered.created,
+    });
+  });
+
   router.post("/companies/:companyId/secret-proposals/:id/approve", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanySecretWrite(req, companyId);

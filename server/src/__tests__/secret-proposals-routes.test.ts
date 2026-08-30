@@ -899,6 +899,140 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await expect(proposals.sweepExpired(new Date(), 2)).resolves.toBe(2);
   });
 
+  it("idempotently recovers one governed confirmation for an existing unlinked binding proposal", async () => {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/source",
+      key: "RECOVERY_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERED_ALIAS",
+        justification: "Restore the missing governed confirmation",
+      });
+    expect(proposed.status).toBe(201);
+
+    await db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+    expect(await db.select({ interactionId: companySecretProposals.interactionId })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ interactionId: null }]);
+
+    const boardApp = createBoardApp(fixture);
+    const [first, second] = await Promise.all([
+      request(boardApp)
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+        .send({}),
+      request(boardApp)
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+        .send({}),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect([first.body.created, second.body.created].sort()).toEqual([false, true]);
+    expect(first.body.interactionId).toBe(second.body.interactionId);
+    expect(first.body).toMatchObject({
+      proposalId: proposed.body.id,
+      proposalStatus: "pending",
+      proposalInteractionId: first.body.interactionId,
+      interactionProposalId: proposed.body.id,
+      issueId: fixture.issueId,
+      interactionStatus: "pending",
+      idempotencyKey: `secret-proposal:${proposed.body.id}`,
+      continuationPolicy: "wake_assignee",
+      resolverPolicy: "human_only",
+    });
+    expect(first.body).not.toHaveProperty("valueFingerprintSha256");
+    expect(first.body).not.toHaveProperty("valueLength");
+
+    const retry = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+      .send({});
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ interactionId: first.body.interactionId, created: false });
+
+    const cards = await db.select().from(issueThreadInteractions);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      id: first.body.interactionId,
+      issueId: fixture.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "governed_action",
+      payload: expect.objectContaining({
+        secretProposal: expect.objectContaining({
+          proposalId: proposed.body.id,
+          configPath: "access.RECOVERED_ALIAS",
+          targetAgentId: fixture.agentId,
+        }),
+      }),
+    });
+    expect(JSON.stringify(cards[0]?.payload)).not.toContain("recovery-secret");
+    expect(JSON.stringify(cards[0]?.payload)).not.toContain("fingerprint");
+
+    const approved = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/approve`)
+      .send({});
+    expect(approved.status).toBe(200);
+    expect(await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, first.body.interactionId)))
+      .toEqual([expect.objectContaining({
+        status: "accepted",
+        result: expect.objectContaining({
+          secretProposal: expect.objectContaining({ status: "executed" }),
+        }),
+      })]);
+  });
+
+  it("preserves rejection lifecycle for a recovered binding confirmation", async () => {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/reject-source",
+      key: "RECOVERY_REJECT_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-reject-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERED_REJECT_ALIAS",
+        justification: "Restore the governed rejection path",
+      });
+    await db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+
+    const recovered = await request(createBoardApp(fixture))
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+      .send({});
+    expect(recovered.status).toBe(200);
+    await issueThreadInteractionService(db).rejectInteraction(
+      { id: fixture.issueId, companyId: fixture.companyId, status: "in_progress" },
+      recovered.body.interactionId,
+      { reason: "Keep the current binding policy" },
+      { userId: "board-user" },
+    );
+
+    expect(await db.select().from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([expect.objectContaining({
+        interactionId: recovered.body.interactionId,
+        status: "rejected",
+        resolutionReason: "Keep the current binding policy",
+      })]);
+  });
+
   it("mirrors binding proposal rejection, withdrawal, and expiry onto linked cards", async () => {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
