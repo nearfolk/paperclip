@@ -1411,6 +1411,43 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("denies secret-proposal rejection before the interaction mutation when target authorization fails", async () => {
+    const proposalId = "44444444-4444-4444-8444-444444444444";
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-secret-proposal-denied",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "governed_action",
+      payload: {
+        version: 1,
+        prompt: "Reject the binding?",
+        secretProposal: { version: 1, proposalId, configPath: "access.NEW_ALIAS" },
+      },
+    });
+    const authorizeSecretProposalResolution = vi.fn().mockResolvedValue(false);
+    const app = await createApp(undefined, { authorizeSecretProposalResolution });
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-secret-proposal-denied/reject`)
+      .send({ reason: "Reject" });
+
+    expect(res.status).toBe(403);
+    expect(authorizeSecretProposalResolution).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      interactionId: "interaction-secret-proposal-denied",
+      proposalId,
+      actor: { agentId: null, userId: "local-board" },
+    });
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
+  });
+
   it("records a failed secret-proposal execution and posts a thread comment", async () => {
     const proposalId = "55555555-5555-4555-8555-555555555555";
     const approveSecretProposal = vi.fn().mockRejectedValue(new Error("binding failed"));

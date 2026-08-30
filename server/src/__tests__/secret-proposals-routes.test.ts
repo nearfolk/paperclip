@@ -924,6 +924,12 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       .where(eq(companySecretProposals.id, proposed.body.id)))
       .toEqual([{ interactionId: null }]);
 
+    const unauthorized = await request(createBoardApp(fixture, { admin: false }))
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+      .send({});
+    expect(unauthorized.status).toBe(403);
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+
     const boardApp = createBoardApp(fixture);
     const [first, second] = await Promise.all([
       request(boardApp)

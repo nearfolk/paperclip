@@ -245,7 +245,16 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.post("/companies/:companyId/secret-proposals/:id/recover-interaction", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanySecretWrite(req, companyId);
-    const recovered = await proposals.recoverBindingInteraction(companyId, req.params.id as string, {
+    const proposal = await proposals.getById(companyId, req.params.id as string);
+    if (!proposal) throw notFound("Secret proposal not found");
+    await assertCanResolveProposal({
+      db,
+      actor: req.actor,
+      companyId,
+      proposal,
+      assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
+    });
+    const recovered = await proposals.recoverBindingInteraction(companyId, proposal.id, {
       recoveredByUserId: req.actor.userId ?? "board",
     });
     const payload = recovered.interaction.payload && typeof recovered.interaction.payload === "object"
