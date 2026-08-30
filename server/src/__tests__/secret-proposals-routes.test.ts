@@ -23,7 +23,7 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
-import { conflict } from "../errors.js";
+import { conflict, forbidden } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
@@ -1084,6 +1084,52 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         addresseeAgentId: fixture.agentId,
         addresseeUserId: "unexpected-board-user",
       }]);
+  });
+
+  it("rechecks resolver authorization inside recovery before relinking", async () => {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/revoked-source",
+      key: "RECOVERY_REVOKED_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-revoked-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERY_REVOKED_ALIAS",
+        justification: "Recheck authorization while recovery is locked",
+      });
+    expect(proposed.status).toBe(201);
+
+    await db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+
+    let rechecked = false;
+    await expect(createSecretProposalsService(db).recoverBindingInteraction(
+      fixture.companyId,
+      proposed.body.id,
+      {
+        recoveredByUserId: "board-user",
+        assertCanResolve: async (lockedProposal, txDb) => {
+          rechecked = true;
+          expect(lockedProposal.id).toBe(proposed.body.id);
+          expect(await txDb.select({ status: companySecretProposals.status })
+            .from(companySecretProposals)
+            .where(eq(companySecretProposals.id, lockedProposal.id)))
+            .toEqual([{ status: "pending" }]);
+          throw forbidden("Resolver authorization was revoked");
+        },
+      },
+    )).rejects.toMatchObject({ status: 403 });
+    expect(rechecked).toBe(true);
+    expect(await db.select({ interactionId: companySecretProposals.interactionId })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ interactionId: null }]);
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
   });
 
   it("preserves rejection lifecycle for a recovered binding confirmation", async () => {

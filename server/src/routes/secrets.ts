@@ -256,6 +256,13 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     });
     const recovered = await proposals.recoverBindingInteraction(companyId, proposal.id, {
       recoveredByUserId: req.actor.userId ?? "board",
+      assertCanResolve: (lockedProposal, txDb) => assertCanResolveProposal({
+        db: txDb,
+        actor: req.actor,
+        companyId,
+        proposal: lockedProposal,
+        assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
+      }),
     });
     const payload = recovered.interaction.payload && typeof recovered.interaction.payload === "object"
       ? recovered.interaction.payload as { secretProposal?: { proposalId?: unknown } }

@@ -334,7 +334,10 @@ export function createSecretProposalsService(db: Db) {
   async function recoverBindingInteraction(
     companyId: string,
     proposalId: string,
-    input: { recoveredByUserId: string },
+    input: {
+      recoveredByUserId: string;
+      assertCanResolve?: (proposal: Proposal, txDb: Db) => Promise<void>;
+    },
   ) {
     const initial = await getById(companyId, proposalId);
     if (!initial) throw notFound("Secret proposal not found");
@@ -362,6 +365,7 @@ export function createSecretProposalsService(db: Db) {
         throw conflict("Binding proposal is incomplete or its origin issue changed");
       }
       assertNotExpired(proposal);
+      await input.assertCanResolve?.(proposal, txDb);
       await assertBindingSnapshotCurrent(proposal, txDb, true);
 
       const target = await txDb
