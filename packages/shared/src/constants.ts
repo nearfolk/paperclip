@@ -1,9 +1,6 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
-export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
-
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
 export type DeploymentMode = (typeof DEPLOYMENT_MODES)[number];
 
@@ -268,6 +265,7 @@ export const ISSUE_THREAD_INTERACTION_KINDS = [
   "request_confirmation",
   "request_checkbox_confirmation",
   "request_item_verdicts",
+  "connection_intent",
 ] as const;
 export type IssueThreadInteractionKind = (typeof ISSUE_THREAD_INTERACTION_KINDS)[number];
 

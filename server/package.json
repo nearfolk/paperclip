@@ -58,10 +58,11 @@
     "@paperclipai/adapter-pi-local": "workspace:*",
     "@paperclipai/adapter-utils": "workspace:*",
     "@paperclipai/db": "workspace:*",
+    "@paperclipai/hermes-paperclip-adapter": "workspace:*",
     "@paperclipai/plugin-sdk": "workspace:*",
     "@paperclipai/shared": "workspace:*",
     "@paperclipai/skills-catalog": "workspace:*",
-    "@paperclipai/hermes-paperclip-adapter": "workspace:*",
+    "@vercel/connect": "0.6.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "better-auth": "1.7.0",
@@ -107,7 +108,8 @@
     "@opentelemetry/exporter-trace-otlp-proto": "0.221.0",
     "@opentelemetry/resources": "2.10.0",
     "@opentelemetry/sdk-node": "0.221.0",
-    "@opentelemetry/semantic-conventions": "1.43.0"
+    "@opentelemetry/semantic-conventions": "1.43.0",
+    "@sentry/node": "10.71.0"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/auto-instrumentations-node": {
@@ -129,6 +131,9 @@
       "optional": true
     },
     "@opentelemetry/semantic-conventions": {
+      "optional": true
+    },
+    "@sentry/node": {
       "optional": true
     }
   },

@@ -139,10 +139,8 @@ Human auth tables (`users`, `sessions`, and provider-specific auth artifacts) ar
 - `issue_counter` int not null
 - `budget_monthly_cents` int not null default 0
 - `spent_monthly_cents` int not null default 0
-- `attachment_max_bytes` int not null
 - `require_board_approval_for_new_agents` boolean not null default false
 - feedback sharing consent fields
-- branding fields such as `brand_color`
 
 Invariant: every business record belongs to exactly one company.
 
@@ -705,8 +703,10 @@ old creator-excluding behavior as canonical `not_creator`, legacy `board_only` r
 become `human_only`, and both are marked `legacy_inherited_restriction`. Resolved
 outcomes and resolver attribution are immutable.
 
-An explicit named addressee and a company-configured cap may narrow the effective
-audience. A cap never widens the requested audience. Tool-action confirmations and
+An explicit named agent or user addressee and a company-configured cap may narrow
+the effective audience. Only the exact named addressee may resolve an addressed
+interaction; a human does not override a user addressee. A cap never widens the
+requested audience. Tool-action confirmations and
 other hard-governed action cards remain `human_only` (or move to the formal approval
 system) regardless of a requested open audience.
 
