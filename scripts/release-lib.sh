@@ -336,11 +336,11 @@ BUNDLED_NPM_PACK_VERSION="10.9.7"
 BUNDLED_NPM_PUBLISH_VERSION="11.18.0"
 
 run_bundled_npm_pack() {
-  npx --yes "npm@$BUNDLED_NPM_PACK_VERSION" "$@"
+  npx --yes "npm@$BUNDLED_NPM_PACK_VERSION" "$@" --ignore-scripts
 }
 
 run_bundled_npm_publish() {
-  npx --yes "npm@$BUNDLED_NPM_PUBLISH_VERSION" "$@" --loglevel verbose
+  npx --yes "npm@$BUNDLED_NPM_PUBLISH_VERSION" "$@" --ignore-scripts --loglevel verbose
 }
 
 run_package_publish() {
@@ -350,9 +350,9 @@ run_package_publish() {
 
   if [ "$publish_tool" = "npm" ]; then
     if [ "$disable_provenance" = "true" ]; then
-      run_bundled_npm_publish publish --ignore-scripts --tag "$dist_tag" --access public --provenance=false
+      run_bundled_npm_publish publish --tag "$dist_tag" --access public --provenance=false
     else
-      run_bundled_npm_publish publish --ignore-scripts --tag "$dist_tag" --access public
+      run_bundled_npm_publish publish --tag "$dist_tag" --access public
     fi
     return
   fi
