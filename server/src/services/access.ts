@@ -780,11 +780,17 @@ export function accessService(db: Db) {
   }
 
   async function demoteInstanceAdmin(userId: string) {
-    return db
-      .delete(instanceUserRoles)
-      .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    return db.transaction(async (tx) => {
+      // Instance-admin authority applies across companies. Serialize its
+      // revocation with every company-scoped authorization decision by taking
+      // the same principal lock first; an empty company list is intentional.
+      await lockPrincipalAuthorization(tx as unknown as Db, "user", userId, []);
+      return tx
+        .delete(instanceUserRoles)
+        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+    });
   }
 
   async function listUserCompanyAccess(userId: string) {

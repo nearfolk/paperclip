@@ -21,6 +21,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  instanceUserRoles,
   principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
@@ -75,6 +76,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(heartbeatRuns);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(instanceUserRoles);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -216,6 +218,31 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         .select({ id: companyMemberships.id })
         .from(companyMemberships)
         .where(eq(companyMemberships.id, membershipId))
+        .for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    return async () => {
+      releaseLock();
+      await transaction;
+    };
+  }
+
+  async function holdInstanceUserRoleRowLock(roleId: string) {
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const transaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: instanceUserRoles.id })
+        .from(instanceUserRoles)
+        .where(eq(instanceUserRoles.id, roleId))
         .for("update");
       signalLocked();
       await release;
@@ -1224,7 +1251,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
   });
 
-  async function runConcurrentRevocationTest(revocationKind: "target grant" | "membership") {
+  async function runConcurrentRevocationTest(
+    revocationKind: "target grant" | "membership" | "instance admin",
+  ) {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
       name: "prod/recovery/concurrent-revocation-source",
@@ -1244,21 +1273,29 @@ describeEmbeddedPostgres("secret proposal routes", () => {
 
     await db.delete(issueThreadInteractions)
       .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
-    await accessService(db).setPrincipalPermission(
-      fixture.companyId,
-      "user",
-      "board-user",
-      "agents:configure",
-      true,
-      null,
-    );
+    if (revocationKind === "instance admin") {
+      await db.insert(instanceUserRoles).values({ userId: "board-user", role: "instance_admin" });
+    } else {
+      await accessService(db).setPrincipalPermission(
+        fixture.companyId,
+        "user",
+        "board-user",
+        "agents:configure",
+        true,
+        null,
+      );
+    }
     const [grant] = await db.select().from(principalPermissionGrants).where(and(
       eq(principalPermissionGrants.companyId, fixture.companyId),
       eq(principalPermissionGrants.principalType, "user"),
       eq(principalPermissionGrants.principalId, "board-user"),
       eq(principalPermissionGrants.permissionKey, "agents:configure"),
     ));
-    expect(grant).toBeDefined();
+    if (revocationKind !== "instance admin") expect(grant).toBeDefined();
+    const [instanceAdminRole] = await db.select().from(instanceUserRoles).where(and(
+      eq(instanceUserRoles.userId, "board-user"),
+      eq(instanceUserRoles.role, "instance_admin"),
+    ));
     const [issueBefore] = await db.select({ updatedAt: issues.updatedAt })
       .from(issues)
       .where(eq(issues.id, fixture.issueId));
@@ -1271,7 +1308,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     expect(membership).toBeDefined();
     const releaseRevocationRow = revocationKind === "target grant"
       ? await holdPermissionGrantRowLock(grant!.id)
-      : await holdMembershipRowLock(membership!.id);
+      : revocationKind === "membership"
+        ? await holdMembershipRowLock(membership!.id)
+        : await holdInstanceUserRoleRowLock(instanceAdminRole!.id);
     const revocation = revocationKind === "target grant"
       ? accessService(db).setPrincipalPermission(
           fixture.companyId,
@@ -1281,15 +1320,19 @@ describeEmbeddedPostgres("secret proposal routes", () => {
           false,
           null,
         )
-      : accessService(db).updateMember(
-          fixture.companyId,
-          membership!.id,
-          { status: "suspended" },
-        ).then(() => undefined);
+      : revocationKind === "membership"
+        ? accessService(db).updateMember(
+            fixture.companyId,
+            membership!.id,
+            { status: "suspended" },
+          ).then(() => undefined)
+        : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
 
     try {
       expect(await waitForBlockedQuery(
-        revocationKind === "target grant" ? "principal_permission_grants" : "company_memberships",
+        revocationKind === "target grant"
+          ? "principal_permission_grants"
+          : revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
       )).toBe(true);
       const recovery = request(createBoardApp(fixture, { admin: false }))
         .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
@@ -1313,11 +1356,16 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         principalPermissionGrants.id,
         grant!.id,
       ))).toHaveLength(0);
-    } else {
+    } else if (revocationKind === "membership") {
       expect(await db.select({ status: companyMemberships.status })
         .from(companyMemberships)
         .where(eq(companyMemberships.id, membership!.id)))
         .toEqual([{ status: "suspended" }]);
+    } else {
+      expect(await db.select().from(instanceUserRoles).where(eq(
+        instanceUserRoles.id,
+        instanceAdminRole!.id,
+      ))).toHaveLength(0);
     }
     expect(await db.select({ interactionId: companySecretProposals.interactionId })
       .from(companySecretProposals)
@@ -1334,14 +1382,14 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ))).toHaveLength(0);
   }
 
-  it.each(["target grant", "membership"] as const)(
+  it.each(["target grant", "membership", "instance admin"] as const)(
     "serializes %s revocation ahead of recovery and rolls back every denied mutation",
     runConcurrentRevocationTest,
   );
 
   async function runConcurrentInteractionDecisionRevocationTest(
     decision: "accept" | "reject" | "withdraw",
-    revocationKind: "target grant" | "membership",
+    revocationKind: "target grant" | "membership" | "instance admin",
   ) {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
@@ -1360,14 +1408,18 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       });
     expect(proposed.status).toBe(201);
 
-    await accessService(db).setPrincipalPermission(
-      fixture.companyId,
-      "user",
-      "board-user",
-      "agents:configure",
-      true,
-      null,
-    );
+    if (revocationKind === "instance admin") {
+      await db.insert(instanceUserRoles).values({ userId: "board-user", role: "instance_admin" });
+    } else {
+      await accessService(db).setPrincipalPermission(
+        fixture.companyId,
+        "user",
+        "board-user",
+        "agents:configure",
+        true,
+        null,
+      );
+    }
     const [grant] = await db.select().from(principalPermissionGrants).where(and(
       eq(principalPermissionGrants.companyId, fixture.companyId),
       eq(principalPermissionGrants.principalType, "user"),
@@ -1379,15 +1431,21 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       eq(companyMemberships.principalType, "user"),
       eq(companyMemberships.principalId, "board-user"),
     ));
-    expect(grant).toBeDefined();
+    if (revocationKind !== "instance admin") expect(grant).toBeDefined();
     expect(membership).toBeDefined();
+    const [instanceAdminRole] = await db.select().from(instanceUserRoles).where(and(
+      eq(instanceUserRoles.userId, "board-user"),
+      eq(instanceUserRoles.role, "instance_admin"),
+    ));
     const [issueBefore] = await db.select({ updatedAt: issues.updatedAt })
       .from(issues)
       .where(eq(issues.id, fixture.issueId));
 
     const releaseRevocationRow = revocationKind === "target grant"
       ? await holdPermissionGrantRowLock(grant!.id)
-      : await holdMembershipRowLock(membership!.id);
+      : revocationKind === "membership"
+        ? await holdMembershipRowLock(membership!.id)
+        : await holdInstanceUserRoleRowLock(instanceAdminRole!.id);
     const revocation = revocationKind === "target grant"
       ? accessService(db).setPrincipalPermission(
           fixture.companyId,
@@ -1397,15 +1455,19 @@ describeEmbeddedPostgres("secret proposal routes", () => {
           false,
           null,
         )
-      : accessService(db).updateMember(
-          fixture.companyId,
-          membership!.id,
-          { status: "suspended" },
-        ).then(() => undefined);
+      : revocationKind === "membership"
+        ? accessService(db).updateMember(
+            fixture.companyId,
+            membership!.id,
+            { status: "suspended" },
+          ).then(() => undefined)
+        : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
 
     try {
       expect(await waitForBlockedQuery(
-        revocationKind === "target grant" ? "principal_permission_grants" : "company_memberships",
+        revocationKind === "target grant"
+          ? "principal_permission_grants"
+          : revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
       )).toBe(true);
       const resolution = request(createBoardIssueApp(fixture))
         .post(`/api/issues/${fixture.issueId}/interactions/${proposed.body.interactionId}/${decision}`)
@@ -1457,6 +1519,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ["reject", "membership"],
     ["withdraw", "target grant"],
     ["withdraw", "membership"],
+    ["accept", "instance admin"],
+    ["reject", "instance admin"],
+    ["withdraw", "instance admin"],
   ] as const)(
     "serializes generic %s behind %s revocation with zero governed mutations",
     runConcurrentInteractionDecisionRevocationTest,
