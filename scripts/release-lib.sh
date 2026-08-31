@@ -350,9 +350,9 @@ run_package_publish() {
 
   if [ "$publish_tool" = "npm" ]; then
     if [ "$disable_provenance" = "true" ]; then
-      run_bundled_npm_publish publish --tag "$dist_tag" --access public --provenance=false
+      run_bundled_npm_publish publish --ignore-scripts --tag "$dist_tag" --access public --provenance=false
     else
-      run_bundled_npm_publish publish --tag "$dist_tag" --access public
+      run_bundled_npm_publish publish --ignore-scripts --tag "$dist_tag" --access public
     fi
     return
   fi
