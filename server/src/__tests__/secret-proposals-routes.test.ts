@@ -299,6 +299,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     fixture: Awaited<ReturnType<typeof seedRun>>,
     options?: {
       admin?: boolean;
+      cachedAdmin?: boolean;
       heartbeat?: IssueAssignmentWakeupDeps;
       issues?: Pick<ReturnType<typeof issueService>, "getById" | "addComment">;
     },
@@ -311,6 +312,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         userId: "board-user",
         companyIds: [fixture.companyId],
         source: options?.admin === false ? "session" : "local_implicit",
+        isInstanceAdmin: options?.cachedAdmin === true,
         memberships: options?.admin === false
           ? [{ companyId: fixture.companyId, status: "active", membershipRole: "member" }]
           : undefined,
@@ -322,7 +324,10 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     return app;
   }
 
-  function createBoardIssueApp(fixture: Awaited<ReturnType<typeof seedRun>>) {
+  function createBoardIssueApp(
+    fixture: Awaited<ReturnType<typeof seedRun>>,
+    options: { cachedAdmin?: boolean } = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -331,6 +336,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         userId: "board-user",
         companyIds: [fixture.companyId],
         source: "session",
+        isInstanceAdmin: options.cachedAdmin === true,
         memberships: [{ companyId: fixture.companyId, status: "active", membershipRole: "member" }],
       };
       next();
@@ -1334,7 +1340,10 @@ describeEmbeddedPostgres("secret proposal routes", () => {
           ? "principal_permission_grants"
           : revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
       )).toBe(true);
-      const recovery = request(createBoardApp(fixture, { admin: false }))
+      const recovery = request(createBoardApp(fixture, {
+        admin: false,
+        cachedAdmin: revocationKind === "instance admin",
+      }))
         .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
         .send({})
         .then((response) => response);
@@ -1469,7 +1478,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
           ? "principal_permission_grants"
           : revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
       )).toBe(true);
-      const resolution = request(createBoardIssueApp(fixture))
+      const resolution = request(createBoardIssueApp(fixture, {
+        cachedAdmin: revocationKind === "instance admin",
+      }))
         .post(`/api/issues/${fixture.issueId}/interactions/${proposed.body.interactionId}/${decision}`)
         .send(decision === "reject" ? { reason: "Do not create this binding" } : {})
         .then((response) => response);
