@@ -252,7 +252,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       actor: req.actor,
       companyId,
       proposal,
-      assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
     });
     const recovered = await proposals.recoverBindingInteraction(companyId, proposal.id, {
       recoveredByUserId: req.actor.userId ?? "board",
@@ -261,7 +260,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         actor: req.actor,
         companyId,
         proposal: lockedProposal,
-        assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
       }),
     });
     const payload = recovered.interaction.payload && typeof recovered.interaction.payload === "object"
@@ -294,7 +292,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       actor: req.actor,
       companyId,
       proposal,
-      assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
     });
     const resolvedByUserId = req.actor.userId ?? "board";
     const approved = await proposals.approve(companyId, proposal.id, {
@@ -306,7 +303,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         actor: req.actor,
         companyId,
         proposal: lockedProposal,
-        assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
       }),
     });
     await notifySecretProposalResolution({ proposal, status: "approved", userId: resolvedByUserId, issues, heartbeat });
@@ -326,7 +322,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       actor: req.actor,
       companyId,
       proposal: existing,
-      assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
     });
     const resolvedByUserId = req.actor.userId ?? "board";
     const proposal = await proposals.transition(companyId, req.params.id as string, "rejected", {
@@ -337,7 +332,6 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         actor: req.actor,
         companyId,
         proposal: lockedProposal,
-        assertSecretDefinitionAdmin: () => assertSecretDefinitionAdmin(req, companyId),
       }),
     });
     await notifySecretProposalResolution({

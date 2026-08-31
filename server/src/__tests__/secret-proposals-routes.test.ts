@@ -300,6 +300,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     options?: {
       admin?: boolean;
       cachedAdmin?: boolean;
+      membershipRole?: "owner" | "admin" | "member";
       heartbeat?: IssueAssignmentWakeupDeps;
       issues?: Pick<ReturnType<typeof issueService>, "getById" | "addComment">;
     },
@@ -314,7 +315,11 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         source: options?.admin === false ? "session" : "local_implicit",
         isInstanceAdmin: options?.cachedAdmin === true,
         memberships: options?.admin === false
-          ? [{ companyId: fixture.companyId, status: "active", membershipRole: "member" }]
+          ? [{
+              companyId: fixture.companyId,
+              status: "active",
+              membershipRole: options.membershipRole ?? "member",
+            }]
           : undefined,
       };
       next();
@@ -1394,6 +1399,99 @@ describeEmbeddedPostgres("secret proposal routes", () => {
   it.each(["target grant", "membership", "instance admin"] as const)(
     "serializes %s revocation ahead of recovery and rolls back every denied mutation",
     runConcurrentRevocationTest,
+  );
+
+  async function runConcurrentSecretDecisionRevocationTest(
+    decision: "approve" | "reject",
+    revocationKind: "membership" | "instance admin",
+  ) {
+    const fixture = await seedRun();
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "secret",
+        name: `prod/secret-decision/${decision}-${revocationKind.replace(" ", "-")}`,
+        value: `secret-decision-${decision}-${revocationKind}`,
+        justification: `Prove ${decision} serializes with ${revocationKind} revocation`,
+      });
+    expect(proposed.status).toBe(201);
+
+    if (revocationKind === "membership") {
+      await db.insert(companyMemberships).values({
+        companyId: fixture.companyId,
+        principalType: "user",
+        principalId: "board-user",
+        status: "active",
+        membershipRole: "admin",
+      });
+    } else {
+      await db.insert(instanceUserRoles).values({ userId: "board-user", role: "instance_admin" });
+    }
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, fixture.companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, "board-user"),
+    ));
+    const [instanceAdminRole] = await db.select().from(instanceUserRoles).where(and(
+      eq(instanceUserRoles.userId, "board-user"),
+      eq(instanceUserRoles.role, "instance_admin"),
+    ));
+    const releaseRevocationRow = revocationKind === "membership"
+      ? await holdMembershipRowLock(membership!.id)
+      : await holdInstanceUserRoleRowLock(instanceAdminRole!.id);
+    const revocation = revocationKind === "membership"
+      ? accessService(db).updateMember(
+          fixture.companyId,
+          membership!.id,
+          { status: "suspended" },
+        ).then(() => undefined)
+      : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
+
+    try {
+      expect(await waitForBlockedQuery(
+        revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
+      )).toBe(true);
+      const resolution = request(createBoardApp(fixture, {
+        admin: false,
+        cachedAdmin: revocationKind === "instance admin",
+        membershipRole: revocationKind === "membership" ? "admin" : "member",
+      }))
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/${decision}`)
+        .send(decision === "reject" ? { reason: "Reject after authority is revoked" } : {})
+        .then((response) => response);
+      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+
+      await releaseRevocationRow();
+      await expect(revocation).resolves.toBeUndefined();
+      const denied = await resolution;
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toContain("Company admin access required");
+    } catch (error) {
+      await releaseRevocationRow();
+      await revocation;
+      throw error;
+    }
+
+    expect(await db.select({
+      status: companySecretProposals.status,
+      valueCiphertext: companySecretProposals.valueCiphertext,
+      resolvedAt: companySecretProposals.resolvedAt,
+    }).from(companySecretProposals).where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ status: "pending", valueCiphertext: expect.any(Object), resolvedAt: null }]);
+    expect(await db.select().from(companySecrets)).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(sql`
+      ${activityLog.action} in ('secret.proposal.approved', 'secret.proposal.rejected')
+    `)).toHaveLength(0);
+  }
+
+  it.each([
+    ["approve", "membership"],
+    ["reject", "membership"],
+    ["approve", "instance admin"],
+    ["reject", "instance admin"],
+  ] as const)(
+    "serializes secret %s behind %s revocation with zero governed mutations",
+    runConcurrentSecretDecisionRevocationTest,
   );
 
   async function runConcurrentInteractionDecisionRevocationTest(
