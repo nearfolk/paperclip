@@ -1,5 +1,5 @@
-import { eq } from "drizzle-orm";
-import { companies, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { companies, companyMemberships, type Db } from "@paperclipai/db";
 import { forbidden, unprocessable } from "../errors.js";
 import { accessService } from "./access.js";
 import { authorizationDeniedDetails, type AuthorizationActor } from "./authorization.js";
@@ -28,11 +28,26 @@ export async function assertCanResolveProposal(input: {
     if (input.actor.source === "local_implicit") return;
 
     // Cloud-tenant elevation is attested for each request and has no
-    // instance_user_roles row to refresh. All other board actors must discard
-    // their authentication-time role and membership snapshot after acquiring
-    // the principal authorization lock and re-read the authoritative rows.
+    // instance_user_roles row to refresh. Membership authority still comes
+    // from the database and must be re-read after the principal authorization
+    // lock so a concurrent revocation cannot lose to a request-time snapshot.
+    // All other board actors refresh both role and membership through the
+    // board access service for the same reason.
     if (input.actor.source === "cloud_tenant") {
-      const membership = input.actor.memberships?.find((item) => item.companyId === input.companyId);
+      const membership = input.actor.userId
+        ? await input.db
+            .select({
+              membershipRole: companyMemberships.membershipRole,
+              status: companyMemberships.status,
+            })
+            .from(companyMemberships)
+            .where(and(
+              eq(companyMemberships.companyId, input.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, input.actor.userId),
+            ))
+            .then((rows) => rows[0] ?? null)
+        : null;
       if (
         input.actor.isInstanceAdmin ||
         (membership?.status === "active" && ["owner", "admin"].includes(String(membership.membershipRole)))
