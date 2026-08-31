@@ -179,6 +179,7 @@ export async function openCodexAcpxRuntime(
       overrides: { codex: [VERIFIED_COMMAND_SENTINEL] },
     }),
     permissionMode: options.permissionMode,
+    elicitationModes: ["form"],
     nonInteractivePermissions: "fail",
     permissionPolicy: {
       ...options.permissionPolicy,
@@ -221,6 +222,7 @@ export async function openCodexAcpxRuntime(
       // A verified provider can create descendants that inherit its launch
       // credential. Give the provider a dedicated POSIX process group so
       // cleanup authority covers that complete credential-bearing tree.
+      options.assertWorkspaceHeld?.();
       return children.add(
         options.command.spawn(input.args, {
           ...input.options,
@@ -899,6 +901,9 @@ function runtimePort(
         mode: "prompt",
         requestId: input.requestId,
         ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.onElicitation
+          ? { onElicitation: input.onElicitation }
+          : {}),
       });
     },
     close: closeRuntime,

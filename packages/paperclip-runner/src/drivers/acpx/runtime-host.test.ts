@@ -172,6 +172,37 @@ describe("ACPX runtime host", () => {
     expect(fixture.commandClose).toHaveBeenCalledOnce();
   });
 
+  it("revalidates a pinned workspace at the runtime-open boundary", async () => {
+    const fixture = await hostFixture();
+    const openRuntime = vi.fn(async () => runtimePort());
+    const workspaceSubstituted = new Error("recovered workspace substituted");
+    let assertions = 0;
+    const assertWorkspaceHeld = vi.fn(() => {
+      assertions += 1;
+      if (assertions === 2) throw workspaceSubstituted;
+    });
+
+    await expect(
+      AcpxRuntimeHost.open(
+        {
+          ...fixture.options,
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          permissionMode: "approve-reads",
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}",
+          },
+          assertWorkspaceHeld,
+        },
+        fixture.dependencies({ openRuntime }),
+      ),
+    ).rejects.toBe(workspaceSubstituted);
+
+    expect(assertWorkspaceHeld).toHaveBeenCalledTimes(2);
+    expect(openRuntime).not.toHaveBeenCalled();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
+  });
+
   it("owns an authenticated semantic bridge without persisting its secret", async () => {
     const fixture = await hostFixture();
     const handler = vi.fn(async ({ tool }) => ({ tool, ok: true }));
@@ -602,6 +633,7 @@ describe("ACPX runtime host", () => {
     const fixture = await hostFixture();
     const turn = runtimeTurn();
     const startTurn = vi.fn(() => turn);
+    const onElicitation = vi.fn();
     const runtime = runtimePort({ startTurn });
     const host = await AcpxRuntimeHost.open(
       {
@@ -615,11 +647,16 @@ describe("ACPX runtime host", () => {
     );
 
     expect(
-      host.startTurn({ text: "Complete the task.", requestId: "turn-1" }),
+      host.startTurn({
+        text: "Complete the task.",
+        requestId: "turn-1",
+        onElicitation,
+      }),
     ).toBe(turn);
     expect(startTurn).toHaveBeenCalledWith({
       text: "Complete the task.",
       requestId: "turn-1",
+      onElicitation,
     });
     expect(() =>
       host.startTurn({ text: "Concurrent", requestId: "turn-2" }),
