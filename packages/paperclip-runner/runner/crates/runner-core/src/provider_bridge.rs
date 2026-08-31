@@ -520,6 +520,20 @@ impl ProviderToolBridge {
         Ok(())
     }
 
+    /// Start a receipt epoch after the process that owned the previous epoch
+    /// has been reaped and a replacement provider generation is established.
+    /// Providers that continue in the same process must retain their durable
+    /// call-ID tombstones through ordinary `prepare_turn` transitions.
+    pub(crate) fn prepare_turn_after_provider_restart(
+        &mut self,
+    ) -> Result<(), ProviderBridgeError> {
+        self.prepare_turn()?;
+        self.settled_call_ids.clear();
+        self.settled_call_filter = DurableReplayFilter::default();
+        self.durable_run_receipt_limit_reached = false;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_result_bytes_for_test(&self) -> usize {
         self.retained_result_bytes
@@ -548,6 +562,10 @@ impl ProviderToolBridge {
 
     pub fn has_completed_call(&self, call_id: &str) -> bool {
         self.completed.contains_key(call_id) || self.has_settled_call_id(call_id)
+    }
+
+    pub(crate) fn has_call_receipt(&self, call_id: &str) -> bool {
+        self.pending.contains_key(call_id) || self.has_completed_call(call_id)
     }
 
     pub fn begin_call(
@@ -1462,6 +1480,37 @@ mod tests {
             retained_result_entry_bytes(&call_id, &completed).unwrap()
                 <= pending_result_reserve_bytes(&call).unwrap()
         );
+    }
+
+    #[test]
+    fn cross_bridge_receipt_lookup_reserves_pending_call_ids() {
+        let operation = AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+
+        assert!(!bridge.has_call_receipt("shared-call"));
+        bridge
+            .begin_call(
+                "shared-call".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        assert!(bridge.has_call_receipt("shared-call"));
     }
 
     #[test]

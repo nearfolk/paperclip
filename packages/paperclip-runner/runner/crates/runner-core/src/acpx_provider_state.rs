@@ -8,6 +8,7 @@ use crate::acpx_event_payload::{
 use crate::acpx_event_scope::AcpxEventScope;
 use crate::acpx_sidecar_transport::AcpxSidecarEvent;
 use crate::local_runner::LocalRunnerError;
+use crate::provider_bridge::ToolResult;
 use crate::provider_events::{normalize_acpx_runtime_event, NormalizedProviderEvent};
 
 const MAX_ASSISTANT_TEXT_BYTES: usize = 1024 * 1024;
@@ -15,11 +16,14 @@ const MAX_PENDING_TOOLS: usize = 4_096;
 const MAX_PENDING_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_RUNTIME_REQUESTS: usize = 1_024;
 const MAX_PENDING_RUNTIME_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const PRP_COMPLETION_TOOL_NAME: &str = "paperclip_finish";
+const PRP_BLOCK_TOOL_NAME: &str = "paperclip_block";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AcpxPendingTool {
     pub operation_id: String,
     pub input: Value,
+    pub(crate) input_digest: String,
     input_bytes: usize,
 }
 
@@ -27,7 +31,9 @@ pub struct AcpxPendingTool {
 pub struct AcpxSemanticResult {
     pub call_id: String,
     pub operation_id: String,
+    pub ok: bool,
     pub result: Value,
+    pub(crate) result_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +44,7 @@ pub enum AcpxProviderStateEvent {
         operation_id: String,
         input: Value,
     },
+    ToolResult(ToolResult),
     PermissionRequest {
         request_id: String,
         kind: String,
@@ -115,6 +122,33 @@ impl AcpxProviderState {
         self.scope.active_turn_id()
     }
 
+    pub(crate) fn has_settled_turns(&self) -> bool {
+        self.scope.has_settled_turns()
+    }
+
+    pub(crate) fn validate_new_turn_identity(&self, turn_id: &str) -> Result<(), LocalRunnerError> {
+        self.scope.validate_new_turn_identity(turn_id)
+    }
+
+    pub(crate) fn validate_new_turn_identity_for_provider_restart(
+        &self,
+        turn_id: &str,
+    ) -> Result<(), LocalRunnerError> {
+        self.scope
+            .validate_new_turn_identity_for_provider_restart(turn_id)
+    }
+
+    pub(crate) fn settled_turn_identity_capacity_reached(&self) -> bool {
+        self.scope.settled_turn_identity_capacity_reached()
+    }
+
+    pub(crate) fn rotate_settled_turn_identities_after_provider_restart(
+        &mut self,
+    ) -> Result<(), LocalRunnerError> {
+        self.scope
+            .rotate_settled_turn_identities_after_provider_restart()
+    }
+
     pub fn begin_turn(&mut self, turn_id: impl Into<String>) -> Result<(), LocalRunnerError> {
         if self.scope.active_turn_id().is_some()
             || !self.pending_tools.is_empty()
@@ -147,7 +181,14 @@ impl AcpxProviderState {
                 kind,
                 tool_operation,
                 payload,
-            } => self.accept_runtime_event(event, kind, tool_operation, payload),
+                semantic_result_digest,
+            } => self.accept_runtime_event(
+                event,
+                kind,
+                tool_operation,
+                payload,
+                semantic_result_digest,
+            ),
             AcpxEventPayload::PermissionRequested {
                 request_id,
                 kind,
@@ -193,6 +234,7 @@ impl AcpxProviderState {
                 call_id,
                 operation_id,
                 input,
+                input_digest,
             } => {
                 let input_bytes = value_bytes(&input)?;
                 if self.pending_tools.len() >= MAX_PENDING_TOOLS
@@ -215,6 +257,7 @@ impl AcpxProviderState {
                     AcpxPendingTool {
                         operation_id: operation_id.clone(),
                         input: input.clone(),
+                        input_digest,
                         input_bytes,
                     },
                 );
@@ -259,6 +302,10 @@ impl AcpxProviderState {
 
     pub fn pending_tool(&self, call_id: &str) -> Option<&AcpxPendingTool> {
         self.pending_tools.get(call_id)
+    }
+
+    pub fn has_pending_tools(&self) -> bool {
+        !self.pending_tools.is_empty()
     }
 
     pub fn complete_tool(
@@ -315,6 +362,7 @@ impl AcpxProviderState {
         kind: AcpxRuntimeEventKind,
         tool_operation: Option<&'static str>,
         payload: Value,
+        semantic_result_digest: Option<String>,
     ) -> Result<Vec<AcpxProviderStateEvent>, LocalRunnerError> {
         if kind == AcpxRuntimeEventKind::Thinking {
             if self.thinking_active {
@@ -351,21 +399,36 @@ impl AcpxProviderState {
                     .and_then(Value::as_str)
                     .expect("decoded ACPX semantic result has an operation id")
                     .to_owned(),
+                ok: payload
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .expect("decoded ACPX semantic result has an outcome"),
                 result: payload
                     .get("result")
                     .expect("decoded ACPX semantic result has a result")
                     .clone(),
+                result_digest: semantic_result_digest
+                    .expect("decoded ACPX semantic result has a raw correlation digest"),
             };
-            return match self.semantic_result.as_ref() {
-                None => {
-                    self.semantic_result = Some(result.clone());
-                    Ok(vec![AcpxProviderStateEvent::SemanticResult(result)])
-                }
-                Some(existing) if existing == &result => Ok(Vec::new()),
-                Some(_) => Err(LocalRunnerError::invalid(
-                    "ACPX emitted conflicting semantic results for one turn",
-                )),
-            };
+            if matches!(
+                result.operation_id.as_str(),
+                PRP_COMPLETION_TOOL_NAME | PRP_BLOCK_TOOL_NAME
+            ) {
+                return match self.semantic_result.as_ref() {
+                    None => {
+                        self.semantic_result = Some(result.clone());
+                        Ok(vec![AcpxProviderStateEvent::SemanticResult(result)])
+                    }
+                    Some(existing) if existing == &result => Ok(Vec::new()),
+                    Some(_) => Err(LocalRunnerError::invalid(
+                        "ACPX emitted conflicting terminal semantic results for one turn",
+                    )),
+                };
+            }
+            // Dynamic results are independently authorized and deduplicated
+            // by call ID in ProviderToolBridge. They must not compete for the
+            // turn-wide terminal-result slot.
+            return Ok(vec![AcpxProviderStateEvent::SemanticResult(result)]);
         }
         let turn_id = event
             .turn_id
