@@ -332,6 +332,9 @@ export function companyService(db: Db) {
       actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR,
     ) => {
       const result = await db.transaction(async (tx) => {
+        if (data.status === "archived") {
+          await lockCompanyAuthorization(tx as unknown as Db, id);
+        }
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
@@ -484,6 +487,10 @@ export function companyService(db: Db) {
 
     archive: async (id: string, actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR) => {
       const result = await db.transaction(async (tx) => {
+        // Archival revokes effective access to the entire company. Serialize
+        // it with every governed authorization decision before reading or
+        // changing company state.
+        await lockCompanyAuthorization(tx as unknown as Db, id);
         const existing = await tx
           .select({ status: companies.status })
           .from(companies)

@@ -1,4 +1,5 @@
-import type { Db } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { companies, type Db } from "@paperclipai/db";
 import { forbidden, unprocessable } from "../errors.js";
 import { accessService } from "./access.js";
 import { authorizationDeniedDetails, type AuthorizationActor } from "./authorization.js";
@@ -15,6 +16,13 @@ export async function assertCanResolveProposal(input: {
   companyId: string;
   proposal: ResolvableSecretProposal;
 }) {
+  const company = await input.db
+    .select({ status: companies.status })
+    .from(companies)
+    .where(eq(companies.id, input.companyId))
+    .then((rows) => rows[0] ?? null);
+  if (company?.status !== "active") throw forbidden("Company is not active");
+
   if (input.proposal.kind === "secret") {
     if (input.actor.type !== "board") throw forbidden("Company admin access required");
     if (input.actor.source === "local_implicit") return;

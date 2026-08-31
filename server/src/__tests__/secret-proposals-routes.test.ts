@@ -19,6 +19,7 @@ import {
   companySecrets,
   createDb,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueThreadInteractions,
   issues,
@@ -43,6 +44,7 @@ import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
 import { accessService } from "../services/access.js";
+import { companyService } from "../services/companies.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -81,6 +83,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(userSecretDefinitions);
     await db.delete(companySecretProviderConfigs);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -252,6 +255,31 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         .select({ id: instanceUserRoles.id })
         .from(instanceUserRoles)
         .where(eq(instanceUserRoles.id, roleId))
+        .for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    return async () => {
+      releaseLock();
+      await transaction;
+    };
+  }
+
+  async function holdCompanyRowLock(companyId: string) {
+    let signalLocked!: () => void;
+    let releaseLock!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const transaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.id, companyId))
         .for("update");
       signalLocked();
       await release;
@@ -1278,7 +1306,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
   });
 
   async function runConcurrentRevocationTest(
-    revocationKind: "target grant" | "membership" | "instance admin" | "cloud tenant purge",
+    revocationKind: "target grant" | "membership" | "instance admin" | "cloud tenant purge" | "company archive",
   ) {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
@@ -1299,6 +1327,14 @@ describeEmbeddedPostgres("secret proposal routes", () => {
 
     await db.delete(issueThreadInteractions)
       .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+    if (revocationKind === "company archive") {
+      // Keep archive-side heartbeat cancellation from mutating the issue so
+      // this race isolates mutations attributable to the denied recovery.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded" })
+        .where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    }
     const revokesInstanceAdmin = revocationKind === "instance admin" || revocationKind === "cloud tenant purge";
     if (revokesInstanceAdmin) {
       await db.insert(instanceUserRoles).values({ userId: "board-user", role: "instance_admin" });
@@ -1337,7 +1373,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       ? await holdPermissionGrantRowLock(grant!.id)
       : revocationKind === "membership"
         ? await holdMembershipRowLock(membership!.id)
-        : await holdInstanceUserRoleRowLock(instanceAdminRole!.id);
+        : revocationKind === "company archive"
+          ? await holdCompanyRowLock(fixture.companyId)
+          : await holdInstanceUserRoleRowLock(instanceAdminRole!.id);
     const revocation = revocationKind === "target grant"
       ? accessService(db).setPrincipalPermission(
           fixture.companyId,
@@ -1353,6 +1391,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
             membership!.id,
             { status: "suspended" },
           ).then(() => undefined)
+        : revocationKind === "company archive"
+          ? companyService(db).archive(fixture.companyId).then(() => undefined)
         : revocationKind === "cloud tenant purge"
           ? purgeStaleCloudTenantInstanceAdminRole(db, "board-user")
           : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
@@ -1361,7 +1401,11 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       expect(await waitForBlockedQuery(
         revocationKind === "target grant"
           ? "principal_permission_grants"
-          : revocationKind === "membership" ? "company_memberships" : "instance_user_roles",
+          : revocationKind === "membership"
+            ? "company_memberships"
+            : revocationKind === "company archive"
+              ? "companies"
+              : "instance_user_roles",
       )).toBe(true);
       const recovery = request(createBoardApp(fixture, {
         admin: false,
@@ -1376,7 +1420,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       await expect(revocation).resolves.toBeUndefined();
       const denied = await recovery;
       expect(denied.status).toBe(403);
-      expect(denied.body.error).toMatch(/Missing permission: agents:configure|not an active member/);
+      expect(denied.body.error).toMatch(/Missing permission: agents:configure|not an active member|Company is not active/);
     } catch (error) {
       await releaseRevocationRow();
       await revocation;
@@ -1393,11 +1437,16 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         .from(companyMemberships)
         .where(eq(companyMemberships.id, membership!.id)))
         .toEqual([{ status: "suspended" }]);
-    } else {
+    } else if (revokesInstanceAdmin) {
       expect(await db.select().from(instanceUserRoles).where(eq(
         instanceUserRoles.id,
         instanceAdminRole!.id,
       ))).toHaveLength(0);
+    } else {
+      expect(await db.select({ status: companies.status })
+        .from(companies)
+        .where(eq(companies.id, fixture.companyId)))
+        .toEqual([{ status: "archived" }]);
     }
     expect(await db.select({ interactionId: companySecretProposals.interactionId })
       .from(companySecretProposals)
@@ -1414,7 +1463,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ))).toHaveLength(0);
   }
 
-  it.each(["target grant", "membership", "instance admin", "cloud tenant purge"] as const)(
+  it.each(["target grant", "membership", "instance admin", "cloud tenant purge", "company archive"] as const)(
     "serializes %s revocation ahead of recovery and rolls back every denied mutation",
     runConcurrentRevocationTest,
   );
