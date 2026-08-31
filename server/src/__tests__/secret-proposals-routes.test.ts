@@ -1560,11 +1560,12 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     revocationKind: "membership" | "cloud tenant membership" | "instance admin",
   ) {
     const fixture = await seedRun();
+    const revocationSlug = revocationKind.replaceAll(" ", "-");
     const proposed = await request(createAgentApp(fixture))
       .post("/api/agents/me/secret-proposals")
       .send({
         kind: "secret",
-        name: `prod/secret-decision/${decision}-${revocationKind.replace(" ", "-")}`,
+        name: `prod/secret-decision/${decision}-${revocationSlug}`,
         value: `secret-decision-${decision}-${revocationKind}`,
         justification: `Prove ${decision} serializes with ${revocationKind} revocation`,
       });
