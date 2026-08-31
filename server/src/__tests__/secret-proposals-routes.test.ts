@@ -319,17 +319,15 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     };
   }
 
-  async function waitForBlockedQuery(fragment: string) {
+  async function waitForBlockedQuery(fragment: string, minimumCount = 1) {
     for (let attempt = 0; attempt < 80; attempt += 1) {
       const [waiting] = await db.execute<{ waiting: boolean }>(sql`
-        SELECT EXISTS (
-          SELECT 1
+        SELECT COUNT(*) >= ${minimumCount} AS waiting
           FROM pg_stat_activity
           WHERE pid <> pg_backend_pid()
             AND state = 'active'
             AND wait_event_type = 'Lock'
             AND query ILIKE ${`%${fragment}%`}
-        ) AS waiting
       `);
       if (waiting?.waiting) return true;
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1462,7 +1460,10 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
         .send({})
         .then((response) => response);
-      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+      expect(await waitForBlockedQuery(
+        revokesCloudElevation ? "instance_settings" : "pg_advisory_xact_lock",
+        revokesCloudElevation ? 2 : 1,
+      )).toBe(true);
 
       await releaseRevocationRow();
       await expect(revocation).resolves.toBeUndefined();
@@ -1684,7 +1685,10 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/${decision}`)
         .send(decision === "reject" ? { reason: "Reject after authority is revoked" } : {})
         .then((response) => response);
-      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+      expect(await waitForBlockedQuery(
+        revocationKind === "cloud tenant elevation" ? "instance_settings" : "pg_advisory_xact_lock",
+        revocationKind === "cloud tenant elevation" ? 2 : 1,
+      )).toBe(true);
 
       await releaseRevocationRow();
       await expect(revocation).resolves.toBeUndefined();
