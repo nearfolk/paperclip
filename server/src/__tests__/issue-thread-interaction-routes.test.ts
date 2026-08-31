@@ -888,6 +888,45 @@ describe.sequential("issue thread interaction routes", () => {
     }));
   });
 
+  it("denies secret-proposal withdrawal before any governed mutation when target authorization fails", async () => {
+    const proposalId = "44444444-4444-4444-8444-444444444444";
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-secret-proposal-withdraw-denied",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "governed_action",
+      payload: {
+        version: 1,
+        prompt: "Create the binding?",
+        secretProposal: { version: 1, proposalId, configPath: "access.NEW_ALIAS" },
+      },
+    });
+    const authorizeSecretProposalResolution = vi.fn().mockResolvedValue(false);
+    const app = await createApp(undefined, { authorizeSecretProposalResolution });
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-secret-proposal-withdraw-denied/withdraw`)
+      .send({ reason: "Withdraw" });
+
+    expect(res.status).toBe(403);
+    expect(authorizeSecretProposalResolution).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      interactionId: "interaction-secret-proposal-withdraw-denied",
+      proposalId,
+      actor: { agentId: null, userId: "local-board" },
+    });
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("cancels the bound native run when its question is withdrawn", async () => {
     mockInteractionService.withdrawInteraction.mockImplementationOnce((...args) => resolveMockInteraction(args, {
       id: "interaction-withdraw",

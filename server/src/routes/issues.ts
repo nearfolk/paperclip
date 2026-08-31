@@ -11939,6 +11939,8 @@ export function issueRoutes(
       const current = await interactionSvc.getForIssue(issue, interactionId);
       if (!(await assertIssueThreadInteractionWithdrawalAllowed(req, res, issue, current))) return;
       await assertPendingReviewInteractionVerdictAllowed(req, issue, current);
+      const secretProposalAuthorizationTransaction =
+        await assertSecretProposalInteractionResolutionAllowed(req, issue, current);
 
       const actor = getActorInfo(req);
       let nativeRunId: string | null = null;
@@ -11950,6 +11952,9 @@ export function issueRoutes(
           agentId: actor.agentId,
           runId: actor.runId,
           userId: actor.actorType === "user" ? actor.actorId : null,
+          ...(secretProposalAuthorizationTransaction
+            ? { authorizationTransaction: secretProposalAuthorizationTransaction }
+            : {}),
         },
         {
           afterResolveInTransaction: async (tx, resolved) => {

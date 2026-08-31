@@ -3540,13 +3540,22 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        // Target authorization uses the same principal advisory lock as grant
+        // and membership revocation writers. Take it before any governed
+        // mutation, then recheck after the lock so withdrawal observes either
+        // the complete pre-revocation state or the complete post-revocation
+        // state. Later status guards roll this transaction back if the card is
+        // resolved concurrently.
+        await actor.authorizationTransaction?.lock(txDb);
+        await actor.authorizationTransaction?.assertAllowed(txDb, current);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
           actor,
           now,
         });
-        await resolveLinkedSecretProposal(tx as unknown as Db, current, {
+        await resolveLinkedSecretProposal(txDb, current, {
           status: "withdrawn",
           actor,
           reason,
