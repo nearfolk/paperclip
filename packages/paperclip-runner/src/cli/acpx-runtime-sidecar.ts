@@ -31,10 +31,13 @@ import {
 import {
   ACPX_SIDECAR_MAX_FRAME_BYTES,
   ACPX_SIDECAR_PROTOCOL_VERSION,
+  boundedSidecarText,
   boundedSidecarValue,
+  frameAcpxToolClassification,
   parseAcpxSidecarRequest,
   record,
   sanitizeAcpxPlanEntries,
+  stringifyAcpxSidecarFrame,
   text,
   type AcpxExpectedSessionIdentity,
   type AcpxSidecarEvent,
@@ -662,20 +665,47 @@ function sanitizeRuntimeEvent(event: AcpRuntimeEvent): Record<string, unknown> {
     });
   }
   if (event.type === "tool_call") {
+    // Classification and the consumer must see the same title bytes. In
+    // particular, a mutation token beyond the transport bound must not grant a
+    // create-target attestation that runner-core cannot independently verify.
+    const toolTitle =
+      typeof event.title === "string"
+        ? boundedSidecarText(event.title, 4_000)
+        : null;
+    // Classify the complete provider kind before retaining its bounded display
+    // prefix. The canonical operation keeps runner-core and the location
+    // attestation decision aligned even when the mutation token is outside the
+    // retained prefix.
+    const toolClassification = frameAcpxToolClassification(
+      event.kind,
+      toolTitle,
+    );
+    const toolCallIdentity = {
+      type: "tool_call",
+      toolCallId:
+        typeof event.toolCallId === "string"
+          ? boundedSidecarText(event.toolCallId, 240)
+          : null,
+      status:
+        typeof event.status === "string"
+          ? boundedSidecarText(event.status, 100)
+          : null,
+      title: toolTitle,
+      ...toolClassification,
+    };
     return boundedSidecarValue(
       {
-        type: "tool_call",
-        toolCallId: event.toolCallId?.slice(0, 240) ?? null,
-        status: event.status?.slice(0, 100) ?? null,
-        title: event.title?.slice(0, 4_000) ?? null,
-        kind: event.kind ?? null,
+        ...toolCallIdentity,
         locations: safeAcpxLocations(
           event.locations,
           openParams?.workingDirectory,
+          event.kind,
+          toolTitle,
         ),
         ...safeOutput(event.rawOutput),
       },
       128 * 1024,
+      toolCallIdentity,
     );
   }
   if (event.type === "error") {
@@ -939,7 +969,7 @@ function response(
 }
 
 function writeFrame(value: AcpxSidecarEvent | AcpxSidecarResponse): void {
-  const line = JSON.stringify(value);
+  const line = stringifyAcpxSidecarFrame(value);
   if (Buffer.byteLength(line) > ACPX_SIDECAR_MAX_FRAME_BYTES) {
     process.stderr.write("[paperclip-acpx-sidecar] output_frame_too_large\n");
     return;

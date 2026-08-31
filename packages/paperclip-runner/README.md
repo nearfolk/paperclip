@@ -55,6 +55,40 @@ the exact model, session identity, tool catalog, structured input, and terminal
 settlement at the process boundary. Runnerd and the server do not select this
 sidecar in this slice. Other ACPX agents remain unavailable.
 
+The Rust core includes a bounded client for this sidecar protocol. It enforces
+request identity, event order, frame and queue limits, timeouts, redacted
+diagnostics, and process-group cleanup. This transport remains package-local.
+It does not change runnerd provider selection in this slice.
+
+Before a later provider adapter consumes a valid sidecar event, the Rust core
+also requires its optional or mandatory run and turn scope to match the active
+execution. Process and diagnostic events can remain global. All operational,
+tool, input, permission, and terminal events require the exact active binding.
+
+A package-local payload boundary decodes events only after that scope check. It
+validates control identities, terminal status, question sets, and the admitted
+runtime event types and bounded fields. It redacts diagnostic and retained
+event values again before they can enter provider state.
+
+Validated ACPX runtime events normalize into the same provider-neutral activity
+families as the direct Codex transport. Reasoning contents stay private. Tool
+targets are resolved within the workspace under the provider host's path
+semantics and receive a versioned sidecar boundary marker before becoming
+bounded, display-only PRP safe paths. Raw or unmarked provider locations fail
+closed. URI-scheme and Windows drive-shaped values require a separate sidecar
+attestation backed by an existing in-workspace entry or, for a not-yet-created
+edit target, an existing in-workspace parent. This preserves real POSIX colon
+filenames without treating arbitrary URI text as a path. Windows separators
+are canonicalized, and consumers must not reinterpret the display value as
+file-access authority. Operational semantic-result and terminal events remain
+reserved for the stateful adapter rather than being duplicated.
+
+The package-local ACPX provider reducer preserves that order while it tracks one
+active turn, bounded assistant text, semantic results, and pending tool or input
+correlations. Terminal events flush the final assistant message first and clear
+unresolved turn-scoped requests. This reducer still does not select ACPX in
+runnerd.
+
 Run the complete contract gate with:
 
 ```sh
