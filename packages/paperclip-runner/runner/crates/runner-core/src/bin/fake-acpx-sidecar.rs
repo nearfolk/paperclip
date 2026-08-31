@@ -110,7 +110,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             | "turns-permission"
             | "resolutions"
             | "resolutions-error-redaction"
-            | "resolutions-wrong-ack" => {
+            | "resolutions-wrong-ack"
+            | "suspend"
+            | "suspend-wrong-ack"
+            | "suspend-wrong-identity"
+            | "suspend-missing-identity" => {
                 write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
                 let params = request.get("params").unwrap_or(&Value::Null);
                 let turn_id = params
@@ -571,10 +575,10 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
         }),
         "turn.cancel" => json!({"cancelled":mode != "turns-wrong-cancel"}),
         "session.suspend" => json!({
-            "suspended":true,
-            "identity": {
+            "suspended":mode != "suspend-wrong-ack",
+            "identity": if mode == "suspend-missing-identity" { Value::Null } else { json!({
                 "kind": "acpx",
-                "normalizedSessionId": "session-1",
+                "normalizedSessionId": if mode == "suspend-wrong-identity" { "another-session" } else { "session-1" },
                 "acpxRecordId": "record-1",
                 "backendSessionId": "backend-1",
                 "agentSessionId": "agent-1",
@@ -583,7 +587,7 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
                 "requestedModel": "gpt-5.6-sol",
                 "effectiveModel": "gpt-5.6-sol",
                 "permissionMode": "approve-reads",
-            },
+            })},
         }),
         "tool.resolve" => json!({
             "resolved":if mode == "resolutions-error-redaction" {
