@@ -7,6 +7,7 @@ import {
   diagnoseRuntimeListenerBinds,
   formatProcAddressHex,
   listenerBindFactsForPort,
+  listenerBindFactsFromLsofOutput,
   parseProcNetListeners,
 } from "./loopback-listener.js";
 
@@ -125,6 +126,35 @@ describe("listenerBindFactsForPort", () => {
     );
     expect(facts.loopbackOnly).toBe(false);
     expect(facts.addresses).toEqual(["127.0.0.1", "0.0.0.0"]);
+  });
+});
+
+describe("listenerBindFactsFromLsofOutput", () => {
+  it("rejects a wildcard listener", () => {
+    expect(listenerBindFactsFromLsofOutput(`p123\0f12\0n*:${APP_PORT}\0`, APP_PORT)).toEqual({
+      present: true,
+      loopbackOnly: false,
+      addresses: ["0.0.0.0/::"],
+    });
+  });
+
+  it("accepts IPv4 and IPv6 loopback listeners", () => {
+    expect(listenerBindFactsFromLsofOutput(
+      `p123\0f12\0n127.0.0.1:${APP_PORT}\0f13\0n[::1]:${APP_PORT}\0`,
+      APP_PORT,
+    )).toEqual({
+      present: true,
+      loopbackOnly: true,
+      addresses: ["127.0.0.1", "::1"],
+    });
+  });
+
+  it("ignores listener fields for another port", () => {
+    expect(listenerBindFactsFromLsofOutput(`p123\0f12\0n*:${APP_PORT + 1}\0`, APP_PORT)).toEqual({
+      present: false,
+      loopbackOnly: true,
+      addresses: [],
+    });
   });
 });
 
