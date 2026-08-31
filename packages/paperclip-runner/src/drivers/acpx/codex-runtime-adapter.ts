@@ -24,6 +24,22 @@ const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
 const DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS = 2_000;
 const RETAINED_ADMISSION_CLEANUP_RETRY_MIN_MS = 10;
 const RETAINED_ADMISSION_CLEANUP_RETRY_MAX_MS = 30_000;
+const PROVIDER_TERM_EXIT_TIMEOUT_MS = 2_000;
+const PROVIDER_KILL_EXIT_TIMEOUT_MS = 2_000;
+const MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS = 3;
+// Production shutdown waits for the protocol close bound before beginning the
+// sequential TERM/KILL verification windows. Keep this exported package-local
+// bound aligned with the implementation so admission can include the complete
+// provider cleanup path instead of accounting for only part of it.
+export const DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS =
+  DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS +
+  PROVIDER_TERM_EXIT_TIMEOUT_MS +
+  PROVIDER_KILL_EXIT_TIMEOUT_MS;
+// A close may outlive its caller-facing wait bound. Keep every exact attempt
+// owned until it settles. A handle never starts a second protocol close while
+// the first remains unresolved; late failure can start bounded reconciliation
+// only after the exact attempt reaches a terminal outcome.
+const activeRuntimeCleanupOwners = new Set<Promise<unknown>>();
 const activeCodexRuntimeCleanupOwners = new Set<Promise<unknown>>();
 
 class AcpxRuntimeCloseTimeoutError extends Error {
@@ -53,12 +69,19 @@ export async function openCodexAcpxRuntime(
   options: AcpxRuntimePortOpenOptions,
   dependencies: CodexAcpxRuntimeDependencies = {},
 ): Promise<AcpxRuntimePort> {
+  if (options.signal?.aborted) {
+    // The host may have already transferred its staged credential to this
+    // pending admission before this microtask begins. No adapter resources
+    // exist yet, so publish an already-complete cleanup proof before preserving
+    // the caller's exact abort reason.
+    options.retainFailedAdmissionCleanup(Promise.resolve());
+    throw options.signal.reason;
+  }
   if (options.profile.agent !== "codex") {
     throw new Error(
       "The production ACPX runtime currently supports Codex only",
     );
   }
-  options.signal?.throwIfAborted();
   // The verified-command boundary already refuses to mint a Windows command
   // lease, because Node cannot pin its executable there. Repeat the platform
   // gate at this lower boundary so alternate host wiring cannot launch a
@@ -81,6 +104,7 @@ export async function openCodexAcpxRuntime(
   const baseStore = createStore({ stateDir: options.stateDirectory });
   let failedHandshakeHandle: AcpRuntimeHandle | null = null;
   let admissionCleanup: RuntimeAdmissionCleanup | null = null;
+  let abortedHandshakeCleanup: Promise<void> | null = null;
   const retainedCleanupOwners = new WeakSet<Promise<void>>();
   const retainCleanup = (cleanup: Promise<void>): void => {
     if (retainedCleanupOwners.has(cleanup)) {
@@ -236,14 +260,19 @@ export async function openCodexAcpxRuntime(
         handle = await raceRuntimeHandshakeWithAbort(handshake, options.signal);
       } catch (error) {
         if (options.signal.aborted) {
-          retainCleanup(
-            handshake.then((lateHandle) =>
+          abortedHandshakeCleanup = handshake.then(
+            (lateHandle) =>
               admissionCleanup!.runRetained(
                 lateHandle,
                 "ACPX runtime admission aborted",
               ),
-            ),
+            () =>
+              admissionCleanup!.runRetained(
+                failedHandshakeHandle,
+                "ACPX runtime admission aborted",
+              ),
           );
+          retainCleanup(abortedHandshakeCleanup);
         }
         throw error;
       }
@@ -252,12 +281,30 @@ export async function openCodexAcpxRuntime(
       options.signal.throwIfAborted();
     }
   } catch (error) {
+    const cleanupHandle = handle ?? failedHandshakeHandle;
     const cleanupErrors = await admissionCleanup.run(
-      handle ?? failedHandshakeHandle,
+      cleanupHandle,
       options.signal?.aborted
         ? "ACPX runtime admission aborted"
         : "ACPX session handshake failed",
     );
+    const retainedCleanup =
+      cleanupErrors.length === 0
+        ? Promise.resolve()
+        : admissionCleanup.runRetained(
+            cleanupHandle,
+            options.signal?.aborted
+              ? "ACPX runtime admission aborted"
+              : "ACPX session handshake failed",
+          );
+    const cleanupProof =
+      abortedHandshakeCleanup === null
+        ? retainedCleanup
+        : Promise.all([retainedCleanup, abortedHandshakeCleanup]).then(
+            () => undefined,
+          );
+    options.retainFailedAdmissionCleanup(cleanupProof);
+    retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
         [error, ...cleanupErrors],
@@ -277,13 +324,23 @@ export async function openCodexAcpxRuntime(
       runtime,
       handle,
       requireIdentity(handle),
-      admissionCleanup,
+      children,
+      runtimeCloseTimeoutMs,
     );
   } catch (error) {
     const cleanupErrors = await admissionCleanup.run(
       handle,
       "ACPX runtime identity validation failed",
     );
+    const cleanupProof =
+      cleanupErrors.length === 0
+        ? Promise.resolve()
+        : admissionCleanup.runRetained(
+            handle,
+            "ACPX runtime identity validation failed",
+          );
+    options.retainFailedAdmissionCleanup(cleanupProof);
+    retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
         [error, ...cleanupErrors],
@@ -371,12 +428,12 @@ class RuntimeAdmissionCleanup {
     const targetKey = this.#resolveTargetKey(rawTargetKey, handle);
     const existing = this.#registeredTargets.get(targetKey);
     if (existing !== undefined) {
-      if (handle !== null) {
-        existing.handle =
-          existing.handle === null
-            ? handle
+      existing.handle =
+        existing.handle === null
+          ? handle
+          : handle === null
+            ? existing.handle
             : preferRuntimeAdmissionCleanupHandle(existing.handle, handle);
-      }
       this.#targetAliases.set(rawTargetKey, targetKey);
       return existing.cleanup!;
     }
@@ -407,8 +464,7 @@ class RuntimeAdmissionCleanup {
       const fallbackHandle =
         this.#registeredTargets.get(fallbackTargetKey)?.handle;
       if (
-        fallbackHandle !== undefined &&
-        fallbackHandle !== null &&
+        fallbackHandle != null &&
         nonEmptyRuntimeIdentity(fallbackHandle.acpxRecordId) === undefined &&
         sameRuntimeAdmissionCleanupOwner(fallbackHandle, handle)
       ) {
@@ -590,9 +646,232 @@ function runtimePort(
   runtime: AcpRuntime,
   handle: AcpRuntimeHandle,
   identity: AcpxRuntimePortIdentity,
-  admissionCleanup: RuntimeAdmissionCleanup,
+  children: SpawnedChildSet,
+  runtimeCloseTimeoutMs: number,
 ): AcpxRuntimePort {
-  return {
+  type RuntimeCloseAttempt = {
+    readonly outcome: Promise<unknown | null>;
+    readonly reconciliationGeneration: number;
+    readonly origin:
+      | { readonly kind: "external" }
+      | {
+          readonly kind: "reconciliation";
+          readonly generation: number;
+          readonly attemptNumber: number;
+        };
+    pendingExternalIntent: boolean;
+  };
+  let runtimeClosed = false;
+  let runtimeCloseAttempt: RuntimeCloseAttempt | undefined;
+  let lateReconciliationOwner: Promise<void> | undefined;
+  // Each independently observed late failure receives a bounded reconciliation
+  // budget. Exhausting retries for an older generation must not prevent a newer
+  // late failure from acquiring its own recovery owner.
+  let lateReconciliationAttemptGeneration = 0;
+  let lateReconciliationAttempts = 0;
+  let lateFailureGeneration = 0;
+  let reconciledLateFailureGeneration = 0;
+  const watchedReleasedAttempts = new Set<RuntimeCloseAttempt>();
+
+  const hasUnreconciledLateFailure = (): boolean =>
+    reconciledLateFailureGeneration < lateFailureGeneration;
+
+  const consumePendingExternalIntent = (
+    attempt: RuntimeCloseAttempt,
+    failed: boolean,
+  ): boolean => {
+    const pending = attempt.pendingExternalIntent;
+    attempt.pendingExternalIntent = false;
+    return (
+      pending &&
+      failed &&
+      attempt.origin.kind === "reconciliation" &&
+      attempt.origin.attemptNumber >=
+        MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS
+    );
+  };
+
+  const scheduleLateFailureReconciliation = (): void => {
+    if (
+      runtimeCloseAttempt ||
+      lateReconciliationOwner ||
+      !hasUnreconciledLateFailure()
+    ) {
+      return;
+    }
+    if (lateReconciliationAttemptGeneration !== lateFailureGeneration) {
+      lateReconciliationAttemptGeneration = lateFailureGeneration;
+      lateReconciliationAttempts = 0;
+    }
+    if (
+      lateReconciliationAttempts >=
+        MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS
+    ) {
+      return;
+    }
+    const attemptGeneration = lateFailureGeneration;
+    const attemptNumber = lateReconciliationAttempts + 1;
+    lateReconciliationAttempts = attemptNumber;
+    let retry = false;
+    const reconciliation = closeRuntime({
+      reason: `ACPX late protocol cleanup reconciliation ${attemptNumber}`,
+      reconciliation: {
+        generation: attemptGeneration,
+        attemptNumber,
+      },
+    }).then(
+      () => {
+        if (hasUnreconciledLateFailure()) {
+          retry =
+            lateFailureGeneration === attemptGeneration &&
+            attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
+        }
+      },
+      () => {
+        retry =
+          lateFailureGeneration === attemptGeneration &&
+          attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
+      },
+    );
+    const owner = reconciliation.finally(() => {
+      if (lateReconciliationOwner === owner)
+        lateReconciliationOwner = undefined;
+      if (retry || hasUnreconciledLateFailure()) {
+        queueMicrotask(scheduleLateFailureReconciliation);
+      }
+    });
+    lateReconciliationOwner = owner;
+    retainRuntimeCleanupOwner(owner);
+  };
+
+  const watchPendingAttempt = (
+    attempt: RuntimeCloseAttempt,
+    processCleanupSucceeded: boolean,
+  ): void => {
+    if (watchedReleasedAttempts.has(attempt)) return;
+    watchedReleasedAttempts.add(attempt);
+    void attempt.outcome.then((error) => {
+      watchedReleasedAttempts.delete(attempt);
+      if (runtimeCloseAttempt === attempt) runtimeCloseAttempt = undefined;
+      const renewForExternalIntent = consumePendingExternalIntent(
+        attempt,
+        error !== null || !processCleanupSucceeded,
+      );
+      if (renewForExternalIntent) lateFailureGeneration += 1;
+      if (error === null) {
+        if (processCleanupSucceeded) {
+          reconciledLateFailureGeneration = Math.max(
+            reconciledLateFailureGeneration,
+            attempt.reconciliationGeneration,
+          );
+          runtimeClosed = !hasUnreconciledLateFailure();
+        }
+        scheduleLateFailureReconciliation();
+        return;
+      }
+      // A newer successful close cannot erase an older outcome that had not
+      // settled yet. Re-open cleanup state and autonomously create a bounded
+      // reconciliation generation so the late failure is not suppression-only.
+      // An autonomous failure remains charged to the budget of the generation
+      // that created it. If external callers coalesced onto the exhausted final
+      // attempt, their single batched intent creates exactly one new generation;
+      // joins on earlier attempts are satisfied by the remaining same-generation
+      // retries.
+      if (attempt.origin.kind === "external") {
+        lateFailureGeneration += 1;
+      }
+      runtimeClosed = false;
+      scheduleLateFailureReconciliation();
+    });
+  };
+
+  async function closeRuntime(input: {
+    reason: string;
+    reconciliation?: {
+      generation: number;
+      attemptNumber: number;
+    };
+  }): Promise<void> {
+    if (runtimeClosed) return;
+    if (
+      runtimeCloseAttempt?.origin.kind === "reconciliation" &&
+      input.reconciliation === undefined
+    ) {
+      // Preserve the attempt's autonomous origin while remembering that one or
+      // more external callers requested a fresh cleanup observation. The exact
+      // outcome consumes this bit, so coalesced callers cannot mint generations
+      // independently.
+      runtimeCloseAttempt.pendingExternalIntent = true;
+    }
+    if (!runtimeCloseAttempt) {
+      // A close can reconcile only failures already known when its protocol
+      // attempt begins. A released older attempt may reject while this one is
+      // in flight; that later generation must trigger a subsequent close.
+      runtimeCloseAttempt = {
+        outcome: ownedRuntimeCloseOutcome(runtime, handle, input.reason),
+        reconciliationGeneration:
+          input.reconciliation?.generation ?? lateFailureGeneration,
+        origin:
+          input.reconciliation === undefined
+            ? { kind: "external" }
+            : {
+                kind: "reconciliation",
+                generation: input.reconciliation.generation,
+                attemptNumber: input.reconciliation.attemptNumber,
+              },
+        pendingExternalIntent: false,
+      };
+    }
+    const observedAttempt = runtimeCloseAttempt;
+    const processCleanup = terminateChildrenAfterCloseBound(
+      observedAttempt.outcome,
+      children,
+      runtimeCloseTimeoutMs,
+    );
+    // The caller may stop waiting, but the exact ACPX protocol cleanup stays
+    // owned and remains this handle's sole close attempt until it settles.
+    // Provider termination still proceeds at the deadline.
+    const [closeError, processErrors] = await Promise.all([
+      boundedCloseOutcome(observedAttempt.outcome, runtimeCloseTimeoutMs),
+      processCleanup,
+    ]);
+    if (closeError instanceof AcpxRuntimeCloseTimeoutError) {
+      watchPendingAttempt(observedAttempt, processErrors.length === 0);
+    } else {
+      if (
+        consumePendingExternalIntent(
+          observedAttempt,
+          closeError !== null || processErrors.length > 0,
+        )
+      ) {
+        lateFailureGeneration += 1;
+      }
+      if (runtimeCloseAttempt === observedAttempt) {
+        runtimeCloseAttempt = undefined;
+      }
+    }
+    if (processErrors.length === 0 && closeError === null) {
+      reconciledLateFailureGeneration = Math.max(
+        reconciledLateFailureGeneration,
+        observedAttempt.reconciliationGeneration,
+      );
+      runtimeClosed = !hasUnreconciledLateFailure();
+    } else {
+      runtimeClosed = false;
+    }
+    scheduleLateFailureReconciliation();
+    if (closeError !== null || processErrors.length > 0) {
+      const errors = [closeError, ...processErrors].filter(
+        (error): error is unknown => error !== null,
+      );
+      throw new AggregateError(
+        errors,
+        "ACPX runtime and provider cleanup failed",
+      );
+    }
+  }
+
+  const port: AcpxRuntimePort = {
     async identity() {
       return structuredClone(identity);
     },
@@ -622,16 +901,9 @@ function runtimePort(
         ...(input.signal ? { signal: input.signal } : {}),
       });
     },
-    async close(input) {
-      const errors = await admissionCleanup.run(handle, input.reason);
-      if (errors.length > 0) {
-        throw new AggregateError(
-          errors,
-          "ACPX runtime and provider cleanup failed",
-        );
-      }
-    },
+    close: closeRuntime,
   };
+  return port;
 }
 
 function runtimeCloseOutcome(
@@ -661,6 +933,70 @@ async function closeOutcomeWithin(
   const outcome = await Promise.race([closeOutcome, timeoutOutcome]);
   if (timer !== undefined) clearTimeout(timer);
   return outcome;
+}
+
+function ownedRuntimeCloseOutcome(
+  runtime: AcpRuntime,
+  handle: AcpRuntimeHandle,
+  reason: string,
+): Promise<unknown | null> {
+  const cleanup = Promise.resolve()
+    .then(() =>
+      runtime.close({ handle, reason, discardPersistentState: false }),
+    )
+    .then(
+      () => null,
+      (error: unknown) => error,
+    );
+  return retainRuntimeCleanupOwner(cleanup);
+}
+
+function retainRuntimeCleanupOwner<T>(cleanup: Promise<T>): Promise<T> {
+  activeRuntimeCleanupOwners.add(cleanup);
+  void cleanup
+    .finally(() => activeRuntimeCleanupOwners.delete(cleanup))
+    .catch(() => undefined);
+  return cleanup;
+}
+
+async function terminateChildrenAfterCloseBound(
+  closeOutcome: Promise<unknown | null>,
+  children: SpawnedChildSet,
+  timeoutMs: number,
+): Promise<unknown[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      closeOutcome.then(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(1, Math.floor(timeoutMs)));
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return await children.terminate();
+}
+
+async function boundedCloseOutcome(
+  closeOutcome: Promise<unknown | null>,
+  timeoutMs: number,
+): Promise<unknown | null> {
+  const boundedTimeoutMs = Math.max(1, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    closeOutcome.then((error) => ({ error })),
+    new Promise<{ error: unknown }>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ error: new AcpxRuntimeCloseTimeoutError() }),
+        boundedTimeoutMs,
+      );
+      timer.unref();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return outcome.error;
 }
 
 function delay(timeoutMs: number): Promise<void> {
@@ -703,7 +1039,7 @@ class SpawnedChildSet {
           const terminateOutcome = await signalAndWaitForExit(
             tracked,
             "SIGTERM",
-            2_000,
+            PROVIDER_TERM_EXIT_TIMEOUT_MS,
           );
           if (terminateOutcome.error !== undefined) {
             pushUnique(errors, terminateOutcome.error);
@@ -712,7 +1048,7 @@ class SpawnedChildSet {
             const killOutcome = await signalAndWaitForExit(
               tracked,
               "SIGKILL",
-              2_000,
+              PROVIDER_KILL_EXIT_TIMEOUT_MS,
             );
             if (killOutcome.error !== undefined) {
               pushUnique(errors, killOutcome.error);
