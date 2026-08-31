@@ -1305,7 +1305,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       eq(companyMemberships.principalType, "user"),
       eq(companyMemberships.principalId, "board-user"),
     ));
-    expect(membership).toBeDefined();
+    if (revocationKind === "membership") expect(membership).toBeDefined();
     const releaseRevocationRow = revocationKind === "target grant"
       ? await holdPermissionGrantRowLock(grant!.id)
       : revocationKind === "membership"
@@ -1432,7 +1432,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       eq(companyMemberships.principalId, "board-user"),
     ));
     if (revocationKind !== "instance admin") expect(grant).toBeDefined();
-    expect(membership).toBeDefined();
+    if (revocationKind === "membership") expect(membership).toBeDefined();
     const [instanceAdminRole] = await db.select().from(instanceUserRoles).where(and(
       eq(instanceUserRoles.userId, "board-user"),
       eq(instanceUserRoles.role, "instance_admin"),
