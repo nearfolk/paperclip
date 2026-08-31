@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   companySecretBindings,
@@ -26,7 +27,13 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
+import {
+  claimBoardOwnership,
+  getBoardClaimWarningUrl,
+  initializeBoardClaimChallenge,
+} from "../board-claim.js";
 import { conflict, forbidden } from "../errors.js";
+import { purgeStaleCloudTenantInstanceAdminRole } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { secretRoutes } from "../routes/secrets.js";
@@ -62,6 +69,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    await initializeBoardClaimChallenge(db, { deploymentMode: "local_trusted" });
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(companySecretProposals);
@@ -77,6 +85,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(instanceUserRoles);
+    await db.delete(authUsers);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -301,6 +310,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       admin?: boolean;
       cachedAdmin?: boolean;
       membershipRole?: "owner" | "admin" | "member";
+      userId?: string;
       heartbeat?: IssueAssignmentWakeupDeps;
       issues?: Pick<ReturnType<typeof issueService>, "getById" | "addComment">;
     },
@@ -310,7 +320,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     app.use((req, _res, next) => {
       req.actor = {
         type: "board",
-        userId: "board-user",
+        userId: options?.userId ?? "board-user",
         companyIds: [fixture.companyId],
         source: options?.admin === false ? "session" : "local_implicit",
         isInstanceAdmin: options?.cachedAdmin === true,
@@ -1199,6 +1209,11 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
       .send({});
     expect(recovered.status).toBe(409);
+    const serializedError = JSON.stringify(recovered.body).toLowerCase();
+    expect(serializedError).not.toContain("recovery-conflict-secret");
+    expect(serializedError).not.toContain("ciphertext");
+    expect(serializedError).not.toContain("fingerprint");
+    expect(serializedError).not.toContain("length");
     expect(await db.select({ interactionId: companySecretProposals.interactionId })
       .from(companySecretProposals)
       .where(eq(companySecretProposals.id, proposed.body.id)))
@@ -1263,7 +1278,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
   });
 
   async function runConcurrentRevocationTest(
-    revocationKind: "target grant" | "membership" | "instance admin",
+    revocationKind: "target grant" | "membership" | "instance admin" | "cloud tenant purge",
   ) {
     const fixture = await seedRun();
     const liveSecret = await secretService(db).create(fixture.companyId, {
@@ -1284,7 +1299,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
 
     await db.delete(issueThreadInteractions)
       .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
-    if (revocationKind === "instance admin") {
+    const revokesInstanceAdmin = revocationKind === "instance admin" || revocationKind === "cloud tenant purge";
+    if (revokesInstanceAdmin) {
       await db.insert(instanceUserRoles).values({ userId: "board-user", role: "instance_admin" });
     } else {
       await accessService(db).setPrincipalPermission(
@@ -1302,7 +1318,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       eq(principalPermissionGrants.principalId, "board-user"),
       eq(principalPermissionGrants.permissionKey, "agents:configure"),
     ));
-    if (revocationKind !== "instance admin") expect(grant).toBeDefined();
+    if (!revokesInstanceAdmin) expect(grant).toBeDefined();
     const [instanceAdminRole] = await db.select().from(instanceUserRoles).where(and(
       eq(instanceUserRoles.userId, "board-user"),
       eq(instanceUserRoles.role, "instance_admin"),
@@ -1337,7 +1353,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
             membership!.id,
             { status: "suspended" },
           ).then(() => undefined)
-        : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
+        : revocationKind === "cloud tenant purge"
+          ? purgeStaleCloudTenantInstanceAdminRole(db, "board-user")
+          : accessService(db).demoteInstanceAdmin("board-user").then(() => undefined);
 
     try {
       expect(await waitForBlockedQuery(
@@ -1347,7 +1365,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       )).toBe(true);
       const recovery = request(createBoardApp(fixture, {
         admin: false,
-        cachedAdmin: revocationKind === "instance admin",
+        cachedAdmin: revokesInstanceAdmin,
       }))
         .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
         .send({})
@@ -1396,10 +1414,96 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ))).toHaveLength(0);
   }
 
-  it.each(["target grant", "membership", "instance admin"] as const)(
+  it.each(["target grant", "membership", "instance admin", "cloud tenant purge"] as const)(
     "serializes %s revocation ahead of recovery and rolls back every denied mutation",
     runConcurrentRevocationTest,
   );
+
+  it("serializes board ownership transfer ahead of recovery and rolls back every denied mutation", async () => {
+    const fixture = await seedRun();
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "prod/recovery/board-transfer-source",
+      key: "RECOVERY_BOARD_TRANSFER_SOURCE",
+      provider: "local_encrypted",
+      value: "recovery-board-transfer-secret",
+    });
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RECOVERY_BOARD_TRANSFER_ALIAS",
+        justification: "Prove board ownership transfer serializes with recovery",
+      });
+    expect(proposed.status).toBe(201);
+
+    await db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, proposed.body.interactionId));
+    const [role] = await db.insert(instanceUserRoles)
+      .values({ userId: "local-board", role: "instance_admin" })
+      .returning();
+    const claimantUserId = `claimant-${randomUUID()}`;
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: claimantUserId,
+      name: "Claimant",
+      email: `${claimantUserId}@example.test`,
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await initializeBoardClaimChallenge(db, { deploymentMode: "authenticated" });
+    const warningUrl = getBoardClaimWarningUrl("127.0.0.1", 3100);
+    expect(warningUrl).toBeTruthy();
+    const parsed = new URL(warningUrl!);
+    const token = parsed.pathname.split("/").pop()!;
+    const code = parsed.searchParams.get("code")!;
+    const [issueBefore] = await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId));
+
+    const releaseRoleRow = await holdInstanceUserRoleRowLock(role!.id);
+    const transfer = claimBoardOwnership(db, { token, code, userId: claimantUserId });
+
+    try {
+      expect(await waitForBlockedQuery("instance_user_roles")).toBe(true);
+      const recovery = request(createBoardApp(fixture, {
+        admin: false,
+        cachedAdmin: true,
+        userId: "local-board",
+      }))
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposed.body.id}/recover-interaction`)
+        .send({})
+        .then((response) => response);
+      expect(await waitForBlockedQuery("pg_advisory_xact_lock")).toBe(true);
+
+      await releaseRoleRow();
+      await expect(transfer).resolves.toEqual({ status: "claimed", claimedByUserId: claimantUserId });
+      const denied = await recovery;
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toMatch(/not an active member/);
+    } catch (error) {
+      await releaseRoleRow();
+      await transfer;
+      throw error;
+    }
+
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.id, role!.id)))
+      .toHaveLength(0);
+    expect(await db.select({ interactionId: companySecretProposals.interactionId })
+      .from(companySecretProposals)
+      .where(eq(companySecretProposals.id, proposed.body.id)))
+      .toEqual([{ interactionId: null }]);
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+    expect(await db.select({ updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId)))
+      .toEqual([{ updatedAt: issueBefore!.updatedAt }]);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "secret.proposal.interaction_recovered",
+    ))).toHaveLength(0);
+  });
 
   async function runConcurrentSecretDecisionRevocationTest(
     decision: "approve" | "reject",
