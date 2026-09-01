@@ -1305,6 +1305,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#core !== null && this.#handle !== null) {
       const runnerAlreadyStopping =
         this.#handle.child.exitCode !== null ||
+        this.#handle.child.signalCode !== null ||
         this.#core.store.state.commands.some(
           (command) =>
             (command.type === "runner.suspend" ||
