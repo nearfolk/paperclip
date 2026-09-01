@@ -201,7 +201,7 @@ function sendMutatingRequest(app: express.Express, name: string) {
           // Authorization is the behavior under test. A local package path
           // keeps the happy path hermetic on runners that provide Node without
           // an npm binary; package loading remains mocked below.
-          .send({ packageName: "./paperclip-external-adapter" }),
+          .send({ packageName: "./paperclip-external-adapter", isLocalPath: true }),
       );
     case "disable":
       return requestApp(app, (baseUrl) =>
