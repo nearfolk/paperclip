@@ -98,6 +98,30 @@ export async function runBranchFreshness({
     })
   }
 
+  async function publishEnumerationError(error) {
+    const message = error instanceof Error ? error.message : String(error)
+    core.error(`Could not enumerate open pull requests: ${message}`)
+
+    // A protected-base push has no pull-request head in its payload. Persist the
+    // failed observation on the exact base event commit as well as failing the
+    // workflow. Strict required-status enforcement keeps every older head
+    // blocked until a later serialized run can recompute it.
+    const eventBaseSha = context.payload?.after ?? context.sha
+    try {
+      await publish(
+        eventBaseSha,
+        'error',
+        `Open pull requests for protected ${protectedBase} could not be enumerated.`,
+      )
+    } catch (publishError) {
+      const publishMessage = publishError instanceof Error
+        ? publishError.message
+        : String(publishError)
+      core.error(`Could not publish protected-base enumeration error: ${publishMessage}`)
+    }
+    core.setFailed('Open pull requests could not be enumerated for branch freshness.')
+  }
+
   let pulls
   if (context.eventName === 'pull_request_target') {
     const pull = context.payload.pull_request
@@ -105,12 +129,18 @@ export async function runBranchFreshness({
       ? [{ number: pull.number, headSha: pull.head?.sha }]
       : []
   } else {
-    const openPulls = await github.paginate(github.rest.pulls.list, {
-      ...context.repo,
-      state: 'open',
-      base: protectedBase,
-      per_page: 100,
-    })
+    let openPulls
+    try {
+      openPulls = await github.paginate(github.rest.pulls.list, {
+        ...context.repo,
+        state: 'open',
+        base: protectedBase,
+        per_page: 100,
+      })
+    } catch (error) {
+      await publishEnumerationError(error)
+      return
+    }
     pulls = openPulls.map((pull) => ({
       number: pull.number,
       headSha: pull.head?.sha,
@@ -123,19 +153,25 @@ export async function runBranchFreshness({
   // Invalidate every previously successful status before doing any comparison.
   // This keeps the remaining heads non-successful if a base-push run times out
   // or is cancelled while processing a large set of open pull requests.
-  for (const candidate of pulls) {
-    try {
-      const observedHeadSha = requireSha(candidate.headSha, `PR #${candidate.number} event head`)
-      await publish(
-        observedHeadSha,
-        'pending',
-        `Checking head against protected ${protectedBase}.`,
-      )
-      preparedPulls.push({ ...candidate, observedHeadSha })
-    } catch (error) {
+  const invalidations = await Promise.allSettled(pulls.map(async (candidate) => {
+    const observedHeadSha = requireSha(candidate.headSha, `PR #${candidate.number} event head`)
+    await publish(
+      observedHeadSha,
+      'pending',
+      `Checking head against protected ${protectedBase}.`,
+    )
+    return { ...candidate, observedHeadSha }
+  }))
+
+  for (const [index, invalidation] of invalidations.entries()) {
+    if (invalidation.status === 'fulfilled') {
+      preparedPulls.push(invalidation.value)
+    } else {
       comparisonFailed = true
-      const message = error instanceof Error ? error.message : String(error)
-      core.error(`PR #${candidate.number}: could not publish pending status: ${message}`)
+      const message = invalidation.reason instanceof Error
+        ? invalidation.reason.message
+        : String(invalidation.reason)
+      core.error(`PR #${pulls[index].number}: could not publish pending status: ${message}`)
     }
   }
 
@@ -184,6 +220,28 @@ export async function runBranchFreshness({
       if (result.state === 'error') {
         comparisonFailed = true
         core.error(`PR #${candidate.number}: ${result.description}`)
+      } else if (result.state === 'success') {
+        // Close the publish/read race. The global workflow queue prevents another
+        // writer from overtaking this run; if the repository changes during the
+        // status API call, overwrite the transient success before completing.
+        const [publishedPull, publishedBaseSha] = await Promise.all([
+          currentPull(candidate.number),
+          protectedBaseSha(),
+        ])
+        if (
+          publishedPull.state !== 'open'
+          || publishedPull.base?.ref !== protectedBase
+          || publishedPull.head?.sha !== observedHeadSha
+          || publishedBaseSha !== observedBaseSha
+        ) {
+          comparisonFailed = true
+          await publish(
+            observedHeadSha,
+            'error',
+            `Published comparison for protected ${protectedBase} ${observedBaseSha} became stale.`,
+          )
+          core.error(`PR #${candidate.number}: published comparison became stale.`)
+        }
       }
     } catch (error) {
       comparisonFailed = true

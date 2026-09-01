@@ -38,6 +38,8 @@ test('workflow recomputes on pull request heads and protected master advances', 
   assert.match(source, /types: \[opened, reopened, synchronize, ready_for_review, edited\]/)
   assert.match(source, /push:\s*\n\s*branches: \[master\]/)
   assert.match(source, /statuses: write/)
+  assert.match(source, /group: branch-freshness\s*$/m)
+  assert.match(source, /cancel-in-progress: false/)
   assert.match(source, /runBranchFreshness/)
 })
 
@@ -181,4 +183,148 @@ test('a protected-base run marks every open head pending before comparing any he
     { sha: otherHead, state: 'pending' },
   ])
   assert.equal(statuses.at(-1).state, 'failure')
+})
+
+test('an enumeration API failure records error on the exact protected-base event', async () => {
+  const statuses = []
+  const errors = []
+  let failure
+  const github = {
+    paginate: async () => {
+      throw new Error('pull API unavailable')
+    },
+    rest: {
+      pulls: { list: async () => ({ data: [] }) },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statuses.push({ sha, state, description })
+        },
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = {
+    error: (message) => errors.push(message),
+    setFailed: (message) => { failure = message },
+  }
+
+  await runBranchFreshness({ github, context, core })
+
+  assert.deepEqual(statuses, [{
+    sha: base,
+    state: 'error',
+    description: 'Open pull requests for protected master could not be enumerated.',
+  }])
+  assert.match(errors[0], /pull API unavailable/)
+  assert.match(failure, /could not be enumerated/)
+})
+
+test('all known heads begin invalidation without waiting for an earlier status write', async () => {
+  const otherHead = 'c'.repeat(40)
+  const statuses = []
+  let releaseFirstInvalidation
+  const firstInvalidation = new Promise((resolve) => {
+    releaseFirstInvalidation = resolve
+  })
+  const pulls = [
+    { number: 41, head: { sha: head } },
+    { number: 42, head: { sha: otherHead } },
+  ]
+  const github = {
+    paginate: async () => pulls,
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        list: async () => ({ data: pulls }),
+        get: async ({ pull_number: number }) => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: number === 41 ? head : otherHead },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state }) => {
+          statuses.push({ sha, state })
+          if (statuses.length === 1) await firstInvalidation
+        },
+        compareCommitsWithBasehead: async () => ({ data: comparison({ behind_by: 1 }) }),
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = { error: () => {}, setFailed: () => {} }
+
+  const run = runBranchFreshness({ github, context, core })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(statuses, [
+    { sha: head, state: 'pending' },
+    { sha: otherHead, state: 'pending' },
+  ])
+  releaseFirstInvalidation()
+  await run
+})
+
+test('a base change during success publication overwrites the transient success', async () => {
+  const newerBase = 'c'.repeat(40)
+  const statuses = []
+  let baseRead = 0
+  let failure
+  const github = {
+    rest: {
+      git: {
+        getRef: async () => ({
+          data: { object: { sha: ++baseRead < 3 ? base : newerBase } },
+        }),
+      },
+      pulls: {
+        get: async () => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: head },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statuses.push({ sha, state, description })
+        },
+        compareCommitsWithBasehead: async () => ({ data: comparison() }),
+      },
+    },
+  }
+  const context = {
+    eventName: 'pull_request_target',
+    payload: { pull_request: { number: 42, head: { sha: head } } },
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = { error: () => {}, setFailed: (message) => { failure = message } }
+
+  await runBranchFreshness({ github, context, core })
+
+  assert.equal(statuses.at(-2).state, 'success')
+  assert.deepEqual(statuses.at(-1), {
+    sha: head,
+    state: 'error',
+    description: `Published comparison for protected master ${base} became stale.`,
+  })
+  assert.match(failure, /unavailable or stale/)
 })

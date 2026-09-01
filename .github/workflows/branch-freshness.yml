@@ -13,8 +13,10 @@ permissions:
   statuses: write
 
 concurrency:
-  group: branch-freshness-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Every event can write the same commit-status context. A single queue prevents
+  # an older base or head observation from publishing after a newer one.
+  group: branch-freshness
+  cancel-in-progress: false
 
 jobs:
   update-status:
