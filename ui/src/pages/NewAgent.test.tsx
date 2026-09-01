@@ -232,8 +232,8 @@ async function renderNewAgent() {
 // start the login, and let the panel reach the server `stored` state.
 async function completeClaudeLogin(container: HTMLElement) {
   await clickByText(container, "Test Agent");
-  await flushUntil(() => Boolean(findButton(container, "Log in")));
-  await clickByText(container, "Log in");
+  await flushUntil(() => Boolean(findButton(container, "Sign in")));
+  await clickByText(container, "Sign in");
   await flushUntil(() => (container.textContent ?? "").includes("Authenticated"));
 }
 
@@ -328,12 +328,12 @@ describe("NewAgent Claude subscription login", () => {
     roots.push(result.root);
 
     // Before the test the page shows no login affordance.
-    expect(findButton(result.container, "Log in")).toBeFalsy();
+    expect(findButton(result.container, "Sign in")).toBeFalsy();
 
     await clickByText(result.container, "Test Agent");
-    await flushUntil(() => Boolean(findButton(result.container, "Log in")));
+    await flushUntil(() => Boolean(findButton(result.container, "Sign in")));
 
-    const loginButton = findButton(result.container, "Log in");
+    const loginButton = findButton(result.container, "Sign in");
     const createButton = findButton(result.container, "Create agent");
     expect(loginButton).toBeTruthy();
     expect(createButton).toBeTruthy();
@@ -401,8 +401,8 @@ describe("NewAgent Claude subscription login", () => {
     await clickByText(result.container, "Test Agent");
     // The panel shows the replace action only after it reads the stored-token
     // status, so the button label proves the panel captured the version.
-    await flushUntil(() => Boolean(findButton(result.container, "Log in to replace")));
-    await clickByText(result.container, "Log in to replace");
+    await flushUntil(() => Boolean(findButton(result.container, "Sign in to replace")));
+    await clickByText(result.container, "Sign in to replace");
     await flushUntil(() => mockAgentsApi.startClaudeSetupTokenLogin.mock.calls.length > 0);
 
     expect(mockAgentsApi.startClaudeSetupTokenLogin).toHaveBeenCalledWith("company-1", {

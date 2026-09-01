@@ -2192,6 +2192,26 @@ export type AdapterLoginPanelProps = AdapterLoginDescriptor & {
 // The login panel dispatcher. It picks the panel from the projected panel mode,
 // not from the adapter name. The `submitted_browser_code` mode shows the
 // submitted-browser-code panel; every other mode shows the displayed-code panel.
+/**
+ * The account a source signs in to, named where one is known.
+ *
+ * "Sign in to the environment" describes the plumbing — a login performed inside
+ * a sandbox — and is the honest label when the provider is unknown. But for the
+ * two sources onboarding offers, the customer is signing in to Anthropic or to
+ * OpenAI, and naming that is what tells them which password manager entry to
+ * reach for. The generic wording stays for anything not listed, where a guess
+ * would be worse than a description.
+ */
+const ADAPTER_LOGIN_PROVIDER: Record<string, string> = {
+  claude_local: "Anthropic",
+  codex_local: "OpenAI",
+};
+
+function adapterLoginTitle(adapterType: string): string {
+  const provider = ADAPTER_LOGIN_PROVIDER[adapterType];
+  return provider ? `Sign in to ${provider}` : "Sign in to the environment";
+}
+
 export function AdapterLoginPanel(props: AdapterLoginPanelProps) {
   const getCapabilities = useAdapterCapabilities();
   const panelMode = getCapabilities(props.adapterType).login?.panelMode;
@@ -2266,9 +2286,14 @@ function DisplayedCodeLoginPanel({
   const startDisabled = startLogin.isPending || isActive;
 
   return (
-    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 flex flex-col gap-2">
+      {/* `gap`, not `space-y`: the live region below collapses to
+          `display: none` whenever it has nothing to announce, and
+          `space-y` would still put its 8px on the row above — dead space
+          inside the card that pushes the row off centre. A gap only
+          applies between children that render. */}
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the environment</span>
+        <span className="text-xs font-medium text-foreground">{adapterLoginTitle(adapterType)}</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2290,7 +2315,7 @@ function DisplayedCodeLoginPanel({
             disabled={startDisabled}
             onClick={() => startLogin.mutate()}
           >
-            Log in
+            Sign in
           </Button>
         </div>
       </div>
@@ -2397,6 +2422,7 @@ const CLAUDE_LOGIN_TIMED_OUT_MESSAGE = "The login timed out. Start the login aga
 // only the server `stored` state as success, and it never shows the OAuth token.
 function SubmittedBrowserCodeLoginPanel({
   companyId,
+  adapterType,
   environmentId,
   onStored,
   onApplyStored,
@@ -2714,9 +2740,14 @@ function SubmittedBrowserCodeLoginPanel({
   };
 
   return (
-    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 flex flex-col gap-2">
+      {/* `gap`, not `space-y`: the live region below collapses to
+          `display: none` whenever it has nothing to announce, and
+          `space-y` would still put its 8px on the row above — dead space
+          inside the card that pushes the row off centre. A gap only
+          applies between children that render. */}
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the environment</span>
+        <span className="text-xs font-medium text-foreground">{adapterLoginTitle(adapterType)}</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2755,7 +2786,7 @@ function SubmittedBrowserCodeLoginPanel({
             disabled={startDisabled}
             onClick={() => startLogin.mutate()}
           >
-            {storedToken && !isActive && !isStored ? "Log in to replace" : "Log in"}
+            {storedToken && !isActive && !isStored ? "Sign in to replace" : "Sign in"}
           </Button>
         </div>
       </div>
