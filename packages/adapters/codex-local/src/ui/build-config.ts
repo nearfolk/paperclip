@@ -1,4 +1,9 @@
-import { buildAdapterEnvConfig, type CreateConfigValues } from "@paperclipai/adapter-utils";
+import {
+  buildAdapterEnvConfig,
+  resolvePaperclipRunnerIdleTimeoutMs,
+  resolvePaperclipRunnerPermissionMode,
+  type CreateConfigValues,
+} from "@paperclipai/adapter-utils";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "../index.js";
 
 function parseCommaArgs(value: string): string[] {
@@ -61,7 +66,7 @@ export function buildCodexLocalConfig(v: CreateConfigValues): Record<string, unk
   return ac;
 }
 
-/** Build the Codex-only profile accepted by the experimental Rust runner. */
+/** Build a provider profile accepted by the experimental Rust runner. */
 export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string, unknown> {
   const config = buildCodexLocalConfig(v);
   for (const unsupportedKey of [
@@ -82,5 +87,22 @@ export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string
   ]) {
     delete config[unsupportedKey];
   }
-  return { ...config, provider: "codex" };
+  const schemaValues = v.adapterSchemaValues ?? {};
+  const lifecycleCandidate = v.paperclipRunnerLifecycleMode ?? schemaValues.lifecycleMode;
+  const lifecycleMode = lifecycleCandidate === "warm" ? "warm" : "per_turn";
+  const configuredIdleTimeoutMs =
+    v.paperclipRunnerIdleTimeoutMs ?? schemaValues.idleTimeoutMs;
+  const idleTimeoutMs = resolvePaperclipRunnerIdleTimeoutMs(
+    configuredIdleTimeoutMs,
+  );
+  return {
+    ...config,
+    provider: "codex",
+    codexPermissionMode: resolvePaperclipRunnerPermissionMode(
+      "codex",
+      v.codexPermissionMode ?? schemaValues.codexPermissionMode,
+    ),
+    lifecycleMode,
+    ...(lifecycleMode === "warm" ? { idleTimeoutMs } : {}),
+  };
 }

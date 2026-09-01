@@ -7,14 +7,18 @@ use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
+
 pub use runner::{run_durable_runner, CommandExecution, CommandExecutor, PolledEvent};
 pub(crate) use state::{
-    create_private_temporary_file, open_private_regular_file, redact_text, verify_private_directory,
+    create_private_temporary_file, open_private_regular_file, redact_text, sanitize_value,
+    verify_private_directory,
 };
 pub use state::{
     Command, CommandDisposition, DurableState, DurableStateStore, EventPriority,
     StoredCommandResult, StoredOutboxEvent,
 };
+pub(crate) use transport::current_unix_ms;
 
 pub const PROTOCOL: &str = "paperclip.runner";
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -94,6 +98,7 @@ pub fn capture_bootstrap_ticket() -> Result<Option<BootstrapTicket>, DurableRunn
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableRunnerConfig {
     pub connect_url: String,
+    pub ca_bundle_path: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub runner_instance_id: String,
     pub environment_lease_id: String,
@@ -107,6 +112,7 @@ pub struct DurableRunnerConfig {
     pub p0_reserve_bytes: usize,
     pub max_frame_bytes: usize,
     pub reconnect_delay: Duration,
+    pub reconnect_grace: Option<Duration>,
     pub max_runtime: Duration,
 }
 
@@ -126,6 +132,22 @@ impl DurableRunnerConfig {
             if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
                 return Err(DurableRunnerError::invalid(format!(
                     "{name} must be a non-empty bounded string without control characters"
+                )));
+            }
+        }
+        for (name, value, max_chars) in [
+            ("run_id", self.run_id.as_str(), SHORT_STABLE_ID_CHARS),
+            (
+                "normalized_session_id",
+                self.normalized_session_id.as_str(),
+                SHORT_STABLE_ID_CHARS,
+            ),
+            ("turn_id", self.turn_id.as_str(), DURABLE_STABLE_ID_CHARS),
+            ("item_id", self.item_id.as_str(), DURABLE_STABLE_ID_CHARS),
+        ] {
+            if !is_stable_id(value, max_chars) {
+                return Err(DurableRunnerError::invalid(format!(
+                    "{name} must be a stable identity no longer than {max_chars} characters"
                 )));
             }
         }
@@ -152,11 +174,74 @@ impl DurableRunnerConfig {
                 "reconnect delay must be between one millisecond and 60 seconds",
             ));
         }
+        if self.reconnect_grace.is_some_and(|grace| grace.is_zero()) {
+            return Err(DurableRunnerError::invalid(
+                "reconnect grace must be non-zero when configured",
+            ));
+        }
         if self.max_runtime > Duration::from_secs(7 * 24 * 60 * 60) {
             return Err(DurableRunnerError::invalid(
                 "durable runner max runtime must not exceed seven days",
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> DurableRunnerConfig {
+        DurableRunnerConfig {
+            connect_url: "ws://127.0.0.1/runner".to_owned(),
+            ca_bundle_path: None,
+            state_dir: PathBuf::from("state"),
+            runner_instance_id: "runner-1".to_owned(),
+            environment_lease_id: "lease-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+            runner_version: "1.0.0".to_owned(),
+            runner_digest: "sha256:digest".to_owned(),
+            max_outbox_bytes: 1024 * 1024,
+            p0_reserve_bytes: 64 * 1024,
+            max_frame_bytes: 64 * 1024,
+            reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
+            max_runtime: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn validates_durable_event_identity_boundaries() {
+        let mut boundary = config();
+        boundary.run_id = "r".repeat(SHORT_STABLE_ID_CHARS);
+        boundary.normalized_session_id = "s".repeat(SHORT_STABLE_ID_CHARS);
+        boundary.turn_id = "t".repeat(DURABLE_STABLE_ID_CHARS);
+        boundary.item_id = "i".repeat(DURABLE_STABLE_ID_CHARS);
+        boundary.validate().unwrap();
+
+        for (field, invalid) in [
+            ("run_id", "run 1".to_owned()),
+            ("normalized_session_id", "session/1".to_owned()),
+            ("turn_id", "_turn-1".to_owned()),
+            ("item_id", "itém-1".to_owned()),
+            ("run_id", "r".repeat(SHORT_STABLE_ID_CHARS + 1)),
+            ("turn_id", "t".repeat(DURABLE_STABLE_ID_CHARS + 1)),
+        ] {
+            let mut invalid_config = config();
+            match field {
+                "run_id" => invalid_config.run_id = invalid,
+                "normalized_session_id" => invalid_config.normalized_session_id = invalid,
+                "turn_id" => invalid_config.turn_id = invalid,
+                "item_id" => invalid_config.item_id = invalid,
+                _ => unreachable!(),
+            }
+            let error = invalid_config.validate().unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("stable identity"), "{error}");
+        }
     }
 }

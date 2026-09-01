@@ -18,6 +18,8 @@ const listProfilesMock = vi.hoisted(() => vi.fn());
 const listPoliciesMock = vi.hoisted(() => vi.fn());
 const listConnectionActivityMock = vi.hoisted(() => vi.fn());
 const listActionRequestsMock = vi.hoisted(() => vi.fn());
+const listTestAgentsMock = vi.hoisted(() => vi.fn());
+const getTestAgentAccessMock = vi.hoisted(() => vi.fn());
 const updateConnectionMock = vi.hoisted(() => vi.fn());
 const finishAppMock = vi.hoisted(() => vi.fn());
 const finalizeOAuthAccessMock = vi.hoisted(() => vi.fn());
@@ -52,6 +54,9 @@ vi.mock("@/api/tools", () => ({
       listConnectionActivityMock(connectionId, limit),
     listActionRequests: (companyId: string, status: string) =>
       listActionRequestsMock(companyId, status),
+    listTestAgents: (connectionId: string) => listTestAgentsMock(connectionId),
+    getTestAgentAccess: (connectionId: string, agentId: string) =>
+      getTestAgentAccessMock(connectionId, agentId),
     updateConnection: (connectionId: string, input: unknown) =>
       updateConnectionMock(connectionId, input),
     finishApp: (companyId: string, connectionId: string, input: unknown) =>
@@ -368,6 +373,7 @@ describe("AppDetail", () => {
     });
     listConnectionActivityMock.mockResolvedValue({ events: [], issues: {}, actionRequests: {} });
     listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
+    listTestAgentsMock.mockResolvedValue({ agents: [] });
     updateConnectionMock.mockResolvedValue(connection({ enabled: false }));
     finishAppMock.mockResolvedValue({});
     finalizeOAuthAccessMock.mockResolvedValue({});
@@ -514,6 +520,23 @@ describe("AppDetail", () => {
     expect(container.textContent?.includes("2 actions available")).toBe(showsActionCount);
     expect(container.textContent).toContain(expectedText);
     expect(container.querySelector("section.bg-card")).toBeNull();
+  });
+
+  it("counts only active catalog entries as available actions", async () => {
+    mockParams.tab = "permissions";
+    listCatalogMock.mockResolvedValue({
+      catalog: [
+        catalogEntry(),
+        catalogEntry({ id: "catalog-disabled", toolName: "disabled_action", status: "disabled" }),
+        catalogEntry({ id: "catalog-quarantined", toolName: "pending_action", status: "quarantined" }),
+        catalogEntry({ id: "catalog-removed", toolName: "removed_action", status: "removed" }),
+      ],
+    });
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("1 action available");
+    expect(container.textContent).not.toContain("2 actions available");
   });
 
   it("redirects the legacy Advanced route to Setup", async () => {

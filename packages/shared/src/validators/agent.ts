@@ -57,17 +57,19 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
-const agentModelProfileConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  label: z.string().trim().min(1).optional(),
-  adapterConfig: adapterConfigSchema,
-}).strict();
-
 export const agentRuntimeConfigSchema = z.object({
-  modelProfiles: z.object({
-    cheap: agentModelProfileConfigSchema.optional(),
+  debug: z.object({
+    providerTrace: z.literal("raw").optional(),
   }).strict().optional(),
-}).catchall(z.unknown());
+}).catchall(z.unknown()).superRefine((value, ctx) => {
+  if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["modelProfiles"],
+      message: "runtimeConfig.modelProfiles is no longer supported",
+    });
+  }
+});
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
@@ -210,6 +212,9 @@ export const wakeAgentSchema = z.object({
     (value) => (value === null ? undefined : value),
     z.boolean().optional().default(false),
   ),
+  debug: z.object({
+    providerTrace: z.literal("raw"),
+  }).strict().optional(),
 });
 
 export type WakeAgent = z.infer<typeof wakeAgentSchema>;

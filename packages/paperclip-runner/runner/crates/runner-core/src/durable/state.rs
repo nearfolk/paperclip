@@ -1078,7 +1078,23 @@ fn sensitive_key(key: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
-fn sanitize_value(value: &Value) -> Value {
+fn protocol_authorization_boundary(key: &str, value: &Value) -> bool {
+    key.eq_ignore_ascii_case("authorizationBoundary")
+        && value.as_str().is_some_and(|boundary| {
+            matches!(
+                boundary,
+                "company"
+                    | "actor"
+                    | "active_task"
+                    | "grant"
+                    | "governed_action"
+                    | "lock"
+                    | "revision"
+            )
+        })
+}
+
+pub(crate) fn sanitize_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => Value::Object(
             object
@@ -1086,7 +1102,9 @@ fn sanitize_value(value: &Value) -> Value {
                 .map(|(key, value)| {
                     (
                         key.clone(),
-                        if sensitive_key(key) {
+                        if protocol_authorization_boundary(key, value) {
+                            value.clone()
+                        } else if sensitive_key(key) {
                             Value::String("[REDACTED]".to_owned())
                         } else {
                             sanitize_value(value)
@@ -1179,6 +1197,7 @@ mod tests {
     fn config(state_dir: PathBuf) -> DurableRunnerConfig {
         DurableRunnerConfig {
             connect_url: "ws://127.0.0.1:3000/api/runner/v1/connect/run_1".to_owned(),
+            ca_bundle_path: None,
             state_dir,
             runner_instance_id: "runner_1".to_owned(),
             environment_lease_id: "environment_1".to_owned(),
@@ -1192,6 +1211,7 @@ mod tests {
             p0_reserve_bytes: 4096,
             max_frame_bytes: 65_536,
             reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
             max_runtime: Duration::from_secs(1),
         }
     }
@@ -1320,6 +1340,21 @@ mod tests {
                 .envelope
                 .pointer("/payload/payload/nested/inputTokens"),
             Some(&json!(42))
+        );
+    }
+
+    #[test]
+    fn protocol_authorization_boundary_is_not_redacted_as_a_credential() {
+        let sanitized = sanitize_value(&json!({
+            "authorizationBoundary": "active_task",
+            "nested": {"authorizationBoundary": "Bearer secret-value"},
+            "authorization": "Bearer secret-value",
+        }));
+        assert_eq!(sanitized["authorizationBoundary"], json!("active_task"));
+        assert_eq!(sanitized["authorization"], json!("[REDACTED]"));
+        assert_eq!(
+            sanitized["nested"]["authorizationBoundary"],
+            json!("[REDACTED]")
         );
     }
 

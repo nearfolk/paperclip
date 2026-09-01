@@ -1,11 +1,11 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const SOURCE_RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -104,6 +104,9 @@ vi.mock("../services/index.js", () => ({
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   logActivity: vi.fn(async () => undefined),
   projectService: () => ({}),
+  questionResponseDeliveryService: () => ({
+    deliver: vi.fn(async () => undefined),
+  }),
   routineService: () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
   }),
@@ -176,11 +179,39 @@ function registerModuleMocks() {
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: vi.fn(async () => undefined),
     projectService: () => ({}),
+    questionResponseDeliveryService: () => ({
+      deliver: vi.fn(async () => undefined),
+    }),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => ({}),
   }));
+}
+
+async function createApp() {
+  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      runId: req.header("x-paperclip-run-id") ?? null,
+      isInstanceAdmin: false,
+    };
+    next();
+  });
+  app.use("/api", issueRoutes({
+    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+  } as any, {} as any));
+  app.use(errorHandler);
+  return app;
 }
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
@@ -205,36 +236,12 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 }
 
 describe("issue update comment wakeups", () => {
-  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
-    const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    ]);
-    return { errorHandler, issueRoutes };
-  });
-
-  function createApp() {
-    const { errorHandler, issueRoutes } = routeModules.value;
-    const app = express();
-    app.use(express.json());
-    app.use((req, _res, next) => {
-      (req as any).actor = {
-        type: "board",
-        userId: "local-board",
-        companyIds: ["company-1"],
-        source: "local_implicit",
-        isInstanceAdmin: false,
-      };
-      next();
-    });
-    app.use("/api", issueRoutes({
-      transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-    } as any, {} as any));
-    app.use(errorHandler);
-    return app;
-  }
-
   beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -530,6 +537,119 @@ describe("issue update comment wakeups", () => {
           wakeCommentId: "comment-3",
           wakeReason: "issue_commented",
           source: "issue.comment",
+        }),
+      }),
+    );
+  });
+
+  it("does not wake the assignee for its own run-authenticated top-level comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-top-level",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Plan ready for review.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({ body: "Plan ready for review." });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still wakes a different mentioned agent from a run-authenticated comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-cross-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please verify.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([
+      MENTIONED_AGENT_ID,
+    ]);
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({
+        body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please verify.",
+      });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+      }),
+    );
+  });
+
+  it("preserves an explicit resume on a run-authenticated top-level comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-resume",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Resume intentionally.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "succeeded",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({ body: "Resume intentionally.", resume: true });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        contextSnapshot: expect.objectContaining({
+          resumeIntent: true,
         }),
       }),
     );
