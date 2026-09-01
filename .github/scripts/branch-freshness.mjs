@@ -171,50 +171,71 @@ export async function runBranchFreshness({
       core.warning?.(`REST pull-request enumeration failed; trying GraphQL: ${message}`)
     }
 
-    const pulls = []
-    let cursor = null
-    do {
-      const response = await github.graphql(
-        `query OpenPullHeads($owner: String!, $repo: String!, $cursor: String) {
-          repository(owner: $owner, name: $repo) {
-            pullRequests(first: 100, after: $cursor, states: OPEN) {
-              nodes {
-                number
-                baseRefName
-                headRefOid
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
+    try {
+      const pulls = []
+      let cursor = null
+      do {
+        const response = await github.graphql(
+          `query OpenPullHeads($owner: String!, $repo: String!, $cursor: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequests(first: 100, after: $cursor, states: OPEN) {
+                nodes {
+                  number
+                  baseRefName
+                  headRefOid
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
               }
             }
-          }
-        }`,
-        {
-          owner: context.repo.owner,
-          repo: context.repo.repo,
-          cursor,
-        },
-      )
-      const connection = response?.repository?.pullRequests
-      if (!Array.isArray(connection?.nodes)) {
-        throw new Error('GraphQL pull-request enumeration returned an invalid response')
-      }
-      pulls.push(...connection.nodes
-        .filter((pull) => pull?.baseRefName === protectedBase)
-        .map((pull) => ({
-          number: pull.number,
-          head: { sha: pull.headRefOid },
-        })))
+          }`,
+          {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            cursor,
+          },
+        )
+        const connection = response?.repository?.pullRequests
+        if (!Array.isArray(connection?.nodes)) {
+          throw new Error('GraphQL pull-request enumeration returned an invalid response')
+        }
+        pulls.push(...connection.nodes
+          .filter((pull) => pull?.baseRefName === protectedBase)
+          .map((pull) => ({
+            number: pull.number,
+            head: { sha: pull.headRefOid },
+          })))
 
-      if (!connection.pageInfo?.hasNextPage) return pulls
-      cursor = connection.pageInfo.endCursor
-      if (!cursor) {
-        throw new Error('GraphQL pull-request enumeration omitted its next cursor')
-      }
-    } while (cursor)
+        if (!connection.pageInfo?.hasNextPage) return pulls
+        cursor = connection.pageInfo.endCursor
+        if (!cursor) {
+          throw new Error('GraphQL pull-request enumeration omitted its next cursor')
+        }
+      } while (cursor)
 
-    return pulls
+      return pulls
+    } catch (graphqlError) {
+      const message = graphqlError instanceof Error ? graphqlError.message : String(graphqlError)
+      core.warning?.(`GraphQL pull-request enumeration failed; trying search: ${message}`)
+    }
+
+    // Search is served independently from both repository pull-list surfaces.
+    // It yields PR numbers rather than heads, so resolve every result through
+    // the exact pull endpoint before publishing any status.
+    const matches = await github.paginate(github.rest.search.issuesAndPullRequests, {
+      q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:open base:${protectedBase}`,
+      per_page: 100,
+    })
+    return Promise.all(matches.map(async (match) => {
+      const pull = await currentPull(match.number)
+      return {
+        number: match.number,
+        base: pull.base,
+        head: pull.head,
+      }
+    }))
   }
 
   let pulls
@@ -332,9 +353,11 @@ export async function runBranchFreshness({
         core.error(`PR #${candidate.number}: ${result.description}`)
       } else if (result.state === 'success') {
         // Detect changes during the status write and overwrite transient success.
-        // A base advance after this final read is blocked atomically by GitHub's
-        // strict required-status policy, which was checked both before and after
-        // publication; the queued base-push run then refreshes the visible status.
+        // GitHub's commit-status API cannot atomically compare-and-set against a
+        // mutable branch ref. A base advance after this final read is therefore
+        // blocked at merge time by the native strict policy checked on both sides
+        // of publication, while the newer event cancels this writer and promptly
+        // invalidates the visible status.
         const [publishedPull, publishedBaseSha, enforcementStillActive] = await Promise.all([
           currentPull(candidate.number),
           protectedBaseSha(),

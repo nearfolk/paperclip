@@ -62,10 +62,11 @@ test('workflow recomputes on pull request heads and protected master advances', 
   assert.match(source, /push:\s*\n\s*branches: \[master\]/)
   assert.match(source, /statuses: write/)
   assert.match(source, /if: github\.repository == 'paperclipai\/paperclip'/)
-  assert.match(source, /group: branch-freshness\s*$/m)
-  assert.match(source, /cancel-in-progress: false/)
+  assert.match(source, /group: branch-freshness-\$\{\{ github\.event_name == 'push'/)
+  assert.match(source, /cancel-in-progress: true/)
   assert.match(source, /persist-credentials: false/)
-  assert.doesNotMatch(source, /\$\{\{\s*github\.event/)
+  const executableSource = source.match(/script: \|([\s\S]*)/)?.[1] ?? ''
+  assert.doesNotMatch(executableSource, /\$\{\{\s*github\.event/)
   assert.doesNotMatch(source, /\bsecrets\s*:/)
   assert.doesNotMatch(source, /permissions:\s*[\s\S]*?contents:\s*write/)
   assert.match(source, /runBranchFreshness/)
@@ -302,7 +303,69 @@ test('a REST enumeration failure falls back and invalidates GraphQL heads', asyn
   assert.match(warnings[0], /trying GraphQL/)
 })
 
-test('failure of both enumeration paths records error on the protected-base event', async () => {
+test('REST and GraphQL enumeration failures fall back to search and invalidate exact heads', async () => {
+  const statuses = []
+  const warnings = []
+  const github = {
+    request: rulesetRequest(),
+    paginate: async (route) => {
+      if (route === github.rest.pulls.list) throw new Error('REST pull API unavailable')
+      assert.equal(route, github.rest.search.issuesAndPullRequests)
+      return [{ number: 42 }]
+    },
+    graphql: async () => {
+      throw new Error('GraphQL pull API unavailable')
+    },
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: head },
+          },
+        }),
+      },
+      search: {
+        issuesAndPullRequests: async () => ({ data: [] }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statuses.push({ sha, state, description })
+        },
+        compareCommitsWithBasehead: async () => ({ data: comparison() }),
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = {
+    error: () => {},
+    warning: (message) => warnings.push(message),
+    setFailed: () => {},
+  }
+
+  await runBranchFreshness({ github, context, core })
+
+  assert.deepEqual(statuses.at(0), {
+    sha: head,
+    state: 'pending',
+    description: 'Checking head against protected master.',
+  })
+  assert.equal(statuses.at(-1).state, 'success')
+  assert.match(warnings[0], /trying GraphQL/)
+  assert.match(warnings[1], /trying search/)
+})
+
+test('failure of every enumeration path records error on the protected-base event', async () => {
   const statuses = []
   const errors = []
   let failure
@@ -316,12 +379,19 @@ test('failure of both enumeration paths records error on the protected-base even
     },
     rest: {
       pulls: { list: async () => ({ data: [] }) },
+      search: {
+        issuesAndPullRequests: async () => ({ data: [] }),
+      },
       repos: {
         createCommitStatus: async ({ sha, state, description }) => {
           statuses.push({ sha, state, description })
         },
       },
     },
+  }
+  github.paginate = async (route) => {
+    if (route === github.rest.pulls.list) throw new Error('pull API unavailable')
+    throw new Error('search API unavailable')
   }
   const context = {
     eventName: 'push',
@@ -343,7 +413,7 @@ test('failure of both enumeration paths records error on the protected-base even
     state: 'error',
     description: 'Open pull requests for protected master could not be enumerated.',
   }])
-  assert.match(errors[0], /pull API unavailable/)
+  assert.match(errors[0], /search API unavailable/)
   assert.match(failure, /could not be enumerated/)
 })
 

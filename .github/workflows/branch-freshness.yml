@@ -16,10 +16,11 @@ permissions:
   statuses: write
 
 concurrency:
-  # Every event can write the same commit-status context. A single queue prevents
-  # an older base or head observation from publishing after a newer one.
-  group: branch-freshness
-  cancel-in-progress: false
+  # Base advances cancel only older base-wide runs; each PR head cancels only an
+  # older run for that same PR. A PR update therefore cannot interrupt the
+  # base-wide invalidation of every open head.
+  group: branch-freshness-${{ github.event_name == 'push' && 'protected-base' || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   update-status:
