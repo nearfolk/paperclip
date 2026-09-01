@@ -5005,22 +5005,13 @@ export function issueRoutes(
     return { scope, discovery, sourceIssue, watchdogIssue };
   }
 
-  function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
+  function isStatusOnlyRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
     const context = contextSnapshot as Record<string, unknown>;
-    return context.modelProfile === "cheap" &&
-      context.recoveryIntent === "status_only" &&
+    return context.recoveryIntent === "status_only" &&
       context.allowDeliverableWork === false &&
       context.allowDocumentUpdates === false &&
       context.resumeRequiresNormalModel === true;
-  }
-
-  function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
-    const overrides = input.assigneeAdapterOverrides;
-    return !!overrides &&
-      typeof overrides === "object" &&
-      !Array.isArray(overrides) &&
-      (overrides as Record<string, unknown>).modelProfile === "cheap";
   }
 
   async function loadActorRunContext(req: Request, companyId: string) {
@@ -5088,29 +5079,6 @@ export function issueRoutes(
     };
   }
 
-  async function assertCheapRecoveryIssueAssigneeProfileAllowed(
-    req: Request,
-    res: Response,
-    issue: { id?: string; companyId: string },
-    input: { assigneeAdapterOverrides?: unknown },
-  ) {
-    if (!requestsCheapIssueAssigneeModelProfile(input)) return true;
-    const run = await loadActorRunContext(req, issue.companyId);
-    if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
-
-    res.status(403).json({
-      error: "Cheap status-only recovery runs cannot assign downstream issue work to the cheap model profile",
-      details: {
-        issueId: issue.id ?? null,
-        runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
-      },
-    });
-    return false;
-  }
-
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -5118,14 +5086,13 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      error: "Status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -5140,14 +5107,13 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error: "Status-only recovery runs cannot create or modify approvals",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -9200,7 +9166,6 @@ export function issueRoutes(
         }
         : {}),
     };
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, createBody))) return;
     const createAssignmentScope = {
       projectId: await resolveAssignmentProjectId({
         companyId,
@@ -9436,7 +9401,6 @@ export function issueRoutes(
       ...sanitizedBody,
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
     const childAssignmentScope = {
       projectId: createBody.projectId ?? parent.projectId ?? null,
       parentIssueId: parent.id,
@@ -9615,7 +9579,6 @@ export function issueRoutes(
       };
       requestedChildren.push(childBody);
       assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
-      if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, childBody))) return;
       if (childBody.assigneeAgentId || childBody.assigneeUserId) {
         await assertCanAssignTasks(req, sourceIssue.companyId, {
           projectId: childBody.projectId ?? sourceIssue.projectId ?? null,
@@ -9986,7 +9949,6 @@ export function issueRoutes(
     const issueMutationAuthorizationReason = req.actor.type === "agent"
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
       : issueWriteAuthorizationReason(req, true);
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);

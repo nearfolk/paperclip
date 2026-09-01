@@ -65,7 +65,6 @@ import { CompanyAccess, CompanyAccessLegacyRoute } from "./pages/CompanyAccess";
 import { AdvancedToolsRoute } from "./pages/tools/AdvancedToolsRoute";
 import { ProfileWizardRoute } from "./pages/tools/profiles/ProfileWizardRoute";
 import { ProfileDetailRoute } from "./pages/tools/profiles/ProfileDetailRoute";
-import { Connections } from "./pages/apps/Connections";
 import { Browse } from "./pages/apps/Browse";
 import { AppsConnect } from "./pages/apps/AppsConnect";
 import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
@@ -157,10 +156,10 @@ function boardRoutes() {
       <Route path="company/settings/tools/:tab" element={<LegacyToolsSettingsRedirect />} />
       <Route path="tools" element={<LegacyToolsRedirect />} />
       <Route path="tools/:tab" element={<LegacyToolsRedirect />} />
-      <Route element={<AppsExperimentalGate />}>
-        <Route path="apps" element={<Browse />} />
-        <Route path="apps/browse" element={<Navigate to="/apps" replace />} />
-        <Route path="apps/connections" element={<Connections />} />
+        <Route element={<AppsExperimentalGate />}>
+          <Route path="apps" element={<Browse />} />
+          <Route path="apps/browse" element={<Navigate to="/apps" replace />} />
+          <Route path="apps/connections" element={<Navigate to="/apps" replace />} />
         <Route path="apps/byo" element={<AppsConnect byoOnly />} />
         <Route
           path="apps/vercel-connect"
@@ -170,8 +169,8 @@ function boardRoutes() {
         <Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />
         <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />
         <Route path="apps/review" element={<AppsReview />} />
-        {/* Needs attention folded into Connections (PAP-13254); keep legacy links working. */}
-        <Route path="apps/attention" element={<Navigate to="/apps/connections" replace />} />
+        {/* Connector health is inline on the Apps landing page; keep legacy links working. */}
+        <Route path="apps/attention" element={<Navigate to="/apps" replace />} />
         <Route path="apps/gateways" element={<GatewaysList />} />
         <Route path="apps/gateways/:gatewayId" element={<Navigate to="overview" replace />} />
         <Route path="apps/gateways/:gatewayId/:tab" element={<GatewayDetail />} />
@@ -180,6 +179,8 @@ function boardRoutes() {
         <Route path="apps/advanced/profiles/new" element={<ProfileWizardRoute mode="new" />} />
         <Route path="apps/advanced/profiles/:profileId/edit" element={<ProfileWizardRoute mode="edit" />} />
         <Route path="apps/advanced/profiles/:profileId" element={<ProfileDetailRoute />} />
+        <Route path="apps/advanced/audit" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/advanced/run-your-own" element={<Navigate to="/apps" replace />} />
         <Route path="apps/advanced/:tab" element={<AdvancedToolsRoute />} />
         <Route path="apps/app/:applicationId" element={<AppNotConnected />} />
         <Route path="apps/app/:applicationId/:tab" element={<AppNotConnected />} />
@@ -464,8 +465,8 @@ function LegacyToolsRedirect() {
 
 function legacyToolsRedirectTarget(tab?: string) {
   if (!tab) return "/apps/advanced/profiles";
-  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps/connections";
-  if (tab === "runtime") return "/apps/connections";
+  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps";
+  if (tab === "runtime" || tab === "audit") return "/apps";
   if (tab === "policies") return "/apps/advanced/profiles";
   return `/apps/advanced/${tab}`;
 }
