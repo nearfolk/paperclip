@@ -158,6 +158,65 @@ export async function runBranchFreshness({
     core.setFailed('Open pull requests could not be enumerated for branch freshness.')
   }
 
+  async function enumerateOpenPulls() {
+    try {
+      return await github.paginate(github.rest.pulls.list, {
+        ...context.repo,
+        state: 'open',
+        base: protectedBase,
+        per_page: 100,
+      })
+    } catch (restError) {
+      const message = restError instanceof Error ? restError.message : String(restError)
+      core.warning?.(`REST pull-request enumeration failed; trying GraphQL: ${message}`)
+    }
+
+    const pulls = []
+    let cursor = null
+    do {
+      const response = await github.graphql(
+        `query OpenPullHeads($owner: String!, $repo: String!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequests(first: 100, after: $cursor, states: OPEN) {
+              nodes {
+                number
+                baseRefName
+                headRefOid
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        }`,
+        {
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          cursor,
+        },
+      )
+      const connection = response?.repository?.pullRequests
+      if (!Array.isArray(connection?.nodes)) {
+        throw new Error('GraphQL pull-request enumeration returned an invalid response')
+      }
+      pulls.push(...connection.nodes
+        .filter((pull) => pull?.baseRefName === protectedBase)
+        .map((pull) => ({
+          number: pull.number,
+          head: { sha: pull.headRefOid },
+        })))
+
+      if (!connection.pageInfo?.hasNextPage) return pulls
+      cursor = connection.pageInfo.endCursor
+      if (!cursor) {
+        throw new Error('GraphQL pull-request enumeration omitted its next cursor')
+      }
+    } while (cursor)
+
+    return pulls
+  }
+
   let pulls
   if (context.eventName === 'pull_request_target') {
     const pull = context.payload.pull_request
@@ -167,12 +226,7 @@ export async function runBranchFreshness({
   } else {
     let openPulls
     try {
-      openPulls = await github.paginate(github.rest.pulls.list, {
-        ...context.repo,
-        state: 'open',
-        base: protectedBase,
-        per_page: 100,
-      })
+      openPulls = await enumerateOpenPulls()
     } catch (error) {
       await publishEnumerationError(error)
       return

@@ -1,8 +1,9 @@
 name: Branch freshness
 
 on:
-  # This privileged workflow must use only trusted protected-branch code. Keep
-  # pull-request payload values out of expressions and never check out the head.
+  # Security invariants for this privileged trigger: use only protected-branch
+  # code; never check out or interpolate the pull-request head or payload; never
+  # persist credentials; never add secrets or broaden the permissions below.
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
   push:

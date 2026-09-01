@@ -64,6 +64,10 @@ test('workflow recomputes on pull request heads and protected master advances', 
   assert.match(source, /if: github\.repository == 'paperclipai\/paperclip'/)
   assert.match(source, /group: branch-freshness\s*$/m)
   assert.match(source, /cancel-in-progress: false/)
+  assert.match(source, /persist-credentials: false/)
+  assert.doesNotMatch(source, /\$\{\{\s*github\.event/)
+  assert.doesNotMatch(source, /\bsecrets\s*:/)
+  assert.doesNotMatch(source, /permissions:\s*[\s\S]*?contents:\s*write/)
   assert.match(source, /runBranchFreshness/)
 })
 
@@ -240,7 +244,65 @@ test('a protected-base run marks every open head pending before comparing any he
   assert.equal(statuses.at(-1).state, 'failure')
 })
 
-test('an enumeration API failure records error on the exact protected-base event', async () => {
+test('a REST enumeration failure falls back and invalidates GraphQL heads', async () => {
+  const statuses = []
+  const warnings = []
+  const github = {
+    request: rulesetRequest(),
+    paginate: async () => {
+      throw new Error('REST pull API unavailable')
+    },
+    graphql: async () => ({
+      repository: {
+        pullRequests: {
+          nodes: [{ number: 42, baseRefName: 'master', headRefOid: head }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    }),
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: head },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statuses.push({ sha, state, description })
+        },
+        compareCommitsWithBasehead: async () => ({ data: comparison() }),
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = {
+    error: () => {},
+    warning: (message) => warnings.push(message),
+    setFailed: () => {},
+  }
+
+  await runBranchFreshness({ github, context, core })
+
+  assert.equal(statuses[0].sha, head)
+  assert.equal(statuses[0].state, 'pending')
+  assert.equal(statuses.at(-1).state, 'success')
+  assert.match(warnings[0], /trying GraphQL/)
+})
+
+test('failure of both enumeration paths records error on the protected-base event', async () => {
   const statuses = []
   const errors = []
   let failure
@@ -248,6 +310,9 @@ test('an enumeration API failure records error on the exact protected-base event
     request: rulesetRequest(),
     paginate: async () => {
       throw new Error('pull API unavailable')
+    },
+    graphql: async () => {
+      throw new Error('GraphQL pull API unavailable')
     },
     rest: {
       pulls: { list: async () => ({ data: [] }) },
