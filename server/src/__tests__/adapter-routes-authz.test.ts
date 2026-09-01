@@ -254,7 +254,7 @@ describe.sequential("adapter management route authorization", () => {
     const [routes, middleware, registry] = await Promise.all([
       import("../routes/adapters.js"),
       import("../middleware/index.js"),
-      import("../adapters/registry.js"),
+      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
     ]);
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
