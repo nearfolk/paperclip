@@ -1,0 +1,40 @@
+name: Branch freshness
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: branch-freshness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-status:
+    name: Update branch-freshness status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out trusted protected-branch logic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: master
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Mark open pull requests fresh or stale
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { runBranchFreshness } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/branch-freshness.mjs`
+            )
+            await runBranchFreshness({ github, context, core })
