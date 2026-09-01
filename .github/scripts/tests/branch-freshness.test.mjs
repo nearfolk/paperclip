@@ -57,9 +57,11 @@ test('workflow recomputes on pull request heads and protected master advances', 
   const source = await readFile('.github/workflows/branch-freshness.yml', 'utf8')
 
   assert.match(source, /pull_request_target:/)
-  assert.match(source, /types: \[opened, reopened, synchronize, ready_for_review, edited\]/)
+  assert.match(source, /types: \[opened, reopened, synchronize, ready_for_review\]/)
+  assert.doesNotMatch(source, /\btype?s?:[^\n]*edited\b/)
   assert.match(source, /push:\s*\n\s*branches: \[master\]/)
   assert.match(source, /statuses: write/)
+  assert.match(source, /if: github\.repository == 'paperclipai\/paperclip'/)
   assert.match(source, /group: branch-freshness\s*$/m)
   assert.match(source, /cancel-in-progress: false/)
   assert.match(source, /runBranchFreshness/)

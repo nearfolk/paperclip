@@ -1,8 +1,10 @@
 name: Branch freshness
 
 on:
+  # This privileged workflow must use only trusted protected-branch code. Keep
+  # pull-request payload values out of expressions and never check out the head.
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
+    types: [opened, reopened, synchronize, ready_for_review]
   push:
     branches: [master]
   workflow_dispatch: {}
@@ -21,6 +23,7 @@ concurrency:
 jobs:
   update-status:
     name: Update branch-freshness status
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
