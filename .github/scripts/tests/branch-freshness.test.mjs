@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import {
   computeFreshnessStatus,
+  hasStrictFreshnessEnforcement,
   runBranchFreshness,
   successDescription,
 } from '../branch-freshness.mjs'
@@ -31,6 +32,27 @@ function result(overrides = {}) {
   })
 }
 
+function strictRuleset(overrides = {}) {
+  return {
+    enforcement: 'active',
+    rules: [{
+      type: 'required_status_checks',
+      parameters: {
+        strict_required_status_checks_policy: true,
+        required_status_checks: [{
+          context: 'branch-freshness',
+          integration_id: 15368,
+        }],
+      },
+    }],
+    ...overrides,
+  }
+}
+
+function rulesetRequest(ruleset = strictRuleset()) {
+  return async () => ({ data: ruleset })
+}
+
 test('workflow recomputes on pull request heads and protected master advances', async () => {
   const source = await readFile('.github/workflows/branch-freshness.yml', 'utf8')
 
@@ -52,6 +74,35 @@ test('only exact stable zero-behind evidence succeeds', () => {
   assert.equal(result({
     comparison: comparison({ behind_by: 1 }),
   }).state, 'failure')
+})
+
+test('success requires the exact active strict ruleset check', () => {
+  const input = {
+    ruleset: strictRuleset(),
+    statusContext: 'branch-freshness',
+    statusIntegrationId: 15368,
+  }
+  assert.equal(hasStrictFreshnessEnforcement(input), true)
+  assert.equal(hasStrictFreshnessEnforcement({
+    ...input,
+    ruleset: strictRuleset({ enforcement: 'disabled' }),
+  }), false)
+  assert.equal(hasStrictFreshnessEnforcement({
+    ...input,
+    ruleset: strictRuleset({
+      rules: [{
+        type: 'required_status_checks',
+        parameters: {
+          strict_required_status_checks_policy: false,
+          required_status_checks: [{ context: 'branch-freshness', integration_id: 15368 }],
+        },
+      }],
+    }),
+  }), false)
+  assert.equal(hasStrictFreshnessEnforcement({
+    ...input,
+    statusIntegrationId: 1,
+  }), false)
 })
 
 test('changed base or head makes a completed comparison stale', () => {
@@ -79,6 +130,7 @@ test('an unavailable protected-base lookup overwrites prior success on the event
   const errors = []
   let failure
   const github = {
+    request: rulesetRequest(),
     rest: {
       git: {
         getRef: async () => {
@@ -134,6 +186,7 @@ test('a protected-base run marks every open head pending before comparing any he
     { number: 42, head: { sha: otherHead } },
   ]
   const github = {
+    request: rulesetRequest(),
     paginate: async () => pulls,
     rest: {
       git: {
@@ -190,6 +243,7 @@ test('an enumeration API failure records error on the exact protected-base event
   const errors = []
   let failure
   const github = {
+    request: rulesetRequest(),
     paginate: async () => {
       throw new Error('pull API unavailable')
     },
@@ -238,6 +292,7 @@ test('all known heads begin invalidation without waiting for an earlier status w
     { number: 42, head: { sha: otherHead } },
   ]
   const github = {
+    request: rulesetRequest(),
     paginate: async () => pulls,
     rest: {
       git: { getRef: async () => ({ data: { object: { sha: base } } }) },
@@ -286,6 +341,7 @@ test('a base change during success publication overwrites the transient success'
   let baseRead = 0
   let failure
   const github = {
+    request: rulesetRequest(),
     rest: {
       git: {
         getRef: async () => ({
@@ -325,6 +381,53 @@ test('a base change during success publication overwrites the transient success'
     sha: head,
     state: 'error',
     description: `Published comparison for protected master ${base} became stale.`,
+  })
+  assert.match(failure, /unavailable or stale/)
+})
+
+test('a rejected first invalidation is retried and cannot preserve prior success', async () => {
+  const statuses = []
+  let statusAttempt = 0
+  let failure
+  const github = {
+    request: rulesetRequest(strictRuleset({ enforcement: 'disabled' })),
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        get: async () => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: head },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statusAttempt += 1
+          if (statusAttempt === 1) throw new Error('transient status failure')
+          statuses.push({ sha, state, description })
+        },
+        compareCommitsWithBasehead: async () => ({ data: comparison() }),
+      },
+    },
+  }
+  const context = {
+    eventName: 'pull_request_target',
+    payload: { pull_request: { number: 42, head: { sha: head } } },
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = { error: () => {}, setFailed: (message) => { failure = message } }
+
+  await runBranchFreshness({ github, context, core })
+
+  assert.equal(statuses[0].state, 'pending')
+  assert.deepEqual(statuses.at(-1), {
+    sha: head,
+    state: 'error',
+    description: 'Strict branch-freshness enforcement is unavailable.',
   })
   assert.match(failure, /unavailable or stale/)
 })
