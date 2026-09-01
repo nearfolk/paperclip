@@ -1728,7 +1728,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
   );
 
   async function runConcurrentInteractionDecisionRevocationTest(
-    decision: "accept" | "reject" | "withdraw",
+    decision: "accept" | "reject" | "withdraw" | "skip",
     revocationKind: "target grant" | "membership" | "instance admin",
   ) {
     const fixture = await seedRun();
@@ -1846,6 +1846,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       ${activityLog.action} in (
         'issue.thread_interaction_accepted',
         'issue.thread_interaction_rejected',
+        'issue.thread_interaction_skipped',
         'issue.thread_interaction_withdrawn',
         'secret.proposal.approved',
         'secret.proposal.rejected',
@@ -1861,9 +1862,12 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ["reject", "membership"],
     ["withdraw", "target grant"],
     ["withdraw", "membership"],
+    ["skip", "target grant"],
+    ["skip", "membership"],
     ["accept", "instance admin"],
     ["reject", "instance admin"],
     ["withdraw", "instance admin"],
+    ["skip", "instance admin"],
   ] as const)(
     "serializes generic %s behind %s revocation with zero governed mutations",
     runConcurrentInteractionDecisionRevocationTest,

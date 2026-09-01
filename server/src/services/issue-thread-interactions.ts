@@ -3802,13 +3802,16 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await actor.authorizationTransaction?.lock(txDb);
+        await actor.authorizationTransaction?.assertAllowed(txDb, current);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
           actor,
           now,
         });
-        await resolveLinkedSecretProposal(tx as unknown as Db, current, {
+        await resolveLinkedSecretProposal(txDb, current, {
           status: "withdrawn",
           actor,
           reason: reason ?? "Skipped from the task composer",

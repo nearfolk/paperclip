@@ -12696,11 +12696,18 @@ export function issueRoutes(
       }
       assertBoard(req);
 
+      const interactionSvc = issueThreadInteractionService(db);
+      const current = await interactionSvc.getForIssue(issue, interactionId);
+      const secretProposalAuthorizationTransaction =
+        await assertSecretProposalInteractionResolutionAllowed(req, issue, current);
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).skipInteraction(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.skipInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
+        ...(secretProposalAuthorizationTransaction
+          ? { authorizationTransaction: secretProposalAuthorizationTransaction }
+          : {}),
       });
 
       await logActivity(db, {
