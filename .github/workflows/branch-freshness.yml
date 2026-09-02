@@ -16,11 +16,11 @@ permissions:
   statuses: write
 
 concurrency:
-  # Base advances cancel only older base-wide runs; each PR head cancels only an
-  # older run for that same PR. A PR update therefore cannot interrupt the
-  # base-wide invalidation of every open head.
-  group: branch-freshness-${{ github.event_name == 'push' && 'protected-base' || github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  # Every trigger writes the same commit-status context. Serialize every writer
+  # without cancellation so a newer run cannot interrupt base-wide invalidation
+  # and an older observation cannot publish after a newer one.
+  group: branch-freshness
+  cancel-in-progress: false
 
 jobs:
   update-status:

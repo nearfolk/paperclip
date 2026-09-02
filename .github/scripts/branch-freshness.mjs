@@ -356,8 +356,8 @@ export async function runBranchFreshness({
         // GitHub's commit-status API cannot atomically compare-and-set against a
         // mutable branch ref. A base advance after this final read is therefore
         // blocked at merge time by the native strict policy checked on both sides
-        // of publication, while the newer event cancels this writer and promptly
-        // invalidates the visible status.
+        // of publication, while the globally serialized newer event runs next
+        // and promptly invalidates the visible status.
         const [publishedPull, publishedBaseSha, enforcementStillActive] = await Promise.all([
           currentPull(candidate.number),
           protectedBaseSha(),

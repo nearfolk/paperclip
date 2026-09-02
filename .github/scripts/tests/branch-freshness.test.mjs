@@ -62,8 +62,8 @@ test('workflow recomputes on pull request heads and protected master advances', 
   assert.match(source, /push:\s*\n\s*branches: \[master\]/)
   assert.match(source, /statuses: write/)
   assert.match(source, /if: github\.repository == 'paperclipai\/paperclip'/)
-  assert.match(source, /group: branch-freshness-\$\{\{ github\.event_name == 'push'/)
-  assert.match(source, /cancel-in-progress: true/)
+  assert.match(source, /group: branch-freshness\s*$/m)
+  assert.match(source, /cancel-in-progress: false/)
   assert.match(source, /persist-credentials: false/)
   const executableSource = source.match(/script: \|([\s\S]*)/)?.[1] ?? ''
   assert.doesNotMatch(executableSource, /\$\{\{\s*github\.event/)
