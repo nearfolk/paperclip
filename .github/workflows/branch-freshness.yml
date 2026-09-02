@@ -17,9 +17,11 @@ permissions:
 
 concurrency:
   # Every trigger writes the same commit-status context. Serialize every writer
-  # without cancellation so a newer run cannot interrupt base-wide invalidation
-  # and an older observation cannot publish after a newer one.
+  # in one multi-pending queue so bursts cannot replace a queued invalidation,
+  # newer runs cannot interrupt base-wide invalidation, and an older observation
+  # cannot publish after a newer one.
   group: branch-freshness
+  queue: max
   cancel-in-progress: false
 
 jobs:
