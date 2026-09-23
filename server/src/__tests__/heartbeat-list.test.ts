@@ -114,6 +114,95 @@ describeEmbeddedPostgres("heartbeat list", () => {
     expect(boundHeartbeatRunListLimit(50_000)).toBe(HEARTBEAT_RUN_LIST_MAX_LIMIT);
   });
 
+  it("caps an omitted service limit at the default", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: HEARTBEAT_RUN_LIST_DEFAULT_LIMIT + 5 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment" as const,
+        status: "succeeded" as const,
+        resultJson: { summary: `run ${index}` },
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)),
+      })),
+    );
+
+    const runs = await heartbeatService(db).list(companyId);
+
+    expect(runs).toHaveLength(HEARTBEAT_RUN_LIST_DEFAULT_LIMIT);
+  });
+
+  it("projects large list results and log access metadata without full payloads", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      resultJson: {
+        summary: "completed representative work",
+        stdout: "x".repeat(500_000),
+      },
+      logStore: "local",
+      logRef: "runs/test.log",
+    });
+
+    const service = heartbeatService(db);
+    const runs = await service.list(companyId);
+    const logAccess = await service.getRunLogAccess(runId);
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.resultJson).toEqual({ summary: "completed representative work" });
+    expect(logAccess).toEqual({
+      id: runId,
+      companyId,
+      logStore: "local",
+      logRef: "runs/test.log",
+    });
+    expect(logAccess).not.toHaveProperty("resultJson");
+  });
+
   it("returns small result json payloads unchanged from getRun", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 const {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -36,10 +39,10 @@ const {
 
 vi.mock("./acp.js", () => ({
   createGeminiAcpExecutor: () => executeGeminiAcp,
-  formatGeminiAcpFallbackMessage: (reason: string) =>
-    `[paperclip] Gemini ACP default unavailable; falling back to Gemini CLI. ${reason} Set engine=acp to require ACP or engine=cli to silence this fallback.\n`,
   resolveGeminiExecutionEngineForRun: async (ctx: { config: Record<string, unknown> }) =>
-    ctx.config.engine === "acp"
+    ctx.config.engine === "cli"
+      ? { engine: "cli", explicit: true }
+      : ctx.config.engine === "acp"
       ? { engine: "acp", explicit: true }
       : { engine: "acp", explicit: false },
 }));
@@ -99,23 +102,11 @@ describe("gemini_local ACP startup fallback", () => {
     vi.clearAllMocks();
   });
 
-  it("falls back to Gemini CLI when auto-selected ACP fails before execution starts", async () => {
+  it("does not start CLI after default ACP fails", async () => {
     const ctx = buildContext();
-
-    const result = await execute(ctx as never);
-
-    expect(result.exitCode).toBe(0);
-    expect(result.summary).toBe("hello");
+    await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
     expect(executeGeminiAcp).toHaveBeenCalledTimes(1);
-    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
-    expect(ctx.onLog).toHaveBeenCalledWith(
-      "stderr",
-      expect.stringContaining("Gemini ACP startup failed"),
-    );
-    expect(ctx.onLog).toHaveBeenCalledWith(
-      "stderr",
-      expect.stringContaining('Unexpected "<<"'),
-    );
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
 
   it("keeps explicit ACP strict when startup fails", async () => {
@@ -125,4 +116,38 @@ describe("gemini_local ACP startup fallback", () => {
 
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
+
+  it.each(["fresh", "resumed", "missing"] as const)(
+    "supplies initial communication guidance at the CLI attempt boundary (%s)", async (state) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "gemini-communication-"));
+      const prompts: string[] = [];
+      try {
+        if (state === "missing") {
+          runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+            exitCode: 1, signal: null, timedOut: false, stdout: "",
+            stderr: "Unknown session 'previous'", pid: 123, startedAt: new Date().toISOString(),
+          });
+        }
+        const ctx = buildContext({ engine: "cli", cwd });
+        await execute({
+          ...ctx,
+          runtime: { ...ctx.runtime, sessionId: state === "fresh" ? null : "previous" },
+          context: { paperclipTaskCommunicationGuidance: "Frozen Slack preferences." },
+          onMeta: async (meta) => { prompts.push(meta.prompt ?? ""); },
+        });
+        if (state === "fresh") {
+          expect(prompts).toHaveLength(1);
+          expect(prompts[0]?.match(/Frozen Slack preferences\./g)).toHaveLength(1);
+        } else {
+          expect(prompts[0]).not.toContain("Frozen Slack preferences.");
+          expect(prompts).toHaveLength(state === "missing" ? 2 : 1);
+          if (state === "missing") {
+            expect(prompts[1]?.match(/Frozen Slack preferences\./g)).toHaveLength(1);
+          }
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
 });

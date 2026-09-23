@@ -33,6 +33,25 @@ representative concurrent list and log polling. The sample must use synthetic
 payloads with production-shaped row counts and result sizes. It must not copy
 production content.
 
+Run the opt-in representative list check with:
+
+```sh
+PAPERCLIP_HEARTBEAT_MEMORY_LOAD_TEST=true pnpm exec vitest run \
+  server/src/__tests__/heartbeat-list-load.test.ts --reporter=verbose
+```
+
+The check creates 24,205 synthetic runs containing more than 1.29 billion
+logical `result_json` characters, issues eight concurrent default list reads,
+requires every response to stop at 200 summary-only rows, and fails if the Node
+process grows by 384 MB or more. The temporary database is deleted afterward.
+
+The 2026-09-22 verification used 24,205 rows and 1,291,640,309 logical JSON
+characters. Eight concurrent reads returned 200 summary-only rows each. Node
+RSS moved from 532,971,520 bytes to a 533,692,416-byte peak, a 720,896-byte
+increase. The pre-fix production observation for the same row count was roughly
+1.29 billion materialized JSON characters per request and overlapping requests
+produced 10–12 GB V8 heaps.
+
 Set the initial steady-state old-space ceiling to 4 GB only when all of these
 conditions hold for the exact release head:
 
