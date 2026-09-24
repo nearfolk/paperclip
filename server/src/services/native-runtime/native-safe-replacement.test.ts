@@ -254,7 +254,7 @@ const support = externalDatabaseUrl
         expect(afterHold!.outcome).toBe("blocked");
       }
     });
-    it("automatically closes an exhausted incident once, preserves ownership, and records no replay", async () => {
+    it("keeps an exhausted incident active once, preserves ownership, and records no replay", async () => {
       const source = await seed(3);
       await reconcileSafeNativeReplacements(db);
       await Promise.all([settleUnrecoverableExecutions(db), settleUnrecoverableExecutions(db)]);
@@ -263,7 +263,7 @@ const support = externalDatabaseUrl
       expect(task).toMatchObject({ status: "blocked", assigneeAgentId: source.agentId, executionRunId: null, checkoutRunId: null });
       const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       expect(actions).toHaveLength(1);
-      expect(actions[0]).toMatchObject({ status: "resolved", outcome: "blocked", evidence: {
+      expect(actions[0]).toMatchObject({ status: "active", outcome: null, evidence: {
         automaticRecovery: { policy: "preserve_without_replay_v1", actionOutcome: "unknown", replay: "blocked", runId: source.runId },
       } });
       const logs = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.runId));
@@ -355,7 +355,7 @@ const support = externalDatabaseUrl
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
       await settleUnrecoverableExecutions(db);
       const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actions[0]!.id));
-      expect(settled).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+      expect(settled).toMatchObject({ status: "active", outcome: null, evidence: { automaticRecovery: { replay: "blocked" } } });
 
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", resultJson: { errorFamily: "provider_quota" } })).toBe(true);
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(false);
