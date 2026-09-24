@@ -300,8 +300,7 @@ export async function deliverReconciledExecutions(
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
  * This is NOT evidence that an external action succeeded or never happened.
- * The active recovery record retains a dispatch hold until actual evidence
- * clears it. Superseded records resolve without replay.
+ * The resolved record retains a dispatch hold until actual evidence clears it.
  */
 export async function settleUnrecoverableExecutions(
   db: Db,
@@ -375,7 +374,6 @@ export async function settleUnrecoverableExecutions(
         inArray(issueRecoveryActions.cause, [
           ...EXECUTION_RECONCILIATION_CAUSES,
         ]),
-        sql`coalesce(${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy', '') <> 'preserve_without_replay_v1'`,
         inArray(heartbeatRuns.status, [
           "failed",
           "timed_out",
@@ -473,7 +471,7 @@ export async function settleUnrecoverableExecutions(
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
         const note = current
-          ? "Automatic recovery stopped. Recorded work is preserved; the recovery action remains active until an authorized operator reconciles the outcome."
+          ? "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         if (current) {
@@ -495,12 +493,12 @@ export async function settleUnrecoverableExecutions(
         await tx
           .update(issueRecoveryActions)
           .set({
-            status: current ? "active" : "resolved",
-            outcome: current ? null : "cancelled",
-            resolvedAt: current ? null : now,
+            status: "resolved",
+            outcome: current ? "blocked" : "cancelled",
+            resolvedAt: now,
             updatedAt: now,
             nextAction: note,
-            resolutionNote: current ? null : note,
+            resolutionNote: note,
             wakePolicy: null,
             monitorPolicy: null,
             evidence: {
@@ -527,7 +525,6 @@ export async function settleUnrecoverableExecutions(
           details: {
             recoveryActionId: action.id,
             outcome: current ? "blocked" : "cancelled",
-            recoveryActionStatus: current ? "active" : "resolved",
             replay: "not_authorized",
           },
         });
