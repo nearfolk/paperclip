@@ -1,5 +1,9 @@
 import { api } from "./client";
 import type {
+  SlackAppConfiguration,
+  UpdateChatEndpointInput,
+  PhotonProjectInspection,
+  PhotonChannelConfiguration,
   ChatPublicationBatchStatus,
   ChatPublicationState,
   ChatPublicationSummary,
@@ -12,7 +16,7 @@ export type {
 } from "@paperclipai/shared";
 
 export type ChatProvider =
-  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "agentmail";
+  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "agentmail" | "imessage-photon";
 export type ChatEndpointStatus =
   | "draft"
   | "verifying"
@@ -26,6 +30,7 @@ export type ChatEndpointSetupAction =
   "configure" | "verify" | "pause" | "resume" | "reconnect" | "remove";
 
 export interface ChatEndpointResource {
+  metadata?: Record<string, unknown>;
   id: string;
   type: string;
   providerResourceId: string;
@@ -33,11 +38,16 @@ export interface ChatEndpointResource {
   availability: "available" | "unavailable" | "removed";
   enabled: boolean;
   detail?: string | null;
+  participants?: string[];
 }
 
 export interface ChatIdentityLink {
+  githubUserId?: string;
+  githubLogin?: string | null;
   id: string;
   principalId: string;
+  /** Latest discovery-only connect command received by this endpoint. */
+  lastConnectAt?: string | null;
   externalLabel: string;
   externalDetail?: string | null;
   paperclipUserId?: string | null;
@@ -70,6 +80,8 @@ export interface ExternalChannelBindingSummary {
 }
 
 export interface ChatIdentityLinkPreview {
+  selfService?: boolean;
+  canConfirm?: boolean;
   endpointId: string;
   companyId: string;
   companyName: string;
@@ -83,6 +95,7 @@ export interface ChatIdentityLinkPreview {
 }
 
 export interface ChatEndpoint {
+  communicationInstructions?: string;
   publicationMode?: "automatic" | "explicit";
   externalExecutionPolicy?: "restricted" | "agent";
   id: string;
@@ -97,6 +110,7 @@ export interface ChatEndpoint {
   botLabel?: string | null;
   botUsername?: string | null;
   botExternalId?: string | null;
+  photonAllocation?: "dedicated" | "shared";
   allowDirectMessages?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople: boolean;
@@ -109,12 +123,16 @@ export interface ChatEndpoint {
   conversations?: ChatConversation[];
   activity?: ChatActivityItem[];
   setup?: {
+    github?: import("@paperclipai/shared").ChatEndpointSetupState["github"];
     step: string;
+    testStartedAt?: string | null;
+    testSkipped?: boolean;
     authorizationUrl?: string | null;
     providerUrl?: string | null;
     webhookUrl?: string | null;
     messagingEndpoint?: string | null;
     command?: string | null;
+    slackApp?: SlackAppConfiguration;
     webhookVerifiedAt?: string | null;
     webhookSecretConfigured?: boolean;
     callbackSurfaces?: {
@@ -176,20 +194,18 @@ export const chatEndpointsApi = {
   ) => api.post<ChatEndpoint>(`/companies/${companyId}/chat-endpoints`, input),
   update: (
     endpointId: string,
-    input: Partial<
-      Pick<
-        ChatEndpoint,
-        "allowDirectMessages" | "allowGroupChats" | "allowUnlinkedPeople"
-      >
-    >,
+    input: UpdateChatEndpointInput,
   ) => api.patch<ChatEndpoint>(`/chat-endpoints/${endpointId}`, input),
   setup: (
     endpointId: string,
     input: {
       action: ChatEndpointSetupAction;
       credentials?: Record<string, string>;
+      photon?: PhotonChannelConfiguration;
     },
   ) => api.post<ChatEndpoint>(`/chat-endpoints/${endpointId}/setup`, input),
+  inspectPhoton: (endpointId: string, input: { projectId: string; projectSecret: string }) =>
+    api.post<PhotonProjectInspection>(`/chat-endpoints/${endpointId}/photon/inspect`, input),
   generateSetupSecret: (endpointId: string) =>
     api.post<ChatEndpointSetupSecret>(
       `/chat-endpoints/${endpointId}/setup-secret`,
@@ -197,6 +213,9 @@ export const chatEndpointsApi = {
     ),
   test: (endpointId: string) =>
     api.post<ChatEndpoint>(`/chat-endpoints/${endpointId}/test`, {}),
+  finishSlackSetup: (endpointId: string) => api.post<ChatEndpoint>(`/chat-endpoints/${endpointId}/finish`, {}),
+  setupTestStatus: (endpointId: string) => api.get<{ messageReceivedAt: string | null }>(`/chat-endpoints/${endpointId}/test-status`),
+  requestIdentityAccess: (token: string) => api.post<{ status: "member" | "pending_approval" }>("/chat-identity-links/request-access", { token }),
   listResources: async (endpointId: string) =>
     rows(
       await api.get<ListResponse<ChatEndpointResource>>(
@@ -244,6 +263,10 @@ export const chatEndpointsApi = {
       await api.get<ListResponse<ChatActivityItem>>(
         `/chat-endpoints/${endpointId}/activity`,
       ),
+    ),
+  listActivityPage: (endpointId: string, cursor?: string) =>
+    api.get<{ items: ChatActivityItem[]; nextCursor: string | null }>(
+      `/chat-endpoints/${endpointId}/activity?limit=25${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
     ),
   getIssueBinding: (issueId: string) =>
     api.get<ExternalChannelBindingSummary | null>(

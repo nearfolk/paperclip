@@ -88,7 +88,27 @@ RUN set -eux; \
 COPY packages/paperclip-runner/rust-toolchain.toml /tmp/runner-toolchain/rust-toolchain.toml
 RUN cd /tmp/runner-toolchain && rustup show
 
-FROM rust-toolchain AS runner-build
+# Pin the recipe generator and its dependency lockfile. It is a build-only tool
+# and uses the same package-owned compiler as both native build stages.
+FROM rust-toolchain AS rust-chef
+RUN cd /tmp/runner-toolchain && cargo install cargo-chef --version 0.1.73 --locked
+
+FROM rust-chef AS runner-plan
+WORKDIR /app/packages/paperclip-runner
+COPY packages/paperclip-runner/rust-toolchain.toml ./
+COPY packages/paperclip-runner/runner ./runner
+RUN cd runner && cargo chef prepare --recipe-path /tmp/runner-recipe.json
+
+FROM rust-chef AS runner-deps
+WORKDIR /app/packages/paperclip-runner/runner
+COPY packages/paperclip-runner/rust-toolchain.toml ../
+# The recipe changes only when dependency manifests, the lockfile, or target
+# metadata change. Source edits can reuse this compiled dependency layer.
+COPY --from=runner-plan /tmp/runner-recipe.json /tmp/runner-recipe.json
+RUN cargo chef cook --release --locked --package paperclip-runner-core --bin paperclip-runnerd --recipe-path /tmp/runner-recipe.json \
+  && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
+
+FROM runner-deps AS runner-build
 WORKDIR /app/packages/paperclip-runner
 # Rust embeds protocol schemas and fixtures with include_str!. Keep those
 # alongside the complete Cargo workspace so every compile-time input keys
@@ -108,16 +128,17 @@ COPY --from=deps /app /app
 COPY . .
 RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -type f -exec touch -d @0 {} + \
   && touch -d @0 packages/paperclip-runner/rust-toolchain.toml
+# Both the browser bundle and server stamp need the source commit. Declare it
+# after the stable dependency layers, before either application build.
+ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
-# next RUN as an environment variable, so declare it here — in the build
-# stage — before the server build. The production stage below declares the
+# next RUN as an environment variable. The production stage below declares the
 # same ARG again for the runtime fallback; an ARG goes out of scope at the
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
-ARG PAPERCLIP_BUILD_COMMIT=""
 ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)

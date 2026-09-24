@@ -11,7 +11,6 @@ import {
   decisionTrainingExamples,
   decisionTriage,
   decisions,
-  heartbeatRunEvents,
   heartbeatRuns,
   inboxDismissals,
   invites,
@@ -49,13 +48,14 @@ import type {
   IssueReviewPolicy,
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
+import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
   BLOCKER_ATTENTION_MAX_NODES,
   issueService,
 } from "./issues.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { executionIssueCondition } from "./issue-visibility.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isProspectiveBlockedTransition } from "./routable-blocked.js";
 import { evaluateAgentInvokability, type AgentOrgRow } from "./agent-invokability.js";
@@ -104,7 +104,6 @@ const SOURCE_RANK: Record<AttentionSourceKind, number> = {
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
 const OPEN_RECOVERY_STATUSES = ["active", "escalated"] as const;
 const HUMAN_RECOVERY_OWNER_TYPES = ["user", "board"] as const;
-const FAILED_RUN_STATUSES = ["failed", "timed_out"] as const;
 const DETAIL_EXCERPT_LENGTH = 160;
 const DETAIL_IMAGE_LIMIT = 3;
 const OPEN_DECISION_DEFAULT_LIMIT = 500;
@@ -844,7 +843,7 @@ async function issueSummaryMap(db: Db, companyId: string, issueIds: Array<string
       eq(issues.projectWorkspaceId, projectWorkspaces.id),
       eq(projectWorkspaces.companyId, companyId),
     ))
-    .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids), visibleIssueCondition()));
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids), executionIssueCondition()));
   return new Map(rows.map((row) => [row.id, {
     id: row.id,
     companyId: row.companyId,
@@ -1586,7 +1585,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           updatedAt: issues.updatedAt,
         })
         .from(issues)
-        .where(and(eq(issues.companyId, companyId), eq(issues.status, "in_review"), visibleIssueCondition()))
+        .where(and(eq(issues.companyId, companyId), eq(issues.status, "in_review"), executionIssueCondition()))
         .orderBy(desc(issues.updatedAt), desc(issues.id));
       const reviewIssueIds = reviewRows.map((row) => row.id);
       const pendingReviewApprovalRows = reviewIssueIds.length === 0
@@ -1662,40 +1661,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }));
       }
 
-      const exhaustedRunRows = await db
-        .select({
-          id: heartbeatRuns.id,
-          companyId: heartbeatRuns.companyId,
-          agentId: heartbeatRuns.agentId,
-          agentName: agents.name,
-          status: heartbeatRuns.status,
-          error: heartbeatRuns.error,
-          errorCode: heartbeatRuns.errorCode,
-          contextSnapshot: heartbeatRuns.contextSnapshot,
-          createdAt: heartbeatRuns.createdAt,
-          updatedAt: heartbeatRuns.updatedAt,
-          finishedAt: heartbeatRuns.finishedAt,
-          exhaustionMessage: heartbeatRunEvents.message,
-        })
-        .from(heartbeatRuns)
-        .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-        .innerJoin(heartbeatRunEvents, eq(heartbeatRunEvents.runId, heartbeatRuns.id))
-        .where(and(
-          eq(heartbeatRuns.companyId, companyId),
-          eq(agents.companyId, companyId),
-          notInArray(agents.status, ["terminated"]),
-          inArray(heartbeatRuns.status, [...FAILED_RUN_STATUSES]),
-          eq(heartbeatRunEvents.companyId, companyId),
-          eq(heartbeatRunEvents.eventType, "lifecycle"),
-          sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
-        ))
-        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRunEvents.id));
-
-      const latestExhaustedByRunId = new Map<string, (typeof exhaustedRunRows)[number]>();
-      for (const row of exhaustedRunRows) {
-        if (!latestExhaustedByRunId.has(row.id)) latestExhaustedByRunId.set(row.id, row);
-      }
-      const failedRows = [...latestExhaustedByRunId.values()];
+      const failedRows = await listAttentionExhaustedRuns(db, companyId);
       const failedIssueIds = failedRows.map((row) => readRunIssueId(row.contextSnapshot));
       const failedAgentIds = [...new Set(failedRows.map((row) => row.agentId))];
       const oldestFailedRunCreatedAt = failedRows.reduce<Date | null>((oldest, row) => {

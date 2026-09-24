@@ -1,3 +1,4 @@
+import { nativePhotonInteraction } from "./photon/interactions.js";
 import { randomBytes } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -16,9 +17,8 @@ import type {
   RequestConfirmationInteraction,
   SafeExternalChatCardAction,
 } from "@paperclipai/shared";
-import { readConfigFile } from "../config-file.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
-import { safeChatTaskUrl } from "./chat-task-url.js";
+import { publicChatTaskUrl } from "./chat-task-url.js";
 import {
   chatQuestionFormActionRecords,
   createChatQuestionFormDraft,
@@ -109,16 +109,7 @@ function terminalNativeInteractionCopy(
   return null;
 }
 
-export function publicChatInteractionTaskUrl(issueId: string): string | null {
-  const configured =
-    process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL?.trim() ||
-    process.env.BETTER_AUTH_URL?.trim() ||
-    process.env.BETTER_AUTH_BASE_URL?.trim() ||
-    process.env.PAPERCLIP_PUBLIC_URL?.trim() ||
-    readConfigFile()?.auth?.publicBaseUrl?.trim() ||
-    process.env.PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL?.trim();
-  return safeChatTaskUrl(configured, issueId);
-}
+export const publicChatInteractionTaskUrl = publicChatTaskUrl;
 
 /**
  * Provider callbacks carry this compact, cryptographically random action id.
@@ -313,6 +304,7 @@ export async function enqueueIssueInteractionChatPublications(
           )
         : null;
     const supportsCallbacks =
+      endpoint.provider !== "imessage-photon" &&
       formDraft === null &&
       question !== null &&
       endpoint.capabilities.actions === true;
@@ -430,7 +422,13 @@ export async function enqueueIssueInteractionChatPublications(
       .onConflictDoNothing()
       .returning();
     const publication = rows[0];
-    if (publication && formDraft) {
+    if (publication && endpoint.provider === "imessage-photon" && nativePhotonInteraction(interaction)) {
+      const reference = randomBytes(9).toString("base64url");
+      await db.insert(chatActions).values({ companyId: interaction.companyId, endpointId: endpoint.id, conversationId: conversation.id,
+        kind: "photon_interaction", providerActionId: `photon:${reference}`,
+        payload: { version: 1, reference, interactionId: interaction.id, publicationId: publication.id, sessionGeneration: conversation.sessionGeneration,
+          expiresAt: new Date(publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS).toISOString() }, status: "issued" });
+    } else if (publication && formDraft) {
       await db.insert(chatActions).values(
         chatQuestionFormActionRecords(formDraft, {
           companyId: interaction.companyId,
@@ -540,10 +538,12 @@ export async function enqueueTerminalIssueInteractionChatPublications(
       and(
         eq(chatActions.companyId, interaction.companyId),
         inArray(chatActions.kind, [
+          "photon_interaction",
           "question_answer",
           "question_form_open",
           "question_form_submit",
           "confirmation_response",
+          "photon_interaction",
         ]),
         eq(chatActions.status, "issued"),
         eq(
@@ -763,6 +763,7 @@ export async function cancelPendingIssueInteractionChatPublications(
           "question_form_open",
           "question_form_submit",
           "confirmation_response",
+          "photon_interaction",
         ]),
         eq(chatActions.status, "issued"),
         inArray(sql<string>`${chatActions.payload}->>'interactionId'`, [

@@ -873,7 +873,7 @@ describe("Capability live runnerd and Codex session", () => {
     expect(session.snapshot().config).toMatchObject({
       provider: "opencode",
       driver: "opencode_server",
-      providerVersion: "1.18.29",
+      providerVersion: "1.18.32",
       requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
     });
     await service.shutdown(session.id);
@@ -1831,7 +1831,11 @@ describe("Capability live runnerd and Codex session", () => {
         ...binding,
         workingDirectory: directory,
         attemptId: "attempt-real-killed",
-        turnTimeoutMs: 2_000,
+        // The kill below ends this turn, so the timeout is only a backstop.
+        // A short one races a loaded machine and settles the turn first,
+        // which fails the assertion that the turn was still running when the
+        // process died — the flake that starves this lane in CI.
+        turnTimeoutMs: 60_000,
       });
       const observed = observeSavedEffect(store, {
         ...binding,

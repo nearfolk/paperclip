@@ -56,6 +56,40 @@ stdin/stdout bridge admits the pinned Claude and Codex ACPX profiles. It
 validates the exact model, session identity, tool catalog, structured input,
 and terminal settlement at the process boundary. Pi remains unavailable.
 
+Native Claude skill assignments travel in the runtime-context snapshot through
+runnerd to the ACPX sidecar. After acquiring the provider lifetime lease, the
+host materializes the assigned bundles under the isolated Claude home's
+`skills/` directory before launch. Reopening a provider refreshes that snapshot;
+project and ambient host settings remain excluded. This path is separate from
+the legacy `claude_local` adapter's remote skill staging.
+
+The isolated Claude settings pin both `model` and `availableModels` to the
+user's requested ID. This keeps ACP from replacing an exact ID with a picker
+alias during selection and verification. Users can keep selecting models from
+the normal Claude catalog or entering custom IDs; unavailable models still fail
+at the provider rather than silently falling back.
+
+ACPX Claude defaults to `approve-all`, shown as **Full auto (approve all)**.
+OpenCode defaults to `allow`; native Codex defaults to `never` (no approval
+pauses). These defaults cover all assigned tools and connections, including
+provider-native operations. Full auto is resolved consistently for agent
+creation, adapter conversion, direct driver launches, and fresh/resumed turns.
+Explicitly stored restrictive modes still apply.
+
+The runner's authenticated bridge and controller still enforce company access,
+action claims, task modes, and governed approvals. Provider permission defaults
+do not change workspace isolation or grant credentials or connection access.
+`approve-paperclip` remains an optional narrower mode for assigned planning and
+task tools; `approve-reads` allows assigned reads; `deny-all` rejects requests.
+None of these restrictive modes is the default.
+
+This runtime has no interactive permission handler. An operation that still
+requires approval stops the turn with `approval_required`. The server marks the
+task blocked, exposes the permission action to the operator, and disables
+automatic retry. The operator must review the operation and the agent's
+permission setting before retrying. Company access checks still run when each
+Paperclip tool executes.
+
 Runnerd selects only qualified provider profiles. Claude Managed and AWS
 AgentCore receive immutable company-profile snapshots with explicit retention,
 spend, and invocation limits. No provider process receives a Paperclip API
@@ -379,3 +413,5 @@ then open the protocol inspector to review events and reducer state. Expand a
 Terminal row and its nested **Debug details** disclosure to inspect every
 canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
+
+`create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).

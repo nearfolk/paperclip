@@ -76,8 +76,16 @@ export const createChatEndpointSchema = z
   })
   .strict();
 
+export const slackAppConfigurationSchema = z.object({
+  appName: z.string().trim().min(1, "Enter a Slack app name.").max(35),
+  botName: z.string().trim().min(1).max(80).regex(/^[a-z0-9._-]+$/, "Use lowercase letters, numbers, dots, hyphens, or underscores for the bot name."),
+  command: z.string().trim().min(2).max(32).regex(/^\/[a-z0-9_-]+$/, "Start the command with / and use lowercase letters, numbers, hyphens, or underscores."),
+}).strict();
+
 export const updateChatEndpointSchema = z
   .object({
+    communicationInstructions: multilineTextSchema.pipe(z.string().trim().max(4000)).optional(),
+    slackApp: slackAppConfigurationSchema.optional(),
     allowDirectMessages: z.boolean().optional(),
     allowGroupChats: z.boolean().optional(),
     allowUnlinkedPeople: z.boolean().optional(),
@@ -86,6 +94,17 @@ export const updateChatEndpointSchema = z
   .refine((value) => Object.keys(value).length > 0, {
     message: "At least one chat endpoint field is required",
   });
+
+export const photonProjectIdSchema = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9_-]+$/);
+export const photonLineIdSchema = z.string().trim().min(1).max(63).regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/);
+export const photonChannelConfigurationSchema = z.union([
+  z.object({ allocation: z.literal("dedicated").default("dedicated"), projectId: photonProjectIdSchema, lineId: photonLineIdSchema }).strict(),
+  z.object({ allocation: z.literal("shared"), projectId: photonProjectIdSchema }).strict(),
+]);
+export const inspectPhotonProjectSchema = z.object({
+  projectId: photonProjectIdSchema,
+  projectSecret: z.string().min(1).max(4096),
+}).strict();
 
 export const configureChatEndpointSchema = z
   .object({
@@ -98,11 +117,12 @@ export const configureChatEndpointSchema = z
       "remove",
     ]),
     credentials: chatEndpointCredentialsSchema.optional(),
+    photon: photonChannelConfigurationSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
     if (
-      value.credentials &&
+      (value.credentials || value.photon) &&
       value.action !== "configure" &&
       value.action !== "reconnect"
     ) {

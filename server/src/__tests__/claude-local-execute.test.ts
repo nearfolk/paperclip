@@ -9,6 +9,7 @@ import {
   claudeSessionCwdMatchesExecutionTarget,
   execute,
   resetClaudeCliCapabilitiesCacheForTests,
+  sessionCodec,
 } from "@paperclipai/adapter-claude-local/server";
 
 async function writeFailingClaudeCommand(
@@ -900,11 +901,8 @@ describe("claude execute", () => {
         },
       });
       const capture = JSON.parse(await fs.readFile(capturePath1, "utf8")) as CapturePayload;
-      expect(capture.argv).toContain("--allowedTools");
-      expect(capture.argv).toContain(
-        "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write",
-      );
-      expect(capture.argv).not.toContain("--dangerously-skip-permissions");
+      expect(capture.argv).toContain("--dangerously-skip-permissions");
+      expect(capture.argv).not.toContain("--allowedTools");
       expect(capture.claudeConfigDir).toBe(path.join(remoteWorkspace, ".paperclip-runtime", "claude", "config"));
       expect(capture.claudeConfigEntries).toContain("settings.json");
       expect(capture.paperclipApiUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
@@ -1156,6 +1154,14 @@ describe("claude execute", () => {
           },
         },
         context: {},
+        runtimeMcp: {
+          getServers: () => [{
+            name: "Paperclip projects",
+            url: "http://localhost:3100/api/mcp/project-tools",
+            connectionId: "paperclip-project-tools",
+            token: "run-jwt-token",
+          }],
+        },
         authToken: "run-jwt-token",
         onLog: async () => {},
       });
@@ -1179,7 +1185,7 @@ describe("claude execute", () => {
         },
         runtime: {
           sessionId: null,
-          sessionParams: first.sessionParams ?? null,
+          sessionParams: sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams ?? null)),
           sessionDisplayId: null,
           taskKey: null,
         },
@@ -1230,6 +1236,14 @@ describe("claude execute", () => {
             truncated: false,
             fallbackFetchNeeded: false,
           },
+        },
+        runtimeMcp: {
+          getServers: () => [{
+            name: "Paperclip projects",
+            url: "http://localhost:3100/api/mcp/project-tools",
+            connectionId: "paperclip-project-tools",
+            token: "next-run-jwt-token",
+          }],
         },
         authToken: "run-jwt-token",
         onLog: async () => {},

@@ -1,12 +1,15 @@
-import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
+import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
+import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "./native-local-process-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
-  agents, approvals, issueApprovals, issueThreadInteractions,
+  agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
-  issues, nativeRunFinalizations, type Db,
+  issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
@@ -14,6 +17,7 @@ import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
+import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
@@ -21,6 +25,43 @@ const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
 function processStopped(pid: number): boolean {
   try { process.kill(pid, 0); return false; }
   catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+/** Validate the whole saved queue, preserving order and original authors.
+ * Call again under the task lock before adopting IDs into a new run.
+ */
+export async function undeliveredLegacyUserCommentIds(
+  db: Db, companyId: string, issueId: string, agentId: string, commentIds: string[],
+): Promise<string[]> {
+  if (!commentIds.length) return [];
+  const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+    inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
+    isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
+    sql`nullif(trim(${issueComments.body}), '') is not null`,
+    sql`nullif(trim(${issueComments.authorUserId}), '') is not null`,
+  ));
+  const valid = new Set(comments.map(comment => comment.id));
+  const previous = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    // A queued turn cancelled before dispatch has not consumed input, whatever
+    // cancelled it (pause, stale assignment, or rejected admission). Reserved
+    // native identity/process metadata is not proof that its prompt was sent.
+    // Admission separately verifies process termination before a new turn.
+    sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null)`,
+    or(...commentIds.map(id => or(
+      sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${id}`,
+      sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> ${JSON.stringify([id])}::jsonb`,
+    ))),
+  ));
+  for (const { context } of previous) {
+    if (typeof context?.wakeCommentId === "string") valid.delete(context.wakeCommentId);
+    if (Array.isArray(context?.wakeCommentIds)) {
+      for (const id of context.wakeCommentIds) if (typeof id === "string") valid.delete(id);
+    }
+  }
+  return commentIds.filter(id => valid.has(id));
 }
 
 /** Called under the issue lock, in the transaction that creates the new turn.
@@ -32,6 +73,10 @@ export async function admitExplicitNativeContinuation(input: {
   actorType: string | null | undefined; actorId: string | null | undefined;
   reason: string | null; commentId: string | null; successorRunId: string;
   failedRunId?: string | null;
+  /** Server-recorded board intent to send an existing legacy message queue. */
+  queuedCommentInterruptId?: string;
+  /** Internal delivery of an unconsumed, user-authored legacy queue entry. */
+  queuedCommentRequestId?: string;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string } | null> {
@@ -40,22 +85,50 @@ export async function admitExplicitNativeContinuation(input: {
   if (input.actorType !== "user" || !actorId) return null;
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
-  if (!retry && (!commentId || !z.string().guid().safeParse(commentId).success ||
+  if (!retry && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
       !["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""))) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
   if (!task || task.assigneeAgentId !== agentId || ["done", "cancelled"].includes(task.status)) return null;
-  const [comment] = retry ? [] : await db.select().from(issueComments).where(and(
+  const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorId}`,
+  )) : [];
+  const response = interruptQueue
+    ? await readQueuedInteractionResponse(db, companyId, issueId, interruptQueue.payload) : null;
+  const queuedInterrupt = Boolean(interruptQueue && (response || (commentId &&
+    queuedCommentIdsFromWakePayload(interruptQueue.payload).includes(commentId))));
+  if (input.queuedCommentInterruptId && !queuedInterrupt) return null;
+  const [savedQueue] = input.queuedCommentRequestId ? await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, input.queuedCommentRequestId),
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+  )) : [];
+  const queuedRequest = Boolean(savedQueue && commentId &&
+    !savedQueue.idempotencyKey?.startsWith("chat-inbound:") &&
+    queuedCommentIdsFromWakePayload(savedQueue.payload).includes(commentId));
+  if (input.queuedCommentRequestId && !queuedRequest) return null;
+  if (queuedRequest) {
+    const ids = queuedCommentIdsFromWakePayload(savedQueue!.payload);
+    const undelivered = await undeliveredLegacyUserCommentIds(db, companyId, issueId, agentId, ids);
+    if (undelivered.length !== ids.length) return null;
+  }
+  const [comment] = retry || response ? [] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
-    eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
+    queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
   ));
-  if (!retry && !comment?.body.trim()) return null;
-  const authorizedAt = comment?.createdAt ?? new Date();
+  if (!retry && !response && !comment?.body.trim()) return null;
+  const authorizedAt = response?.comment.createdAt ?? comment?.createdAt ?? new Date();
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
+  if (queuedInterrupt && !isConversationAdapter(agent.adapterType) && !response?.source.requiresFreshSession) return null;
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
@@ -74,17 +147,19 @@ export async function admitExplicitNativeContinuation(input: {
   if (pendingInteraction || pendingApproval) return blocked("decision_pending", "A pending approval or question must be resolved before this message can start.");
 
   const sources: Run[] = [];
+  const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
+  const cancelledStartupIds = new Set<string>();
   for (const action of actions) {
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
     if (typeof runId !== "string") return blocked("source_missing", "The stopped run could not be identified. Your message is saved.");
     // Text comparison keeps malformed historical evidence a hold, not a UUID cast error.
-    const [run] = await db.select().from(heartbeatRuns).where(and(
+    let [run] = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id}::text = ${runId}`,
     ));
     if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
         (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
         !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
-    if (authorizedAt <= run.finishedAt) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
+    if (!queuedInterrupt && !queuedRequest && authorizedAt <= run.finishedAt) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
     if (adapterExecutionControls.has(run.id)) return blocked("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
     const unusedAdmission = run.status === "cancelled" && !run.startedAt &&
       run.errorCode === "execution_reconciliation_required" &&
@@ -92,6 +167,13 @@ export async function admitExplicitNativeContinuation(input: {
     const legacyUserTurn = run.runtimeMode === "legacy" &&
       action.cause === "legacy_execution_requires_reconciliation" &&
       isConversationAdapter(agent.adapterType);
+    if ((queuedInterrupt || queuedRequest) && !legacyUserTurn && !unusedAdmission &&
+        !(queuedInterrupt && response?.source.requiresFreshSession && run.runtimeMode === "native")) return null;
+    // Saved input is a request for a new turn, never permission to undo an
+    // operator Stop or redeliver a message already consumed by this run.
+    if (queuedRequest && !queuedInterrupt && ((run.status === "cancelled" && !unusedAdmission) ||
+        run.contextSnapshot?.wakeCommentId === commentId ||
+        (Array.isArray(run.contextSnapshot?.wakeCommentIds) && run.contextSnapshot.wakeCommentIds.includes(commentId)))) return null;
     if (legacyUserTurn) {
       const historicalAdapter = await historicalAdapterType(db, run);
       // A settings change never converts a known process/webhook execution into
@@ -101,12 +183,38 @@ export async function admitExplicitNativeContinuation(input: {
     // For pre-upgrade rows without adapter evidence, only a new explicit user
     // turn is allowed, after the termination proofs below. This does not infer
     // an old adapter type, certify old outcomes, or authorize automatic replay.
-    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn) return null;
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, run.id),
     )).for("update");
-    if (coordinator && (coordinator.phase !== "terminal_failure" || coordinator.leaseOwner ||
-        coordinator.resultId || coordinator.failureDetail?.successorRunId)) return blocked("controller_settling", "Waiting for the previous run to finish recovery. Your message will start automatically.");
+    // Same lock order as the native claim. Re-read the run while holding both
+    // locks before accepting the never-claimed startup proof.
+    const [lockedRun] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, run.id),
+    )).for("update");
+    if (!lockedRun || lockedRun.status !== run.status || lockedRun.agentId !== run.agentId ||
+        lockedRun.finishedAt?.getTime() !== run.finishedAt.getTime()) return null;
+    run = lockedRun;
+    const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
+    if (cancelledStartup) cancelledStartupIds.add(run.id);
+    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
+    // A provider failure can finish the normal result/assessment commit path.
+    // Its accepted failed result is immutable history, not a live controller.
+    // Only a new user turn may pass this gate; the process/lease stop proofs
+    // below remain mandatory and no previous action is automatically replayed.
+    const [committedFailure] = coordinator?.phase === "committed" && coordinator.resultId && run.status === "failed"
+      ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
+          eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
+          eq(nativeRunResults.runId, run.id), eq(nativeRunResults.id, coordinator.resultId),
+          eq(nativeRunResults.schemaStatus, "accepted"),
+          sql`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState' = 'failed'`,
+        )).limit(1)
+      : [];
+    if (!cancelledStartup && coordinator && (
+        (coordinator.phase !== "terminal_failure" && !committedFailure) || coordinator.leaseOwner ||
+        (coordinator.resultId && !committedFailure) || coordinator.failureDetail?.successorRunId)) return blocked("controller_settling",
+          run.status === "cancelled" && !coordinator.leaseOwner
+            ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
+            : "Waiting for the previous run to finish recovery. Your message will start automatically.");
     const leases = await db.select()
       .from(environmentLeases).where(and(
         eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
@@ -120,13 +228,22 @@ export async function admitExplicitNativeContinuation(input: {
       }))) return null;
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
-      if (!unusedAdmission) {
+      if (!unusedAdmission && !cancelledStartup) {
         // A missing process identity is not evidence that a provider exited.
         if (!run.processPid && !run.processGroupId &&
-            !await hasNativeLocalProcessStop(db, companyId, run.id)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
+            !await hasNativeLocalProcessStop(db, companyId, run.id) &&
+            !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
         if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
         if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
       }
+    }
+    if (!remote && run.runtimeMode === "native" && run.errorCode === "native_session_cleanup_quarantined") {
+      // This is new user input, never permission to retry the interrupted turn.
+      if (retry) return blocked("cleanup_quarantined", "Send a new message after the previous provider has stopped.");
+      const { verifyStoppedNativeSessionForContinuation } = await import("./native-runtime/native-session-executor.js");
+      const stopped = await verifyStoppedNativeSessionForContinuation(db, run);
+      if (!stopped) return blocked("local_cleanup", "Waiting for the previous provider and its tools to stop. Your message is saved.");
+      stoppedSessions.push(stopped);
     }
     sources.push(run);
   }
@@ -146,8 +263,29 @@ export async function admitExplicitNativeContinuation(input: {
     context: { previousRunId: previous.id, wakeCommentId: commentId },
     summary: null, exposeLowTrustRaw: false });
   if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
-  const authorization = { actorId, commentId, ...(retry ? { failedRunId: input.failedRunId } : {}), runId: input.successorRunId,
+  for (const stopped of stoppedSessions) {
+    if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
+    await appendHeartbeatRunEvent(db, {
+      companyId, runId: String(stopped.evidence.runId), agentId,
+      eventType: "native.stopped_conversation_verified", stream: "system", level: "info",
+      message: "The old runner and provider stopped. New user input will use a fresh session; prior action outcomes remain recorded.",
+      payload: stopped.evidence,
+    });
+  }
+  const authorization = { actorId, commentId, ...(response ? { interactionId: response.source.interactionId } : {}), ...(retry ? { failedRunId: input.failedRunId } : {}),
+    ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
+    ...(queuedRequest ? { queuedCommentRequestId: input.queuedCommentRequestId } : {}), runId: input.successorRunId,
     previousRunId: previous.id, recordedAt: new Date().toISOString() };
+  for (const runId of cancelledStartupIds) {
+    await db.update(nativeRunFinalizations).set({
+      phase: "terminal_failure", failureCode: "native_startup_cancelled", nextAttemptAt: null,
+      controlDeadlineAt: null, updatedAt: new Date(),
+    }).where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId)));
+    await db.update(heartbeatRuns).set({
+      ...(nativeSources.some(run => run.id === runId) ? { nativePhase: "terminal_failure", nativePhaseUpdatedAt: new Date() } : {}),
+      executionControlDeadlineAt: null,
+    }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+  }
   if (nativeSources.length) await db.update(nativeRunFinalizations).set({
     failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),

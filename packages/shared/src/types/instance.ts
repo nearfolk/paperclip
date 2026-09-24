@@ -53,6 +53,13 @@ export interface InstanceExperimentalSettings {
    */
   enableManagedSandboxOnly: boolean;
   enableIsolatedWorkspaces: boolean;
+  /**
+   * Move the execution workspace default for a project that carries no policy
+   * of its own from the shared project checkout to an isolated per-task
+   * worktree. Inert unless `enableIsolatedWorkspaces` is also on, and never
+   * overrides a project that stores its own policy.
+   */
+  enableIsolatedWorkspacesByDefault: boolean;
   enableStreamlinedLeftNavigation: boolean;
   /**
    * Use the streamlined shell, navigation, and contextual-sidebar experience.
@@ -64,8 +71,11 @@ export interface InstanceExperimentalSettings {
   enableApps: boolean;
   /** Exposes chat connector setup and Board surfaces; existing delivery continues when hidden. */
   enableChatConnectors: boolean;
+  /** Exposes MCP aggregator setup; existing connections keep running when hidden. */
+  enableMcpAggregators: boolean;
   enablePipelines: boolean;
   enableCases: boolean;
+  enableAgentChat: boolean;
   enableConferenceRoomChat: boolean;
   enableClassicTaskInterface: boolean;
   enableIssuePlanDecompositions: boolean;

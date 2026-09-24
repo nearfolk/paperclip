@@ -1,4 +1,8 @@
 export const queryKeys = {
+  agentChats: {
+    detail: (companyId: string | null, userId: string | null, agentId: string | undefined) =>
+      ["agent-chat", companyId, userId, agentId] as const,
+  },
   companies: {
     /**
      * Prefix for everything company-shaped. Matches the list, details and stats
@@ -46,8 +50,6 @@ export const queryKeys = {
       ["tools", "connection", connectionId, "installs"] as const,
     connectionGrants: (connectionId: string) =>
       ["tools", "connection", connectionId, "grants"] as const,
-    composioServices: (connectionId: string) =>
-      ["tools", "connection", connectionId, "composio-services"] as const,
     catalog: (connectionId: string) => ["tools", "connection", connectionId, "catalog"] as const,
     connectionActivity: (connectionId: string) =>
       ["tools", "connection", connectionId, "activity"] as const,

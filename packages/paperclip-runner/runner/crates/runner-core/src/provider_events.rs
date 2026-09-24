@@ -19,6 +19,24 @@ pub struct NormalizedProviderEvent {
     pub payload: Value,
 }
 
+/// The facade closes provider-turn authority on its terminal notification.
+/// Commit any result synthesized at that boundary before the turn terminal,
+/// then publish the run terminal. Already committed semantic results and
+/// active goals supply no new result and keep their existing event order.
+pub(crate) fn with_terminal_outcome(
+    provider_events: Vec<NormalizedProviderEvent>,
+    outcome_events: Vec<NormalizedProviderEvent>,
+) -> Vec<NormalizedProviderEvent> {
+    let (results, terminals): (Vec<_>, Vec<_>) = outcome_events
+        .into_iter()
+        .partition(|event| event.event_type == "run.result.proposed");
+    results
+        .into_iter()
+        .chain(provider_events)
+        .chain(terminals)
+        .collect()
+}
+
 pub(crate) fn normalized_codex_terminal_event_type(
     method: &str,
     params: &Value,
@@ -86,6 +104,16 @@ impl AcpxEventProjectionContext {
         self.provider_turn_id.as_deref().unwrap_or(&self.turn_id)
     }
 
+    fn assistant_item_id(&self) -> String {
+        // Recovery can submit multiple provider turns within one PRP run. Keep
+        // each delivered answer distinct while coalescing its streaming deltas.
+        acpx_message_item_id(
+            "",
+            &format!("{}:{}", self.item_id, self.active_provider_turn_id()),
+            "assistant",
+        )
+    }
+
     fn correlation(&self) -> Value {
         json!({
             "runId": self.run_id,
@@ -129,11 +157,10 @@ pub fn project_acpx_state_event(
                 {
                     payload.insert("providerItemId".to_owned(), Value::String(provider_item_id));
                 }
-                // PRP exposes one canonical assistant item for the turn. This
-                // lets streamed deltas and the completed provider response
-                // coalesce by identity while retaining the opaque ACP message
-                // identity as trace metadata above.
-                payload.insert("itemId".to_owned(), Value::String(context.item_id.clone()));
+                payload.insert(
+                    "itemId".to_owned(),
+                    Value::String(context.assistant_item_id()),
+                );
             }
             Ok(vec![event])
         }
@@ -237,7 +264,7 @@ pub fn project_acpx_state_event(
                 EventPriority::P1,
                 json!({
                     "provider": "acpx",
-                    "itemId": context.item_id,
+                    "itemId": context.assistant_item_id(),
                     "kind": "agentMessage",
                     "status": "completed",
                     "channel": "final",
@@ -1141,6 +1168,9 @@ fn normalize_acpx_tool_call(
                 .unwrap_or(Value::Null)
         },
     });
+    if let Some(input_updated) = payload.get("inputUpdated").and_then(Value::as_bool) {
+        normalized["inputUpdated"] = Value::Bool(input_updated);
+    }
     if let (Some(object), Value::Object(output)) =
         (normalized.as_object_mut(), bounded_output(&output))
     {
@@ -1394,6 +1424,33 @@ mod tests {
                 ),
                 Value::String(location.to_owned()),
             );
+        }
+    }
+
+    #[test]
+    fn preserves_only_typed_acpx_input_update_marker() {
+        for input_updated in [
+            Value::Bool(true),
+            Value::Bool(false),
+            json!("secret"),
+            Value::Null,
+        ] {
+            let events = normalize_acpx_tool_call(
+                &json!({
+                    "type": "tool_call", "tag": "tool_call_update", "status": "pending",
+                    "title": "mcp__paperclip__hire_agent", "inputUpdated": input_updated,
+                    "rawInput": {"private": "secret-input"},
+                }),
+                "provider-tool-id",
+                "execute",
+            );
+            assert_eq!(events[0].event_type, "tool.execution.progressed");
+            if input_updated.is_boolean() {
+                assert_eq!(events[0].payload["inputUpdated"], input_updated);
+            } else {
+                assert!(events[0].payload.get("inputUpdated").is_none());
+            }
+            assert!(!events[0].payload.to_string().contains("secret"));
         }
     }
 

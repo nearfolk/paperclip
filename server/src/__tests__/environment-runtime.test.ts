@@ -21,6 +21,7 @@ import {
   environments,
   executionWorkspaces,
   heartbeatRuns,
+  issues,
   plugins,
   projects,
 } from "@paperclipai/db";
@@ -39,6 +40,7 @@ import * as sandboxProviderRuntime from "../services/sandbox-provider-runtime.ts
 import * as environmentsModule from "../services/environments.ts";
 import { logger } from "../middleware/logger.ts";
 import { environmentService } from "../services/environments.ts";
+import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
@@ -215,6 +217,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
     await db.delete(environmentLeases);
+    await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
@@ -463,6 +466,57 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
   }
 
+  it.each(["stopped", "missing", "wrong-lease", "error"])(
+    "startup cancellation is run-scoped and needs a matching receipt: %s",
+    async (outcome) => {
+      const { pluginId, companyId, runId, reusableLease, environment } = await seedReusablePluginSandboxLease();
+      const other = await environmentService(db).acquireLease({
+        companyId, environmentId: environment.id, heartbeatRunId: null,
+        leasePolicy: "ephemeral", provider: "fake-plugin", providerLeaseId: "other-sandbox",
+      });
+      const call = vi.fn(async () => {
+        if (outcome === "error") throw new Error("provider unavailable");
+        if (outcome === "missing") return undefined;
+        return { providerLeaseId: outcome === "wrong-lease" ? "other-sandbox" : reusableLease.providerLeaseId, state: "stopped" };
+      });
+      const workerManager = {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentReleaseLease"] }),
+      } as unknown as PluginWorkerManager;
+      const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+      await runtimeWithPlugin.releaseRunLeases(runId, "released", undefined, "stop_and_retain", true);
+      expect(call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
+        companyId, providerLeaseId: reusableLease.providerLeaseId, cancelActiveWork: true,
+      }), expect.any(Number));
+      expect(call).toHaveBeenCalledOnce();
+      expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(outcome === "stopped");
+      await expect(environmentService(db).getLeaseById(other.id)).resolves.toMatchObject({ status: "active" });
+    },
+  );
+
+  it("reports an unwired manager separately from a stopped sandbox worker", async () => {
+    const { companyId, environment, runId } = await seedReusablePluginSandboxLease();
+    const input = {
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    };
+    const runtimeWithoutManager = environmentRuntimeService(db);
+    await expect(runtimeWithoutManager.acquireRunLease(input))
+      .rejects.toThrow("sandbox plugin workers are unavailable in this server process");
+
+    const offlineManager = { isRunning: () => false, call: vi.fn() } as unknown as PluginWorkerManager;
+    const runtimeWithStoppedWorker = environmentRuntimeService(db, {
+      pluginWorkerManager: offlineManager,
+      pluginWorkerReadyTimeoutMs: 0,
+    });
+    await expect(runtimeWithStoppedWorker.acquireRunLease(input))
+      .rejects.toThrow("its worker is not running");
+    expect(offlineManager.call).not.toHaveBeenCalled();
+  });
+
   it("retains a successful reusable sandbox lease without stopping the provider resource", async () => {
     const { pluginId, runId, reusableLease } = await seedReusablePluginSandboxLease();
     const workerManager = {
@@ -535,6 +589,68 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.objectContaining({ providerLeaseId: reusableLease.providerLeaseId }),
       expect.any(Number),
     );
+  });
+
+  it.each(["same task", "different task", "different agent", "no task"])(
+    "scopes projectless reusable leases to their task and agent: %s", async (scenario) => {
+    const seeded = await seedReusablePluginSandboxLease();
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    const issueId = randomUUID();
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values([issueId, otherIssueId].map(id => ({
+      id, companyId: seeded.companyId, title: "Projectless chat", status: "in_progress",
+      assigneeAgentId: seeded.agentId,
+    })));
+    const nextAgentId = scenario === "different agent" ? randomUUID() : seeded.agentId;
+    if (nextAgentId !== seeded.agentId) await db.insert(agents).values({
+      id: nextAgentId, companyId: seeded.companyId, name: "Other agent", adapterType: "paperclip_runner",
+    });
+    let acquisitions = 0;
+    const call = vi.fn(async (_pluginId: string, method: string) => {
+      if (method === "environmentAcquireLease") return {
+        providerLeaseId: `projectless-${++acquisitions}`, metadata: { remoteCwd: "/workspace" },
+      };
+      if (method === "environmentResumeLease") return {
+        providerLeaseId: "projectless-1", metadata: { remoteCwd: "/workspace" },
+      };
+      if (method === "environmentReleaseLease") return undefined;
+      throw new Error(`Unexpected projectless lease method: ${method}`);
+    });
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    const first = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId, environment: seeded.environment, issueId,
+      agentId: seeded.agentId, heartbeatRunId: seeded.runId, persistedExecutionWorkspace: null,
+    });
+    expect(first.lease.metadata?.reusableSandboxLease).toMatchObject({
+      projectlessIssueId: issueId, executionWorkspaceId: null, agentId: seeded.agentId,
+    });
+    await runtimeWithPlugin.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain");
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId, companyId: seeded.companyId, agentId: nextAgentId, status: "running",
+    });
+    if (scenario === "different task" || scenario === "different agent") {
+      await expect(environmentService(db).acquireLease({
+        companyId: seeded.companyId, environmentId: seeded.environment.id,
+        issueId: scenario === "different task" ? otherIssueId : issueId,
+        heartbeatRunId: nextRunId, executionWorkspaceId: null,
+        provider: "fake-plugin", providerLeaseId: first.lease.providerLeaseId,
+        leasePolicy: "reuse_by_environment", replacesReusableLeaseId: first.lease.id,
+        metadata: { agentId: nextAgentId },
+      })).rejects.toMatchObject({ status: 409 });
+    }
+    const next = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId, environment: seeded.environment,
+      issueId: scenario === "no task" ? null : scenario === "different task" ? otherIssueId : issueId,
+      agentId: nextAgentId, heartbeatRunId: nextRunId, persistedExecutionWorkspace: null,
+    });
+    const shouldResume = scenario === "same task";
+    expect(next.lease.providerLeaseId).toBe(shouldResume ? "projectless-1" : "projectless-2");
+    expect(acquisitions).toBe(shouldResume ? 1 : 2);
+    expect(call.mock.calls.filter((entry) => entry[1] === "environmentResumeLease")).toHaveLength(shouldResume ? 1 : 0);
   });
 
   it("resumes the same provider lease on the next per-turn run", async () => {

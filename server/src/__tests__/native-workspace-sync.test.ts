@@ -12,6 +12,7 @@ import {
   nativeWorkspaceSyncInternals,
   readNativeWorkspaceSyncReference,
   resumeNativeWorkspaceSync,
+  prepareNativeWorkspaceSync,
 } from "../services/native-runtime/native-workspace-sync.js";
 
 const digest = "a".repeat(64);
@@ -94,6 +95,20 @@ describe("native workspace sync durable metadata", () => {
     ).toThrow("native_workspace_sync_unexpected_existing_descriptor");
   });
 
+  it("refuses a different sandbox before preparing restart workspace sync", async () => {
+    const select = vi.fn();
+    await expect(prepareNativeWorkspaceSync({
+      db: { select } as never, runId: "run", companyId: "company", workspaceId: "workspace",
+      workspaceLocalDir: "/tmp/local-workspace", lease: { id: "lease", providerLeaseId: "replacement" } as never,
+      target: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "daytona",
+        sandboxLeaseAcquisition: { outcome: "replacement", providerLeaseId: "replacement" } } as never,
+      restartRecovery: { kind: "reattach_remote_runner", runId: "run", leaseOwner: "controller", controllerGeneration: 2,
+        providerAttempt: 1, restartKind: "graceful", recoveryRequestId: null,
+        remote: { providerLeaseId: "original", remoteCwd: "/workspace" } },
+    })).rejects.toThrow("native_remote_recovery_lease_mismatch");
+    expect(select).not.toHaveBeenCalled();
+  });
+
   it("reads backward-compatible references and the resource disposition", () => {
     const base = {
       schema: "paperclip.native-workspace-sync/v1",
@@ -134,7 +149,7 @@ describe("native workspace sync durable metadata", () => {
     ).toThrow("native_workspace_sync_descriptor_digest_invalid");
   });
 
-  it("writes one immutable descriptor when the same state is replayed", async () => {
+  it.each([false, true])("writes one immutable descriptor when the same state is replayed (multiple repositories: %s)", async (multipleRepositories) => {
     const paperclipHome = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-native-workspace-sync-"),
     );
@@ -164,7 +179,12 @@ describe("native workspace sync durable metadata", () => {
       state: "prepared" as const,
       baselineSha256: directorySnapshotSha256(baseline),
       baseline: serializeDirectorySnapshot(baseline),
-      gitSnapshot: null,
+      gitSnapshot: multipleRepositories ? {
+        headCommit: "a".repeat(40), branchName: "main", overlayPaths: [], deletedPaths: [], ignoredPaths: [],
+        repositories: [{ path: ".paperclip-repositories/backend", snapshot: {
+          headCommit: "b".repeat(40), branchName: "backend-work", overlayPaths: ["dirty.txt"], deletedPaths: [], ignoredPaths: ["secret.txt"],
+        } }],
+      } : null,
       seed: null,
       createdAt: "2026-01-01T00:00:00.000Z",
       finalizedAt: null,

@@ -103,6 +103,27 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
+  it.each(["legacy", "native", "native-plan"] as const)("shows a read-only response and sends it only on click for %s", async (runtime) => {
+    const entry = { ...queue.entries[0], canEdit: false, canDiscard: false,
+      comment: { ...queue.entries[0].comment, body: 'Accepted: Build the app\n\n{"revision": "v1"}' },
+      source: { kind: "interaction" as const, interactionId: "confirmation-1", interactionKind: "request_confirmation",
+        requiresFreshSession: runtime === "native-plan" } };
+    const props = render({ queue: { ...queue, entries: [entry],
+      protocol: runtime === "legacy" ? "legacy" : "paperclip_runner_v1" },
+      onInterrupt: vi.fn().mockResolvedValue(undefined) });
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(props.onInterrupt).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Accepted: Build the app");
+    expect(container.textContent).not.toContain('"revision"');
+    expect(container.querySelector<HTMLButtonElement>('[aria-label^="Reorder"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[data-testid^="task-chat-queued-discard-"]')?.disabled).toBe(true);
+    expect(reorderQueuedMessageEntries([entry, queue.entries[1]], "comment-1", "comment-2")).toBeNull();
+    const action = runtime === "native" ? "steer" : "interrupt";
+    await act(async () => { container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-${action}-comment-1"]`)!.click(); });
+    if (action === "steer") expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
+    else expect(props.onInterrupt).toHaveBeenCalledOnce();
+  });
+
   it("reorders the complete queue and rewrites contiguous positions", () => {
     const next = reorderQueuedMessageEntries(
       queue.entries,
@@ -293,11 +314,12 @@ describe("TaskChatQueuedMessages", () => {
     ).toBeNull();
   });
 
-  it("uses interrupt instead of steer for legacy runners and keeps the row queued", async () => {
+  it.each(["run-1", null])("delivers legacy queued messages with target %s", async (targetRunId) => {
     const onInterrupt = vi.fn().mockResolvedValue(undefined);
     render({
       queue: {
         ...queue,
+        targetRunId,
         protocol: "legacy",
         steeringDisposition: "unsupported",
       },
@@ -324,7 +346,7 @@ describe("TaskChatQueuedMessages", () => {
       ),
     ).not.toBeNull();
     expect(container.textContent).toContain(
-      "Interruption requested. Queued messages will continue after the active turn stops.",
+      "Queued messages will be sent when the previous run has stopped.",
     );
   });
 });

@@ -322,6 +322,7 @@ export function readNativeWorkspaceSyncReference(
 
 function parseGitSnapshot(
   value: unknown,
+  nested = false,
 ): GitWorkspaceSnapshot | null | undefined {
   if (value === null) return null;
   const candidate = parseObject(value);
@@ -348,12 +349,26 @@ function parseGitSnapshot(
   ) {
     return undefined;
   }
+  const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
+  if (candidate.repositories !== undefined) {
+    if (nested || !Array.isArray(candidate.repositories)) return undefined;
+    const seen = new Set<string>();
+    for (const raw of candidate.repositories) {
+      const repo = parseObject(raw);
+      if (typeof repo.path !== "string" || !/^\.paperclip-repositories\/[a-zA-Z0-9_-]+$/.test(repo.path) || seen.has(repo.path)) return undefined;
+      const snapshot = parseGitSnapshot(repo.snapshot, true);
+      if (!snapshot) return undefined;
+      seen.add(repo.path);
+      repositories.push({ path: repo.path, snapshot });
+    }
+  }
   return {
     headCommit: candidate.headCommit,
     branchName: candidate.branchName as string | null,
     overlayPaths: [...(candidate.overlayPaths as string[])],
     deletedPaths: [...(candidate.deletedPaths as string[])],
     ignoredPaths: [...(candidate.ignoredPaths as string[])],
+    ...(repositories.length ? { repositories } : {}),
   };
 }
 
@@ -743,6 +758,13 @@ export async function prepareNativeWorkspaceSync(input: {
   }
   const target = input.target;
   const providerLeaseId = providerLeaseIdFor({ target, lease: input.lease });
+  // Reattachment may never seed a replacement sandbox over a still-live run.
+  if (input.restartRecovery?.kind === "reattach_remote_runner" &&
+      (input.restartRecovery.runId !== input.runId ||
+       input.restartRecovery.remote.providerLeaseId !== providerLeaseId ||
+       input.restartRecovery.remote.remoteCwd !== target.remoteCwd)) {
+    throw new Error("native_remote_recovery_lease_mismatch");
+  }
   const run = await input.db
     .select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns)

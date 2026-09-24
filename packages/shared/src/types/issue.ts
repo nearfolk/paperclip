@@ -768,6 +768,13 @@ export interface IssueChangeReceiptEntry {
 export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
 export interface Issue {
+  conversationAgentId?: string | null;
+  conversationUserId?: string | null;
+  /** Server-owned Slack lifecycle projection; not writable through task updates. */
+  externalConversationState?: "active" | "waiting" | null;
+  conversationState?: "active" | "waiting" | null;
+  conversationSessionGeneration?: number;
+  conversationBoundaryCommentId?: string | null;
   activeRun?: { id: string; status: string; agentId: string; invocationSource: string;
     triggerDetail: string | null; startedAt: Date | string | null; finishedAt: Date | string | null;
     createdAt: Date | string; execution?: ExecutionProjection } | null;
@@ -862,6 +869,7 @@ export interface Issue {
 
 export type CompactIssue = Pick<
   Issue,
+  | "externalConversationState"
   | "id"
   | "companyId"
   | "projectId"
@@ -933,6 +941,8 @@ export type IssueCommentDerivedAuthorSource =
   | "run_log_comment_post";
 
 export interface IssueComment {
+  clientRequestId?: string | null;
+  conversationSessionGeneration?: number | null;
   id: string;
   companyId: string;
   issueId: string;
@@ -967,6 +977,13 @@ export type IssueQueuedCommentSteeringDisposition =
   | "temporarily_unavailable";
 
 export interface IssueQueuedCommentEntry {
+  /** Immutable response projected from its durable interaction receipt. */
+  source?: {
+    kind: "interaction";
+    interactionId: string;
+    interactionKind: string;
+    requiresFreshSession?: boolean;
+  };
   comment: IssueComment;
   position: number;
   canEdit: boolean;
@@ -1050,6 +1067,8 @@ export interface IssueCommentMetadataSection {
 
 export interface IssueCommentMetadata {
   version: 1;
+  /** Inbound channel attribution; never an authorization input. */
+  sourceChannel?: "imessage-photon";
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
@@ -1322,6 +1341,8 @@ export type ConnectionIntentPhase = "requested" | "authorizing" | "needs_retry";
  */
 export interface ConnectionIntentPayload {
   version: 1;
+  /** Runtime authentication requests cannot be satisfied by tool credentials. */
+  purpose?: "ai";
   serviceSlug: string;
   serviceName: string;
   serviceLogoUrl?: string | null;

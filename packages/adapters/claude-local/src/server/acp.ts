@@ -15,6 +15,7 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  ensureAdapterExecutionTargetDirectory,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
@@ -30,6 +31,8 @@ import type {
   AcpxEngineExecutorOptions,
   AcpxRemoteManagedHomeContext,
   AcpxRemoteManagedHomeResult,
+  AcpxTerminalSessionFailure,
+  AcpxTerminalFailureClassification,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
   asBoolean,
@@ -50,8 +53,8 @@ import {
 } from "./probe-diagnostics.js";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { buildLocalAdapterTestProbeEnv } from "./probe-env.js";
-import { detectClaudeLoginRequired, parseClaudeStreamJson } from "./parse.js";
-import { buildClaudeProbePermissionArgs } from "./permissions.js";
+import { detectClaudeLoginRequired, extractClaudeRetryNotBefore, isClaudeProviderQuotaError, parseClaudeStreamJson } from "./parse.js";
+import { buildClaudeProbePermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -227,7 +230,7 @@ async function prepareClaudeRemoteManagedHome(
     typeof envConfig.CLAUDE_CONFIG_DIR === "string" && envConfig.CLAUDE_CONFIG_DIR.trim().length > 0
       ? envConfig.CLAUDE_CONFIG_DIR.trim()
       : "";
-  if (explicitClaudeConfigDir) {
+  if (explicitClaudeConfigDir && !input.config.managedAiConnection) {
     // User-managed escape hatch. Unlike the Claude CLI lane
     // (`claude-local/execute.ts`), which runs the process on the same host and can
     // forward the operator's path verbatim, the remote ACP lane spawns Claude
@@ -267,7 +270,9 @@ async function prepareClaudeRemoteManagedHome(
 
   // Content-addressed sanitized seed (managed cache under the instance root, not
   // a temp dir — reused across runs, so no teardown cleanup).
-  const claudeConfigSeedDir = await prepareClaudeConfigSeed(process.env, onLog, input.companyId);
+  const claudeConfigSeedDir = input.config.managedAiConnection
+    ? explicitClaudeConfigDir
+    : await prepareClaudeConfigSeed(process.env, onLog, input.companyId);
   // Ship the per-run skill bundle, staged only when the run selected at
   // least one skill. The bundle directory holds a plain copy of each
   // selected skill's files (`materializePaperclipSkillCopy` never copies a
@@ -311,10 +316,31 @@ async function prepareClaudeRemoteManagedHome(
   return { stagedRuntime, teardown: registerWorkspaceSyncBack(stagedRuntime) };
 }
 
+export function classifyClaudeTerminalSessionFailure(
+  failure: AcpxTerminalSessionFailure,
+  now: Date,
+): AcpxTerminalFailureClassification | null {
+  // `limit` also includes context, turn, rate and configured budget limits.
+  // Only the provider's quota wording qualifies for a quota wait.
+  if (failure.category !== "limit") return null;
+  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
+  // claude-agent-acp uses this exact quota_exhausted fallback when no provider
+  // title is available. It does not match the CLI's usage-limit wording.
+  const isQuotaFallback = failure.title === "The Claude account has no available quota.";
+  if (!isQuotaFallback && !isClaudeProviderQuotaError(surface)) return null;
+  const retryNotBefore = extractClaudeRetryNotBefore(surface, now)?.toISOString();
+  return {
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    ...(retryNotBefore ? { retryNotBefore } : {}),
+  };
+}
+
 function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExecutorOptions {
   return {
     resolveBillingIdentity: resolveClaudeAcpBillingIdentity,
     prepareRemoteManagedHome: prepareClaudeRemoteManagedHome,
+    classifyTerminalSessionFailure: classifyClaudeTerminalSessionFailure,
     ...options,
     adapterType: "claude_local",
     moduleDir,
@@ -624,7 +650,11 @@ export async function probeClaudeAcpSandboxLogin(input: {
     cwd = asString(config.cwd, process.cwd());
   }
 
+  Object.assign(env, claudeSandboxPermissionEnv({
+    dangerouslySkipPermissions: asBoolean(config.dangerouslySkipPermissions, true), targetIsSandbox,
+  }));
   const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
+  if (config.managedAiConnection) args.push("--setting-sources", "user");
   args.push(
     ...buildClaudeProbePermissionArgs({
       dangerouslySkipPermissions: asBoolean(config.dangerouslySkipPermissions, true),
@@ -715,9 +745,13 @@ export async function testClaudeAcpEnvironment(
     });
   }
 
-  const cwd = asString(config.cwd, process.cwd());
+  const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
   try {
-    await fs.mkdir(cwd, { recursive: true });
+    await ensureAdapterExecutionTargetDirectory(`claude-acp-envtest-${Date.now()}`, target, cwd, {
+      cwd,
+      env: {},
+      createIfMissing: true,
+    });
     checks.push({
       code: "claude_acp_cwd_valid",
       level: "info",
@@ -760,7 +794,7 @@ export async function testClaudeAcpEnvironment(
   });
 
   const envConfig = parseObject(config.env);
-  const considerHostEnv = !targetIsRemote;
+  const considerHostEnv = !targetIsRemote && !config.managedAiConnection;
   const hasBedrock =
     envConfig.CLAUDE_CODE_USE_BEDROCK === "1" ||
     envConfig.CLAUDE_CODE_USE_BEDROCK === "true" ||
@@ -782,12 +816,13 @@ export async function testClaudeAcpEnvironment(
     });
   } else if (isNonEmpty(configApiKey) || isNonEmpty(hostApiKey)) {
     const source = isNonEmpty(configApiKey) ? "adapter config env" : "server environment";
+    const selectedApiKey = Boolean(config.managedAiConnection) || isNonEmpty(configApiKey);
     checks.push({
       code: "claude_acp_anthropic_api_key_detected",
-      level: "warn",
-      message: "ANTHROPIC_API_KEY is set. Claude ACP will use API-key auth instead of subscription credentials.",
+      level: selectedApiKey ? "info" : "warn",
+      message: selectedApiKey ? "Using the selected Claude API connection." : "ANTHROPIC_API_KEY is set. Claude ACP will use API-key auth instead of subscription credentials.",
       detail: `Detected in ${source}.`,
-      hint: "Unset ANTHROPIC_API_KEY if you want subscription-based Claude login behavior.",
+      hint: selectedApiKey ? undefined : "Unset ANTHROPIC_API_KEY if you want subscription-based Claude login behavior.",
     });
   } else if (
     isNonEmpty(envConfig.CLAUDE_CODE_OAUTH_TOKEN) ||
@@ -860,6 +895,7 @@ export async function testClaudeAcpEnvironment(
     const runId = `claude-acp-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     checks.push(
       ...(await prepareSandboxClaudeProbeRuntime({
+      managedAiConnection: Boolean(config.managedAiConnection),
         runId,
         target,
         cwd,

@@ -30,6 +30,7 @@ import {
   canBoardManageRuntime,
   canBoardResolveRecoveryAction,
   IssueDetail,
+  TaskDetailSurface,
   readRecoveryReconcileWorkspaceId,
   shouldScrollIssueDetailToTopOnNavigation,
 } from "./IssueDetail";
@@ -40,6 +41,7 @@ import {
 } from "../lib/issueDetailBreadcrumb";
 import { getRecentTasksStorageKey, readRecentTasks } from "../lib/recent-tasks";
 import { ApiError } from "../api/client";
+import type { issuesApi } from "../api/issues";
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -83,6 +85,7 @@ const mockActivityApi = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
+  get: vi.fn(),
   liveRunsForIssue: vi.fn(),
   activeRunForIssue: vi.fn(),
   cancel: vi.fn(),
@@ -161,9 +164,12 @@ class ResizeObserverStub {
 (globalThis as any).ResizeObserver =
   (globalThis as any).ResizeObserver ?? ResizeObserverStub;
 
-vi.mock("../api/issues", () => ({
-  issuesApi: mockIssuesApi,
-}));
+vi.mock("../api/issues", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../api/issues")>();
+  // Keep composed API operations real while replacing their request methods.
+  // This also exercises the current-revision check used by both queue surfaces.
+  return { ...actual, issuesApi: Object.assign(actual.issuesApi, mockIssuesApi) };
+});
 
 vi.mock("../api/activity", () => ({
   activityApi: mockActivityApi,
@@ -570,6 +576,7 @@ vi.mock("../components/ApprovalCard", () => ({
 }));
 
 vi.mock("../components/Identity", () => ({
+  deriveInitials: (name: string) => name.slice(0, 2),
   Identity: ({ name, shape }: { name: string; shape?: string }) => (
     <span data-shape={shape ?? "circle"}>{name}</span>
   ),
@@ -1414,6 +1421,74 @@ describe("IssueDetail", () => {
     vi.restoreAllMocks();
   });
 
+  it("keeps an existing conversation on its agent-addressed route", async () => {
+    const agent = createAgent();
+    const canonical = createIssue({ conversationAgentId: agent.id, conversationUserId: "user-1", conversationState: "waiting", status: "in_review" });
+    mockIssuesApi.get.mockResolvedValue(canonical);
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><TaskDetailSurface conversation={{ agent, issue: canonical, ensureIssue: async () => canonical }} /></QueryClientProvider>);
+    });
+    await flushReact();
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(mockIssuesApi.markRead).toHaveBeenCalledWith(canonical.id);
+  });
+
+  it.each(["message", "attachment"])("creates an unused conversation only for the first %s and updates its canonical cache", async (kind) => {
+    mockIssuesApi.markRead.mockClear();
+    const agent = createAgent();
+    const canonical = createIssue({ conversationAgentId: agent.id, conversationUserId: "user-1", conversationState: "waiting", status: "in_review" });
+    const ensureIssue = vi.fn().mockResolvedValue(canonical);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    mockIssuesApi.addComment.mockResolvedValue(createIssueComment({ body: "Clarify this goal" }));
+    mockIssuesApi.uploadAttachment.mockResolvedValue(createAttachment({ id: "first-upload" }));
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><TaskDetailSurface conversation={{ agent, issue: null, ensureIssue }} /></QueryClientProvider>);
+    });
+    await flushReact();
+    expect(ensureIssue).not.toHaveBeenCalled();
+    expect(mockIssuesApi.markRead).not.toHaveBeenCalled();
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      onAdd: (body: string) => Promise<void>;
+      onAttachImage: (file: File) => Promise<IssueAttachment>;
+    };
+    if (kind === "message") {
+      await act(async () => { await props.onAdd("Clarify this goal"); });
+      expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Clarify this goal", undefined, undefined, undefined, expect.any(String));
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.comments(canonical.id) });
+    } else {
+      const file = new File(["image"], "first.png", { type: "image/png" });
+      await act(async () => { await props.onAttachImage(file); });
+      expect(mockIssuesApi.uploadAttachment).toHaveBeenCalledWith(canonical.companyId, canonical.id, file);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.attachments(canonical.id) });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.detail(canonical.id) });
+    }
+    expect(ensureIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the chosen initial chat mode after creation succeeded but mode persistence failed", async () => {
+    mockIssuesApi.addComment.mockClear();
+    mockIssuesApi.update.mockClear();
+    const agent = createAgent();
+    const canonical = createIssue({ conversationAgentId: agent.id, conversationUserId: "user-1", conversationState: "waiting", status: "in_review", workMode: "standard" });
+    const ensureIssue = vi.fn().mockResolvedValue(canonical);
+    mockIssuesApi.update.mockRejectedValueOnce(new Error("Mode save failed")).mockResolvedValue({ ...canonical, workMode: "ask" });
+    mockIssuesApi.addComment.mockResolvedValue(createIssueComment({ body: "Research only" }));
+    const renderChat = async (issue: Issue | null) => {
+      await act(async () => root.render(<QueryClientProvider client={queryClient}><TaskDetailSurface conversation={{ agent, issue, ensureIssue }} /></QueryClientProvider>));
+      await flushReact();
+      return mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as { onWorkModeChange: (mode: string) => Promise<void>; onAdd: (body: string) => Promise<void> };
+    };
+    let props = await renderChat(null);
+    await act(async () => props.onWorkModeChange("ask"));
+    props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0];
+    await act(async () => { await expect(props.onAdd("Research only")).rejects.toThrow("Mode save failed"); });
+    expect(mockIssuesApi.addComment).not.toHaveBeenCalled();
+    props = await renderChat(canonical);
+    await act(async () => props.onAdd("Research only"));
+    expect(mockIssuesApi.update).toHaveBeenNthCalledWith(2, canonical.id, { workMode: "ask" });
+    expect(mockIssuesApi.addComment).toHaveBeenCalledOnce();
+  });
+
   it("opens artifact cards in the shared gallery at the selected image without duplicating attachments", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
     mockIssuesApi.listAttachments.mockResolvedValue([
@@ -1609,6 +1684,7 @@ describe("IssueDetail", () => {
           undefined,
           undefined,
           [id],
+          expect.any(String),
         );
         expect(mockIssuesApi.update).not.toHaveBeenCalled();
       }
@@ -2081,6 +2157,46 @@ describe("IssueDetail", () => {
     });
   });
 
+  it.each([false, true])("reveals new artifacts once in the task panel (mobile: %s)", async (isMobile) => {
+    mockSidebarState.isMobile = isMobile;
+    mockPanelState.panelVisible = false;
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    });
+    await waitForAssertion(() => {
+      expect(queryClient.getQueryData(queryKeys.issues.attachments("PAP-1"))).toEqual([]);
+    });
+    await flushReact();
+    const panelProps = () => (isMobile
+      ? mockTaskSidePanelRender.mock.calls.at(-1)?.[0]
+      : mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props) as {
+        artifactsOpenRequestId?: number;
+        onArtifactsOpened: (requestId: number) => void;
+      };
+    const file = createAttachment({ id: "new-output", createdByAgentId: "agent-1" });
+    act(() => { queryClient.setQueryData(queryKeys.issues.attachments("PAP-1"), [file]); });
+    await waitForAssertion(() => expect(panelProps()?.artifactsOpenRequestId).toBe(1));
+    if (isMobile) {
+      expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).not.toBeNull();
+      expect(mockSetPanelVisible).not.toHaveBeenCalled();
+      expect(mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props.artifactsOpenRequestId).toBeUndefined();
+    } else {
+      expect(mockSetPanelVisible).toHaveBeenCalledWith(true);
+    }
+
+    act(() => panelProps().onArtifactsOpened(1));
+    await waitForAssertion(() => expect(panelProps().artifactsOpenRequestId).toBeUndefined());
+    act(() => { queryClient.setQueryData(queryKeys.issues.attachments("PAP-1"), [{ ...file, originalFilename: "Renamed output" }]); });
+    await flushReact();
+    expect(panelProps().artifactsOpenRequestId).toBeUndefined();
+
+    act(() => { queryClient.setQueryData(queryKeys.issues.attachments("PAP-1"), [file,
+      createAttachment({ id: "next-output", createdByAgentId: "agent-1" }),
+    ]); });
+    await waitForAssertion(() => expect(panelProps().artifactsOpenRequestId).toBe(2));
+  });
+
   it("opens the mobile properties sheet for a document deep link", async () => {
     mockSidebarState.isMobile = true;
     mockLocation.hash = "#document-qa-evidence";
@@ -2144,8 +2260,9 @@ describe("IssueDetail", () => {
     expect(panel?.querySelector('[data-slot="sheet-close"]')).not.toBeNull();
   });
 
-  it("loads subtask membership and created work independently and refreshes on issue activity", async () => {
-    const source = createIssue();
+  it("loads ancestors, subtask membership and created work independently and refreshes on issue activity", async () => {
+    const ancestors = [{ id: "parent-task", identifier: "PAP-0", title: "Parent task", status: "in_progress" }] as Issue["ancestors"];
+    const source = createIssue({ ancestors });
     const child = createIssue({ id: "manual-child", parentId: source.id, title: "Manual child" });
     const created = createIssue({ id: "created-task", parentId: null, title: "Created elsewhere" });
     mockIssuesApi.get.mockResolvedValue(source);
@@ -2158,7 +2275,8 @@ describe("IssueDetail", () => {
     const taskProjection = () => mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props.tasksTab;
     expect(taskProjection()?.content.props.subtasks.map((row: Issue) => row.id)).toEqual([child.id]);
     expect(taskProjection()?.content.props.createdTasks.map((row: Issue) => row.id)).toEqual([created.id]);
-    expect(taskProjection()?.count).toBe(2);
+    expect(taskProjection()?.content.props.ancestors).toEqual(ancestors);
+    expect(taskProjection()?.count).toBe(3);
 
     const next = createIssue({ id: "new-created-task", parentId: source.id });
     mockIssuesApi.list.mockImplementation((_companyId, filters?: { descendantOf?: string; createdFromIssueId?: string }) =>
@@ -2166,7 +2284,7 @@ describe("IssueDetail", () => {
     );
     await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(source.companyId) }); });
     await flushReact();
-    expect(taskProjection()?.count).toBe(3);
+    expect(taskProjection()?.count).toBe(4);
     expect(taskProjection()?.content.props.createdTasks.map((row: Issue) => row.id)).toContain(next.id);
   });
 
@@ -4496,8 +4614,11 @@ describe("IssueDetail", () => {
   });
 
   it.each(["active-run", "composer"])(
-    "routes %s Stop and the menu through the same pause operation",
+    "keeps %s run controls distinct from pausing future work",
     async (control) => {
+      mockIssuesApi.createTreeHold.mockClear();
+      mockHeartbeatsApi.cancel.mockClear();
+      mockHeartbeatsApi.get.mockReset();
       const pausePreview = createPausePreview();
       pausePreview.totals = {
         ...pausePreview.totals,
@@ -4539,6 +4660,7 @@ describe("IssueDetail", () => {
           adapterType: "process",
         },
       ]);
+      mockHeartbeatsApi.get.mockResolvedValue({ id: "run-active-1", status: "cancelled", runtimeMode: "legacy" });
       mockAuthApi.getSession.mockResolvedValue({
         session: { userId: "user-1" },
         user: { id: "user-1" },
@@ -4575,7 +4697,11 @@ describe("IssueDetail", () => {
       });
       await flushReact();
 
-      expect(mockIssuesApi.createTreeHold).toHaveBeenCalledWith("PAP-1", {
+      if (control === "composer") {
+        expect(mockHeartbeatsApi.cancel).toHaveBeenCalledWith("run-active-1");
+        expect(mockHeartbeatsApi.get).toHaveBeenCalledWith("run-active-1");
+        expect(mockIssuesApi.createTreeHold).not.toHaveBeenCalled();
+      } else expect(mockIssuesApi.createTreeHold).toHaveBeenCalledWith("PAP-1", {
         mode: "pause",
         reason: null,
         releasePolicy: { strategy: "manual", note: "leaf_pause" },
@@ -4624,6 +4750,7 @@ describe("IssueDetail", () => {
   );
 
   it("routes live-run finalization actions through run cancellation before issue status update", async () => {
+    mockHeartbeatsApi.cancel.mockClear();
     mockIssuesApi.get.mockResolvedValue(
       createIssue({
         status: "in_progress",
@@ -5166,6 +5293,93 @@ describe("IssueDetail", () => {
     localStorage.removeItem("paperclip:issue-comment-draft:issue-1");
   });
 
+  describe.each([false, true])("composer tree control (mobile=%s)", (isMobile) => {
+    const treeControlKey = ["issues", "tree-control-state", "PAP-1"];
+    const composerProps = () => mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      composerDisabledReason: string | null;
+      composerPause: TaskComposerPause | null;
+      onAdd: (body: string) => Promise<void>;
+    };
+
+    async function renderWithPendingTreeControl() {
+      mockSidebarState.isMobile = isMobile;
+      mockIssuesApi.get.mockResolvedValue(createIssue());
+      let resolve!: (value: Awaited<ReturnType<typeof issuesApi.getTreeControlState>>) => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<Awaited<ReturnType<typeof issuesApi.getTreeControlState>>>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      const response = { promise, resolve, reject };
+      mockIssuesApi.getTreeControlState.mockReturnValue(response.promise);
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+      await waitForAssertion(() => {
+        expect(mockIssuesApi.getTreeControlState).toHaveBeenCalledWith("PAP-1");
+        expect(mockIssueChatThreadRender).toHaveBeenCalled();
+        expect(queryClient.getQueryState(treeControlKey)?.status).toBe("pending");
+        expect(queryClient.getQueryState(treeControlKey)?.fetchStatus).toBe("fetching");
+      });
+      return response;
+    }
+
+    it("allows a message while tree control is pending and remains enabled after success", async () => {
+      mockIssuesApi.addComment.mockClear().mockResolvedValue(createIssueComment({ body: "Keep working" }));
+      const response = await renderWithPendingTreeControl();
+      expect(composerProps().composerDisabledReason).toBeNull();
+      expect(composerProps().composerPause).toBeNull();
+      await act(async () => {
+        await composerProps().onAdd("Keep working");
+      });
+      expect(mockIssuesApi.addComment).toHaveBeenCalledWith(
+        "PAP-1", "Keep working", undefined, undefined, undefined, expect.any(String),
+      );
+      expect(queryClient.getQueryState(treeControlKey)?.status).toBe("pending");
+
+      response.resolve({ activePauseHold: null });
+      await waitForAssertion(() => {
+        expect(queryClient.getQueryState(treeControlKey)?.status).toBe("success");
+        expect(composerProps().composerDisabledReason).toBeNull();
+        expect(composerProps().composerPause).toBeNull();
+      });
+    });
+
+    it("blocks the composer when the pending tree control request fails", async () => {
+      const response = await renderWithPendingTreeControl();
+      response.reject(new Error("tree control unavailable"));
+      await waitForAssertion(() => {
+        expect(queryClient.getQueryState(treeControlKey)?.status).toBe("error");
+        expect(composerProps().composerDisabledReason).toBe(
+          "Couldn’t check whether this task is paused. Refresh to try again.",
+        );
+      });
+    });
+
+    it.each([true, false])("applies a late pause response (root=%s)", async (isRoot) => {
+      const response = await renderWithPendingTreeControl();
+      response.resolve({
+        activePauseHold: {
+          holdId: "hold-1",
+          rootIssueId: isRoot ? "issue-1" : "parent-1",
+          issueId: "issue-1",
+          isRoot,
+          mode: "pause",
+          reason: null,
+          releasePolicy: { strategy: "manual" },
+        },
+      });
+      await waitForAssertion(() => {
+        expect(composerProps().composerPause?.scope).toBe(isRoot ? "leaf" : "subtree");
+        expect(container.querySelector('[data-testid="paused-composer-takeover"]')).not.toBeNull();
+      });
+    });
+  });
+
   it("renders a quiet task pause notice and defaults leaf resume to wake the assignee", async () => {
     const activeHold = createPauseHold();
     const releasedHold = createPauseHold({
@@ -5545,6 +5759,40 @@ describe("IssueDetail", () => {
     },
   );
 
+  it("keeps the last queued message mounted until steering is acknowledged so rejection stays visible", async () => {
+    const queue = createQueuedCommentQueue();
+    mockIssuesApi.get.mockResolvedValue(createIssue({ status: "in_progress", assigneeAgentId: "agent-1", executionRunId: "run-active-1" }));
+    mockAgentsApi.list.mockResolvedValue([createAgent({ adapterType: "paperclip_runner" })]);
+    mockIssuesApi.listComments.mockResolvedValue([queue.entries[0].comment]);
+    mockIssuesApi.getQueuedComments.mockResolvedValue(queue);
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue({
+      id: "run-active-1", runtimeMode: "native", status: "running", invocationSource: "issue",
+      triggerDetail: null, contextCommentId: null, contextWakeCommentId: null,
+      startedAt: "2026-04-21T00:00:00.000Z", finishedAt: null, createdAt: "2026-04-21T00:00:00.000Z",
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", issueId: "issue-1",
+    });
+    let rejectSteer!: (error: Error) => void;
+    mockIssuesApi.steerQueuedComment.mockReturnValue(new Promise((_, reject) => { rejectSteer = reject; }));
+    await act(async () => { root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>); });
+    type Props = { onSteerQueuedComment: (id: string, revision: string) => Promise<void>; queuedCommentQueue: IssueQueuedCommentQueue | null };
+    let props!: Props;
+    await waitForAssertion(() => {
+      props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as Props;
+      expect(props.queuedCommentQueue?.entries).toHaveLength(1);
+      expect(props.queuedCommentQueue?.queueId).toBe("wake-queue-1");
+      expect(props.queuedCommentQueue?.targetRunId).toBe("run-active-1");
+    });
+    let pending!: Promise<unknown>;
+    await act(async () => { pending = props.onSteerQueuedComment("queued-comment-1", queue.revision).catch(error => error); });
+    // The child owns its pending/error state. Unmounting it here loses any later error.
+    const whilePending = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as Props;
+    expect(whilePending.queuedCommentQueue?.entries).toHaveLength(1);
+    const failure = new ApiError("This runner does not support steering", 409, { code: "steering_unsupported" });
+    await act(async () => { rejectSteer(failure); await pending; });
+    expect(await pending).toBe(failure);
+    expect((mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as Props).queuedCommentQueue?.entries).toHaveLength(1);
+  });
+
   it("promotes a steered message immediately while its durable timeline position refreshes", async () => {
     const queue = createQueuedCommentQueue();
     const steeredQueue = createQueuedCommentQueue({
@@ -5618,6 +5866,7 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => {
       expect(mockIssuesApi.steerQueuedComment).toHaveBeenCalled();
       expect(mockActivityApi.forIssue.mock.calls.length).toBeGreaterThan(1);
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.queuedCommentQueue).toBeNull();
     });
 
     const whileRefreshing = mockIssueChatThreadRender.mock.calls.at(

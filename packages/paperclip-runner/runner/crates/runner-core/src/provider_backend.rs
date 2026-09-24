@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, ProviderStartupObservation,
-    ProviderStartupStage, RejectedAcceptedTurn, MAX_SETTLED_PROVIDER_TURN_IDS,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput,
+    ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
+    MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file,
@@ -28,7 +29,8 @@ use crate::provider_bridge::{
     TOOL_SET_SCHEMA,
 };
 use crate::provider_events::{
-    normalize_codex_notification, normalized_codex_terminal_event_type, NormalizedProviderEvent,
+    normalize_codex_notification, normalized_codex_terminal_event_type, with_terminal_outcome,
+    NormalizedProviderEvent,
 };
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
 
@@ -2093,7 +2095,7 @@ impl CodexCommandExecutor {
                         // trustworthy success notification to replay. Terminate it
                         // conservatively so the controller cannot wait forever or
                         // mistake an unknown outcome for success.
-                        state.push_terminal_event(NormalizedProviderEvent {
+                        let provider_terminal = NormalizedProviderEvent {
                             event_type: "turn.failed".to_owned(),
                             priority: EventPriority::P0,
                             payload: json!({
@@ -2102,11 +2104,15 @@ impl CodexCommandExecutor {
                                 "status": "failed",
                                 "providerTerminalObserved": false,
                             }),
-                        })?;
-                        state.extend_terminal_events(terminal_events(
+                        };
+                        let outcome = terminal_events(
                             state,
                             "turn.failed",
                             state.goal.as_ref().map(|goal| goal.status.as_str()),
+                        );
+                        state.extend_terminal_events(with_terminal_outcome(
+                            vec![provider_terminal],
+                            outcome,
                         ))?;
                     }
                 } else {
@@ -2194,7 +2200,7 @@ impl CodexCommandExecutor {
     }
 
     fn prepare(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
-        let config: CodexProviderConfig = serde_json::from_value(
+        let mut config: CodexProviderConfig = serde_json::from_value(
             payload
                 .get("provider")
                 .cloned()
@@ -2203,6 +2209,11 @@ impl CodexCommandExecutor {
         .map_err(|error| {
             DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}"))
         })?;
+        // This field used to be discarded for every facade. Keep non-Codex
+        // persisted profiles unchanged even when an older controller sends it.
+        if config.provider != "codex" {
+            config.include_skill_instructions = None;
+        }
         config
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
@@ -2431,11 +2442,15 @@ impl CodexCommandExecutor {
             .map_err(|_| {
                 DurableRunnerError::invalid("run.attach runtime launch arguments are invalid")
             })?;
+        let mut upgraded_skill_config = false;
         if let Some(provider) = payload.get("provider") {
             let mut config: CodexProviderConfig = serde_json::from_value(provider.clone())
                 .map_err(|error| {
                     DurableRunnerError::invalid(format!("run.attach provider is invalid: {error}"))
                 })?;
+            if config.provider != "codex" {
+                config.include_skill_instructions = None;
+            }
             config
                 .validate()
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
@@ -2445,6 +2460,17 @@ impl CodexCommandExecutor {
                     == Self::stable_launch_args(&next_state.config.args)
             {
                 config.args = next_state.config.args.clone();
+            }
+            // Pre-fix checkpoints dropped this field. A fresh settled run may
+            // adopt the explicit controller setting once, then must reopen the
+            // same thread so the provider receives it. Known settings remain
+            // immutable within this profile, like the other durable fields.
+            if next_state.config.provider == "codex"
+                && next_state.config.include_skill_instructions.is_none()
+                && config.include_skill_instructions.is_some()
+            {
+                next_state.config.include_skill_instructions = config.include_skill_instructions;
+                upgraded_skill_config = true;
             }
             if config != next_state.config {
                 return Err(DurableRunnerError::invalid(
@@ -2495,6 +2521,7 @@ impl CodexCommandExecutor {
         next_state.last_agent_message = None;
         let retained_provider = if let Some(provider) = self.provider.as_mut() {
             !runtime_launch_changed
+                && !upgraded_skill_config
                 && provider
                     .attach_run_in_place(
                         next_state.tool_bridge.authorized_tools().cloned(),
@@ -2847,6 +2874,21 @@ impl CodexCommandExecutor {
     }
 
     fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        // Validate before recovery or marking dispatch ambiguous: malformed
+        // selections must not launch a provider or poison a durable session.
+        let skills: Vec<CodexSkillInput> =
+            serde_json::from_value(payload.get("skills").cloned().unwrap_or_else(|| json!([])))
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("invalid turn.start skills: {error}"))
+                })?;
+        if skills.len() > 64 {
+            return Err(DurableRunnerError::invalid("too many turn.start skills"));
+        }
+        for skill in &skills {
+            skill
+                .validate()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        }
         self.restore_provider_if_needed()?;
         if self
             .state
@@ -2906,6 +2948,14 @@ impl CodexCommandExecutor {
             .config
             .cwd
             .clone();
+        if !skills.is_empty()
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.config.provider != "codex")
+        {
+            return Err(DurableRunnerError::invalid("explicit skills require Codex"));
+        }
         self.ensure_provider()?;
         {
             let state = self
@@ -2922,7 +2972,7 @@ impl CodexCommandExecutor {
             rejected_accepted_turn,
         ) = {
             let provider = self.ensure_provider()?;
-            let result = provider.start_turn(text, &cwd);
+            let result = provider.start_turn_with_skills(text, &cwd, &skills);
             (
                 result,
                 provider.completed_turn_authority().is_some(),
@@ -3533,7 +3583,7 @@ impl CodexCommandExecutor {
         } else {
             "Codex"
         };
-        state.push_terminal_event(NormalizedProviderEvent {
+        let provider_terminal = NormalizedProviderEvent {
             event_type: terminal_event_type.to_owned(),
             priority: EventPriority::P0,
             payload: json!({
@@ -3552,9 +3602,9 @@ impl CodexCommandExecutor {
                 "providerTerminalObserved": false,
                 "providerShutdownFailed": provider_shutdown_failed,
             }),
-        })?;
+        };
         let terminal = terminal_events(state, terminal_event_type, None);
-        state.extend_terminal_events(terminal)?;
+        state.extend_terminal_events(with_terminal_outcome(vec![provider_terminal], terminal))?;
         self.save_state()
     }
 
@@ -3919,14 +3969,18 @@ impl CodexCommandExecutor {
                         priority: EventPriority::P0,
                         payload: diagnostic.clone(),
                     })?;
-                    state.push_terminal_event(NormalizedProviderEvent {
+                    let provider_terminal = NormalizedProviderEvent {
                         event_type: "turn.failed".to_owned(),
                         priority: EventPriority::P0,
                         payload: json!({ "provider": state.config.provider, "status": "failed",
                             "code": diagnostic["code"], "recoverable": false,
                             "message": diagnostic["message"], "error": diagnostic }),
-                    })?;
-                    state.extend_terminal_events(terminal_events(state, "turn.failed", None))?;
+                    };
+                    let outcome = terminal_events(state, "turn.failed", None);
+                    state.extend_terminal_events(with_terminal_outcome(
+                        vec![provider_terminal],
+                        outcome,
+                    ))?;
                     // Commit the authoritative failure before best-effort provider cleanup.
                     self.save_state()?;
                     if let Some(mut provider) = self.provider.take() {
@@ -4197,8 +4251,10 @@ impl CodexCommandExecutor {
                         }
                     }
                     let trace_first_event_sequence = state.next_provider_event_seq;
-                    if terminal_event_type.is_some() {
-                        state.extend_terminal_events(normalized)?;
+                    if let Some(ref event_type) = terminal_event_type {
+                        let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
+                        let outcome = terminal_events(state, event_type, goal_status);
+                        state.extend_terminal_events(with_terminal_outcome(normalized, outcome))?;
                     } else if receipt_limit_terminal_poll {
                         for event in normalized {
                             state.push_receipt_limit_cleanup_event(event)?;
@@ -4207,14 +4263,6 @@ impl CodexCommandExecutor {
                         state.extend_events(normalized)?;
                     }
                     let trace_last_event_sequence = state.next_provider_event_seq;
-                    if let Some(event_type) = terminal_event_type {
-                        let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
-                        state.extend_terminal_events(terminal_events(
-                            state,
-                            &event_type,
-                            goal_status,
-                        ))?;
-                    }
                     let trace_emitted_event_ids = identity
                         .as_ref()
                         .map(|identity| {
@@ -4786,7 +4834,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_results_expose_only_reserved_static_schema_guidance() {
+    fn invalid_tool_results_expose_only_reserved_schema_guidance() {
         let finish_result = schema_rejection(
             "paperclip_finish",
             json!({"secretSubmittedValue": "must-not-appear"}),
@@ -4796,6 +4844,9 @@ mod tests {
         let finish_message = finish_result.result["error"]["message"].as_str().unwrap();
         assert!(finish_message
             .contains("continuation must include kind=response_wake, summary, and idempotencyKey"));
+        assert!(finish_message.contains("/required (missing \"requiredField\")"));
+        assert!(finish_message.contains("/additionalProperties"));
+        assert!(!finish_message.contains("secretSubmittedValue"));
         assert!(finish_message.len() <= 512);
         assert!(!finish_message.chars().any(char::is_control));
         assert!(!finish_result.result.to_string().contains("must-not-appear"));
@@ -4836,7 +4887,7 @@ mod tests {
             CodexProviderConfig {
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
-                provider_version: "1.18.29".to_owned(),
+                provider_version: "1.18.32".to_owned(),
                 command: PathBuf::from("node"),
                 args: Vec::new(),
                 cwd: std::env::current_dir()
@@ -4848,6 +4899,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             Some(CompletionContractBinding {
                 revision: "revision-1".to_owned(),
@@ -5196,7 +5248,7 @@ mod tests {
             CodexProviderConfig {
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
-                provider_version: "1.18.29".to_owned(),
+                provider_version: "1.18.32".to_owned(),
                 command: PathBuf::from("node"),
                 args: Vec::new(),
                 cwd: std::env::current_dir()
@@ -5208,6 +5260,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             Some(CompletionContractBinding {
                 revision: "revision-1".to_owned(),
@@ -5297,6 +5350,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             opencode_launch_profile_digest: None,
             completion_contract: None,
@@ -5348,6 +5402,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5389,6 +5444,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             Some(CompletionContractBinding {
                 revision: "1".to_owned(),
@@ -5480,6 +5536,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5545,6 +5602,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5593,6 +5651,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5715,6 +5774,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             bridge,
@@ -5825,6 +5885,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             bridge,
@@ -5880,6 +5941,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5999,6 +6061,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             bridge,
@@ -6038,6 +6101,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6074,6 +6138,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6149,6 +6214,7 @@ mod tests {
                 instructions: String::new(),
                 approval_policy: "never".to_owned(),
                 externally_sandboxed: false,
+                include_skill_instructions: None,
             },
             None,
             ProviderToolBridge::default(),

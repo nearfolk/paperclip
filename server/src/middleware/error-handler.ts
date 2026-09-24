@@ -236,7 +236,33 @@ export function errorHandler(
     return;
   }
 
+  // Only body-parser's malformed-JSON errors are client input failures.
+  // Parser messages can quote request bytes; return a constant response and
+  // keep the raw error out of crash reporting and HTTP error context.
+  if (
+    err instanceof SyntaxError &&
+    "status" in err && err.status === 400 &&
+    "type" in err && err.type === "entity.parse.failed"
+  ) {
+    res.status(400).json({ error: "Invalid JSON body" });
+    return;
+  }
+
   const rootError = err instanceof Error ? err : new Error(String(err));
+
+  // The client tore down the connection mid-request (closed tab, dropped
+  // mobile network, cancelled upload): Node surfaces it as `Error: aborted`
+  // with ECONNRESET. There is no server fault to report and nobody left to
+  // answer, so skip the error sinks and just close out the response.
+  if (
+    rootError.message === "aborted" &&
+    (rootError as NodeJS.ErrnoException).code === "ECONNRESET"
+  ) {
+    if (!res.headersSent) res.status(499);
+    res.end();
+    return;
+  }
+
   const reportableError = sanitizeSecretSensitiveError(req, rootError);
   attachErrorContext(
     req,

@@ -204,6 +204,16 @@ async function handleServerRequestBody(
           ],
         };
       }
+      let feedback = "Completion report accepted. Task status is committed after this turn and workspace finalization finish.";
+      try {
+        feedback = await state.completionFeedback?.(validation.result) ?? feedback;
+      } catch (error) {
+        return rejectedToolCall(boundedText(error instanceof Error ? error.message : error));
+      }
+      state.assertProtocolIntegrity();
+      if (state.terminal || state.activeTurnId !== turnId) {
+        return rejectedToolCall("The turn ended while checking completion. The result was not accepted.");
+      }
       const admission = admitResult(state, validation.result, callId, turnId);
       if (admission === "conflict") {
         return rejectedToolCall(
@@ -213,7 +223,7 @@ async function handleServerRequestBody(
       return {
         success: true,
         contentItems: [
-          { type: "inputText", text: "Semantic completion accepted." },
+          { type: "inputText", text: feedback },
         ],
       };
     }
@@ -282,7 +292,11 @@ async function handleServerRequestBody(
       prompt: runtimeRequestPrompt(requestKind, request.params),
       details: record(redactCodexValue(boundedCodexValue(request.params))),
       ...(input !== null ? { input } : {}),
-      origin: {
+      origin: request.method === "elicitation/create" ? {
+        adapter: "acpx-runtime-sidecar",
+        provider: text(record(request.params.origin).provider, "acpx"),
+        method: request.method,
+      } : {
         adapter: "codex-app-server",
         provider: "codex",
         method: request.method,

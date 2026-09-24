@@ -223,6 +223,7 @@ export const agentsApi = {
     type: string,
     data: {
       adapterConfig: Record<string, unknown>;
+      aiConnection?: import("@paperclipai/shared").AiConnectionBinding;
       agentId?: string;
       testCredentials?: Record<string, string>;
       environmentId?: string | null;
@@ -258,7 +259,16 @@ export const agentsApi = {
       reason: "retry_failed_run",
       failedRunId,
     });
-    if ("id" in result) return { runId: result.id, issueId: null };
+    if ("id" in result) {
+      // Exact retries are idempotent: a repeated click can return a successor
+      // that has already stopped. It does not mean a new attempt was queued.
+      if (["failed", "timed_out", "cancelled", "interrupted"].includes(result.status)) {
+        throw new Error(
+          "The previous retry has already stopped. Refresh the task and retry its latest failed run.",
+        );
+      }
+      return { runId: result.id, issueId: null };
+    }
     if ("actionId" in result) {
       if (result.status === "failed" || result.status === "cancelled") {
         throw new Error(
@@ -274,7 +284,7 @@ export const agentsApi = {
   startAdapterAuthLogin: (
     companyId: string,
     type: string,
-    data: { environmentId: string; ttlSeconds?: number },
+    data: { environmentId: string; ttlSeconds?: number; aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent },
   ) =>
     api.post<AdapterAuthSessionResponse>(
       `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/login-sessions`,
@@ -317,7 +327,7 @@ export const agentsApi = {
     ),
   startClaudeSetupTokenLogin: (
     companyId: string,
-    data: { environmentId: string; overwrite?: ClaudeSetupTokenOverwrite },
+    data: { environmentId: string; overwrite?: ClaudeSetupTokenOverwrite; aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent },
   ) =>
     api.post<ClaudeSetupTokenSessionOwnerResponse>(
       `/companies/${encodeURIComponent(companyId)}/setup-token-login-sessions`,

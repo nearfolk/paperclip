@@ -41,6 +41,19 @@ describe("TaskChatBubble attachment chips", () => {
     );
   }
 
+  it("shows persistent iMessage attribution only on inbound human bubbles", () => {
+    for (const author of ["human", "agent"] as const) {
+      flushSync(() => root!.render(
+        <ThemeProvider>
+          <TaskChatBubble item={{ id: "photon", kind: "message", author, text: "A reply", timestamp: "1:56 PM", sourceChannel: "imessage-photon" }} />
+        </ThemeProvider>,
+      ));
+      expect(container.textContent?.includes("Sent from iMessage")).toBe(author === "human");
+    }
+    renderMessage("Board reply");
+    expect(container.textContent).not.toContain("Sent from iMessage");
+  });
+
   it("opens attachment images in the shared task gallery", () => {
     const openGallery = vi.fn(() => true);
     const contentPath = "/api/attachments/shared-image/content";
@@ -79,6 +92,33 @@ describe("TaskChatBubble attachment chips", () => {
     // No empty bubble is left behind once the only line is chipped.
     expect(container.textContent).toContain("report.pdf");
     expect(container.textContent).toContain("PDF");
+  });
+
+  it("opens video thumbnails in a local gallery when no task gallery is available", () => {
+    renderMessage("[clip.mp4](/api/attachments/clip/content)", "agent", [
+      attachment({ id: "clip", originalFilename: "clip.mp4", contentType: "video/mp4" }),
+    ]);
+    const group = container.querySelector('[data-testid="task-chat-bubble-attachments"]');
+    expect(group?.querySelector("video")?.getAttribute("src")).toBe("/api/attachments/clip/content");
+    expect(group?.querySelector("video")?.autoplay).toBe(false);
+    flushSync(() => group!.querySelector<HTMLButtonElement>('button[aria-label="Open clip.mp4"]')!.click());
+    expect(document.querySelector('[role="dialog"] video')?.getAttribute("src")).toBe("/api/attachments/clip/content");
+    expect(document.querySelector('[role="dialog"] a[download]')?.getAttribute("href")).toBe("/api/attachments/clip/content?download=1");
+  });
+
+  it.each(["video/mp4", "application/octet-stream"])("opens %s video attachments in the shared task gallery", (contentType) => {
+    const openGallery = vi.fn(() => true);
+    const clip = attachment({ id: "clip", originalFilename: "clip.mp4", contentType });
+    flushSync(() => root!.render(
+      <ThemeProvider>
+        <IssueGalleryContext.Provider value={openGallery}>
+          <TaskChatBubble item={{ id: "m1", kind: "message", author: "agent", text: `[clip.mp4](${clip.contentPath})` }} attachments={[clip]} />
+        </IssueGalleryContext.Provider>
+      </ThemeProvider>,
+    ));
+    flushSync(() => container.querySelector<HTMLButtonElement>('button[aria-label="Open clip.mp4"]')!.click());
+    expect(openGallery).toHaveBeenCalledWith(clip.contentPath);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("leaves messages without file references untouched", () => {
@@ -272,6 +312,29 @@ describe("TaskChatBubble accent-bubble text color", () => {
 });
 
 describe("TaskChatBubble agent page-surface treatment", () => {
+  it("does not show an on-behalf-of badge in the new task view", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    flushSync(() =>
+      root.render(
+        <ThemeProvider>
+          <TaskChatBubble
+            item={{ id: "attributed", kind: "message", author: "agent", authorName: "Fable", onBehalfOfUserName: "Dotta", text: "Done." }}
+          />
+        </ThemeProvider>,
+      ),
+    );
+
+    expect(container.textContent).toContain("Fable");
+    expect(container.textContent).not.toContain("for Dotta");
+    expect(container.querySelector('[data-testid="comment-attribution-chip"]')).toBeNull();
+
+    flushSync(() => root.unmount());
+    container.remove();
+  });
+
   it("renders agent prose without a card background or constrained width", () => {
     const container = document.createElement("div");
     document.body.appendChild(container);

@@ -97,6 +97,25 @@ const driver: HarnessDriver = {
 };
 
 describe("HarnessDriverBackend", () => {
+  it.each([false, true])("honors driver steering support even when the transport exposes a steer method (%s)", async supported => {
+    const steer = vi.fn(async () => { throw new Error("provider does not support steering"); });
+    const session = Object.assign(new FakeHarnessSession(), { steer });
+    const backend = new HarnessDriverBackend({ ...driver,
+      descriptor: async () => ({ ...(await driver.descriptor()), capabilities: {
+        ...(await driver.descriptor()).capabilities, steering: supported,
+      } }),
+      openSession: async () => session,
+      recoverSession: async () => ({ recovered: true, session }),
+    });
+    const opened = await backend.openSession({ identity: {
+      runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1",
+    } });
+    expect((await opened.capabilities()).steering).toBe(supported);
+    const recovered = await backend.recoverSession(await opened.snapshot(), { signal: new AbortController().signal });
+    expect(recovered.recovered).toBe(true);
+    expect((await recovered.session!.capabilities()).steering).toBe(supported);
+    expect(steer).not.toHaveBeenCalled();
+  });
   it("retains Codex accounting and startup state through a serialized native checkpoint", async () => {
     const fields = { workingDirectory: "/workspace/selected", codexUsageBaseline: {
       baseline: { inputTokens: 100, outputTokens: 20 },
@@ -935,6 +954,20 @@ describe("HarnessDriverBackend", () => {
     await iterator.next();
     await iterator.next();
     await expect(iterator.next()).rejects.toThrow("provider transport lost after resolution");
+  });
+
+  it("does not start provider work when Stop arrives before the first turn", async () => {
+    const provider = new FakeHarnessSession();
+    const start = vi.spyOn(provider, "startTurn");
+    const backend = new HarnessDriverBackend({ ...driver, async openSession() { return provider; } });
+    const session = await backend.openSession({
+      identity: { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+      workingDirectory: "/workspace",
+    });
+    await session.cancel({ reason: "user stop during startup", signal: new AbortController().signal }).cleanup;
+    await expect(session.startTurn({ message: { role: "user", text: "cancelled work" } }))
+      .rejects.toThrow("native_session_cancelled");
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("does not synthesize a fallback after explicit run cancellation", async () => {

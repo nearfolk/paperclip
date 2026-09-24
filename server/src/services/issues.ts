@@ -1,3 +1,7 @@
+import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
+import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
+import { documentService } from "./documents.js";
+import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
@@ -9,6 +13,7 @@ import {
   desc,
   eq,
   gt,
+  getTableColumns,
   gte,
   inArray,
   isNotNull,
@@ -60,6 +65,8 @@ import {
   issueReadStates,
   issueThreadInteractions,
   toolActionRequests,
+  toolActionDeliveries,
+  toolInvocations,
   issues,
   labels,
   projectWorkspaces,
@@ -1127,6 +1134,7 @@ export async function resolveChatOriginPublicationBindings(
     const run = await dbOrTx
       .select({
         agentId: heartbeatRuns.agentId,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -1140,6 +1148,7 @@ export async function resolveChatOriginPublicationBindings(
         (
           rows: Array<{
             agentId: string;
+            responsibleUserId: string | null;
             contextSnapshot: Record<string, unknown> | null;
           }>,
         ) => rows[0] ?? null,
@@ -1153,6 +1162,12 @@ export async function resolveChatOriginPublicationBindings(
       readStringFromRecord(snapshot, "issueId") ??
       readStringFromRecord(snapshot, "taskId");
     if (snapshotIssueId && snapshotIssueId !== issueId) return [];
+
+    const boardBindings = await slackBoardReplyBindings(dbOrTx, {
+      companyId, issueId, agentId: lineageAgentId!,
+      commentIds: readChatWakeCommentIds(snapshot), userId: run.responsibleUserId,
+    });
+    if (boardBindings.length) return boardBindings;
 
     // A native runner can emit its continuation immediately after the durable
     // `request.resolve` command is queued, before the delivery worker records
@@ -1298,6 +1313,51 @@ export async function resolveChatOriginPublicationBindings(
     }
 
     const contextSource = readStringFromRecord(snapshot, "source");
+    if (contextSource === "tool_action_review") {
+      // Review results use their own durable wake, not the ordinary interaction
+      // response key. Attest the entire batch before following its origin; the
+      // model's context/sourceRunId alone never grants publication authority.
+      const [wake] = await dbOrTx.select({ payload: agentWakeupRequests.payload,
+        idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, lineageAgentId!),
+          eq(agentWakeupRequests.runId, originRunId),
+          like(agentWakeupRequests.idempotencyKey, "tool-action-response:%"),
+        )).limit(1);
+      const requestIds = wake?.payload?.toolActionRequestIds;
+      const sourceRunId = readStringFromRecord(snapshot, "sourceRunId");
+      if (!Array.isArray(requestIds) || requestIds.length === 0 ||
+        requestIds.some((id: unknown) => typeof id !== "string" || !isUuidLike(id)) ||
+        !sourceRunId || !isUuidLike(sourceRunId) || sourceRunId !== wake.payload.sourceRunId ||
+        wake.idempotencyKey !== `tool-action-response:${requestIds[0]}` ||
+        snapshot.interactionId !== wake.payload.interactionId) return [];
+      const receipts = await dbOrTx.select({ id: toolActionRequests.id })
+        .from(toolActionRequests)
+        .innerJoin(toolInvocations, and(
+          eq(toolInvocations.id, toolActionRequests.invocationId),
+          eq(toolInvocations.companyId, companyId),
+          eq(toolInvocations.issueId, issueId),
+          eq(toolInvocations.agentId, lineageAgentId!),
+          eq(toolInvocations.runId, sourceRunId),
+        ))
+        .innerJoin(toolActionDeliveries, and(
+          eq(toolActionDeliveries.actionRequestId, toolActionRequests.id),
+          eq(toolActionDeliveries.companyId, companyId),
+          eq(toolActionDeliveries.issueId, issueId),
+          eq(toolActionDeliveries.interactionId, toolActionRequests.interactionId),
+        ))
+        .where(and(
+          eq(toolActionRequests.companyId, companyId),
+          eq(toolActionRequests.issueId, issueId),
+          eq(toolActionRequests.requestedByAgentId, lineageAgentId!),
+          inArray(toolActionRequests.id, requestIds),
+          inArray(toolActionRequests.status, ["executed", "failed", "rejected", "expired", "cancelled"]),
+        ));
+      if (receipts.length !== requestIds.length) return [];
+      originRunId = sourceRunId;
+      continue;
+    }
     if (contextSource?.startsWith("chat:")) {
       contextSnapshot = snapshot;
       break;
@@ -1774,7 +1834,7 @@ export interface IssueFilters {
   updatedSince?: string;
 }
 
-type IssueRow = typeof issues.$inferSelect;
+type IssueRow = typeof issues.$inferSelect & { externalConversationState?: "active" | "waiting" | null };
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
@@ -1857,8 +1917,17 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+/** Conversation containers cannot acquire new child edges, even with the experiment disabled. */
+async function assertExecutionTaskParent(db: Db, companyId: string, parentId?: string | null) {
+  if (!parentId) return;
+  const [parent] = await db.select({ conversationAgentId: issues.conversationAgentId })
+    .from(issues).where(and(eq(issues.id, parentId), eq(issues.companyId, companyId)));
+  if (parent?.conversationAgentId) throw unprocessable("Conversations cannot have new subtasks; create a task in a project instead");
+}
+
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
+  initialPlan?: string | null;
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
@@ -4399,7 +4468,7 @@ async function listIssueReviewAttentionMap(
         .select()
         .from(issues)
         .where(
-          and(eq(issues.companyId, companyId), inArray(issues.id, chunk)),
+          and(eq(issues.companyId, companyId), inArray(issues.id, chunk), nonIdleSlackIssueCondition()),
         )),
     );
   }
@@ -4609,6 +4678,9 @@ async function listIssueReviewAttentionMap(
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      conversationAgentId: issue.conversationAgentId,
+      conversationUserId: issue.conversationUserId,
+      conversationState: issue.conversationState,
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
@@ -4763,6 +4835,12 @@ async function listIssueReviewAttentionMap(
 }
 
 const issueListSelect = {
+  externalConversationState: externalConversationStateSql(),
+  conversationAgentId: issues.conversationAgentId,
+  conversationUserId: issues.conversationUserId,
+  conversationState: issues.conversationState,
+  conversationSessionGeneration: issues.conversationSessionGeneration,
+  conversationBoundaryCommentId: issues.conversationBoundaryCommentId,
   id: issues.id,
   companyId: issues.companyId,
   projectId: issues.projectId,
@@ -5705,6 +5783,9 @@ async function listIssueBlockedInboxAttentionMap(
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      conversationAgentId: issue.conversationAgentId,
+      conversationUserId: issue.conversationUserId,
+      conversationState: issue.conversationState,
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
@@ -6470,7 +6551,7 @@ export function issueService(db: Db) {
 
   async function getIssueByUuid(id: string) {
     const row = await db
-      .select()
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.id, id))
       .then((rows) => rows[0] ?? null);
@@ -6481,7 +6562,7 @@ export function issueService(db: Db) {
 
   async function getIssueByIdentifier(identifier: string) {
     const row = await db
-      .select()
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.identifier, identifier.toUpperCase()))
       .then((rows) => rows[0] ?? null);
@@ -7810,6 +7891,12 @@ export function issueService(db: Db) {
         eq(issues.companyId, companyId),
         visibleIssueCondition(),
       ];
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
       if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(
         filters?.assigneeAgentId,
@@ -7836,24 +7923,7 @@ export function issueService(db: Db) {
         filters?.includeLiveDescendantSummary === true;
       const rawSearch = filters?.q?.trim() ?? "";
       const hasSearch = rawSearch.length > 0;
-      const escapedSearch = hasSearch ? escapeLikePattern(rawSearch) : "";
-      const startsWithPattern = `${escapedSearch}%`;
-      const containsPattern = `%${escapedSearch}%`;
-      const titleStartsWithMatch = sql<boolean>`${issues.title} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const titleContainsMatch = sql<boolean>`${issues.title} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const identifierStartsWithMatch = sql<boolean>`${issues.identifier} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const identifierContainsMatch = sql<boolean>`${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const descriptionContainsMatch = sql<boolean>`${issues.description} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const commentContainsMatch = sql<boolean>`
-        EXISTS (
-          SELECT 1
-          FROM ${issueComments}
-          WHERE ${issueComments.issueId} = ${issues.id}
-            AND ${issueComments.companyId} = ${companyId}
-            AND ${issueComments.deletedAt} IS NULL
-            AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
-        )
-      `;
+      const taskSearch = parseTaskSearch(rawSearch);
       if (filters?.createdFromIssueId) {
         conditions.push(createdFromIssueCondition(companyId, filters.createdFromIssueId));
       }
@@ -7961,16 +8031,6 @@ export function issueService(db: Db) {
           ),
         );
       }
-      if (hasSearch) {
-        conditions.push(
-          or(
-            titleContainsMatch,
-            identifierContainsMatch,
-            descriptionContainsMatch,
-            commentContainsMatch,
-          )!,
-        );
-      }
       if (filters?.updatedSince) {
         const since = new Date(filters.updatedSince);
         if (Number.isFinite(since.getTime())) {
@@ -7985,20 +8045,15 @@ export function issueService(db: Db) {
         conditions.push(ne(issues.originKind, "routine_execution"));
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
-      const searchOrder = sql<number>`
-        CASE
-          WHEN ${titleStartsWithMatch} THEN 0
-          WHEN ${titleContainsMatch} THEN 1
-          WHEN ${identifierStartsWithMatch} THEN 2
-          WHEN ${identifierContainsMatch} THEN 3
-          WHEN ${commentContainsMatch} THEN 4
-          WHEN ${descriptionContainsMatch} THEN 5
-          ELSE 6
-        END
-      `;
-      const baseQuery = db
-        .select(issueListSelect)
-        .from(issues)
+      const searchOrder = sql<number>`-task_search.score`;
+      const issueSource = db.select(issueListSelect).from(issues);
+      const searchedSource = hasSearch
+        ? issueSource.innerJoin(sql`(
+            ${taskSearchCtes(companyId, taskSearch, true, and(...conditions))}
+            SELECT m.id, ${taskSearchScore(taskSearch)} AS score FROM matched m
+          ) task_search`, sql`task_search.id = ${issues.id}`)
+        : issueSource;
+      const baseQuery = searchedSource
         .where(and(...conditions))
         .orderBy(
           ...issueListOrderBy(companyId, {
@@ -8169,10 +8224,13 @@ export function issueService(db: Db) {
         return countBlockedInboxIssues(db, companyId, filters);
       }
 
-      const conditions = [
-        eq(issues.companyId, companyId),
-        visibleIssueCondition(),
-      ];
+      const conditions = [eq(issues.companyId, companyId), visibleIssueCondition()];
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
       const statuses = parseStatusFilter(filters?.status);
       if (statuses.length === 1)
         conditions.push(eq(issues.status, statuses[0]!));
@@ -9042,6 +9100,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, blockerIssue.companyId),
             eq(issueRelations.type, "blocks"),
             eq(issueRelations.issueId, blockerIssueId),
+            isNull(issues.conversationAgentId),
           ),
         );
       if (candidates.length === 0) return [];
@@ -9090,6 +9149,7 @@ export function issueService(db: Db) {
       const parent = await db
         .select({
           id: issues.id,
+          conversationAgentId: issues.conversationAgentId,
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           companyId: issues.companyId,
@@ -9097,11 +9157,7 @@ export function issueService(db: Db) {
         .from(issues)
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
-      if (
-        !parent ||
-        !parent.assigneeAgentId ||
-        ["backlog", "done", "cancelled"].includes(parent.status)
-      ) {
+      if (!parent || parent.conversationAgentId || !parent.assigneeAgentId || ["backlog", "done", "cancelled"].includes(parent.status)) {
         return null;
       }
 
@@ -9189,6 +9245,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
       if (!parent) throw notFound("Parent issue not found");
+      await assertExecutionTaskParent(db, parent.companyId, parent.id);
 
       const idempotencyKey = data.idempotencyKey?.trim();
       if (idempotencyKey) {
@@ -9687,12 +9744,17 @@ export function issueService(db: Db) {
       });
     },
 
+    getConversation: async (companyId: string, agentId: string, userId: string) => db.select().from(issues).where(and(
+      eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId), eq(issues.conversationUserId, userId),
+    )).then((rows) => rows[0] ?? null),
+
     create: async (
       companyId: string,
       data: IssueCreateInput,
       dbOrTx: Db | DbTransaction = db,
     ) => {
       const {
+        initialPlan,
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
@@ -9734,6 +9796,18 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       const persist = async (tx: DbTransaction) => {
+        await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
+        if (issueData.conversationAgentId && issueData.conversationUserId) {
+          const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${identity}, 0))`);
+          const [existing] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId),
+            eq(issues.conversationAgentId, issueData.conversationAgentId), eq(issues.conversationUserId, issueData.conversationUserId)));
+          if (existing) {
+            const [enriched] = await withIssueLabels(tx, [existing]);
+            const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
+            return withRelations;
+          }
+        }
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -10142,6 +10216,13 @@ export function issueService(db: Db) {
             tx,
           );
         }
+        if (initialPlan?.trim()) {
+          await documentService(tx as unknown as Db).upsertIssueDocument({
+            issueId: issue.id, key: "plan", title: "Plan", format: "markdown", body: initialPlan,
+            createdByAgentId: issueData.createdByAgentId, createdByUserId: issueData.createdByUserId,
+            createdByRunId: actorRunId,
+          });
+        }
         const [enriched] = await withIssueLabels(tx, [issue]);
         const [withRelations] = await withIssueRelationSummaries(
           companyId,
@@ -10283,6 +10364,7 @@ export function issueService(db: Db) {
 
         let counter = base;
         for (const row of rows) {
+          await assertExecutionTaskParent(tx as unknown as Db, companyId, row.parentId);
           counter += 1;
           const issueNumber = counter;
           const identifier = `${company.issuePrefix}-${issueNumber}`;
@@ -10508,6 +10590,7 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
+      options: { bindRuntimeSharedWorkspace?: boolean } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -10530,6 +10613,17 @@ export function issueService(db: Db) {
         .where(idPredicate)
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
+      if (data.parentId !== undefined && data.parentId !== existing.parentId) {
+        await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
+      }
+      if (existing.conversationAgentId) {
+        if ((data.assigneeAgentId !== undefined && data.assigneeAgentId !== existing.conversationAgentId)
+          || data.assigneeUserId || data.conversationAgentId !== undefined || data.conversationUserId !== undefined
+          || data.conversationState !== undefined || data.conversationSessionGeneration !== undefined
+          || data.conversationBoundaryCommentId !== undefined || data.status === "done" || data.status === "cancelled") {
+          throw unprocessable("Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation");
+        }
+      }
 
       const {
         labelIds: nextLabelIds,
@@ -10567,7 +10661,30 @@ export function issueService(db: Db) {
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
-      if (!isolatedWorkspacesEnabled) {
+      if (options.bindRuntimeSharedWorkspace) {
+        const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
+        if (!workspaceId) {
+          throw unprocessable("Runtime workspace binding requires an existing shared workspace");
+        }
+        const [workspace] = await dbOrTx
+          .select({ mode: executionWorkspaces.mode })
+          .from(executionWorkspaces)
+          .where(and(
+            eq(executionWorkspaces.id, workspaceId),
+            eq(executionWorkspaces.companyId, existing.companyId),
+          ));
+        if (
+          workspace?.mode !== "shared_workspace" ||
+          (issueData.executionWorkspacePreference ?? existing.executionWorkspacePreference) !== "reuse_existing" ||
+          (issueData.executionWorkspaceSettings ?? existing.executionWorkspaceSettings)?.mode !== "shared_workspace"
+        ) {
+          throw unprocessable("Runtime workspace binding requires an existing shared workspace");
+        }
+      }
+      // Warm sandbox continuity is runtime bookkeeping, independent of the
+      // opt-in UI for creating isolated worktrees. Public updates still obey
+      // the feature gate; only the internal shared-workspace binding bypasses it.
+      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
@@ -10819,6 +10936,21 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        // Ownership changes invalidate observed handoff versions even if status
+        // stays the same, including an A -> B -> A assignment race.
+        if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
+          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
+        // Reasserting Blocked or changing its blockers is a fresh decision even
+        // when the status string stays the same. Invalidate recovery's prior
+        // status receipt without treating comment recency as blocking intent.
+        if (receiptExisting.status === "blocked" &&
+            (issueData.status === "blocked" ||
+              (issueData.status === undefined &&
+                (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -10826,6 +10958,14 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // An operator explicitly choosing a disposition owns that decision,
+        // including choosing In Review while the conversation is Idle.
+        if (actorUserId && issueData.status !== undefined) {
+          await tx.update(chatConversations).set({ state: "active", updatedAt: new Date() })
+            .where(and(eq(chatConversations.companyId, updated.companyId), eq(chatConversations.issueId, updated.id),
+              eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
+                where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
+        }
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
@@ -12016,10 +12156,13 @@ export function issueService(db: Db) {
         authorizationReason?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
+        clientRequestId?: string;
+        /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
+        mirrorToSlack?: boolean;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
-      if (dbOrTx === db && actor.runId) {
+      if (dbOrTx === db && (actor.runId || actor.userId)) {
         const append = () =>
           db.transaction(async (tx) => {
             // Serialize run-authored comments on the issue so a provider retry
@@ -12038,14 +12181,21 @@ export function issueService(db: Db) {
           ? retryNativeChatReviewPresentation(append)
           : append();
       }
+      // Callers supplying a transaction still share the settlement fence.
+      if (actor.userId && dbOrTx !== db) {
+        await dbOrTx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      }
       const issue = await dbOrTx
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, conversationAgentId: issues.conversationAgentId })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+        .then((rows: Array<{ companyId: string; conversationAgentId: string | null }>) => rows[0] ?? null);
 
       if (!issue) throw notFound("Issue not found");
 
+      if (issue.conversationAgentId && actor.userId && !(await instanceSettingsService(dbOrTx).getExperimental()).enableAgentChat) {
+        throw unprocessable("Agent Chat is disabled in Experimental settings");
+      }
       const currentUserRedactionOptions = {
         // Keep every read on the caller's transaction connection. Re-entering
         // the outer pool here can deadlock when concurrent transactions fill
@@ -12053,10 +12203,23 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral({ db: dbOrTx }))
           .censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(
-        body,
-        currentUserRedactionOptions,
-      );
+      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      if (actor.userId && options?.clientRequestId) {
+        const [existing] = await dbOrTx.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+          eq(issueComments.authorUserId, actor.userId), eq(issueComments.clientRequestId, options.clientRequestId)));
+        if (existing) {
+          if (existing.body !== redactedBody) throw conflict("Message request ID was already used for different content");
+          return existing;
+        }
+      }
+      if (issue.conversationAgentId && actor.runId) {
+        const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
+        const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
+        if (run?.status === "cancelled") throw conflict("This conversation turn was cancelled; it cannot post a reply");
+        if (run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
+          throw conflict("Conversation session changed; this reply belongs to an earlier session");
+        }
+      }
       const authorType = issueCommentAuthorTypeSchema.parse(
         options?.authorType ??
           (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
@@ -12267,6 +12430,7 @@ export function issueService(db: Db) {
             authorType,
             createdByRunId,
             body: redactedBody,
+            clientRequestId: options?.clientRequestId ?? null,
             presentation,
             metadata,
             sourceTrust: options?.sourceTrust ?? null,
@@ -12472,6 +12636,15 @@ export function issueService(db: Db) {
         }
       }
 
+      if (issue.conversationAgentId && actor.userId) {
+        await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
+      }
+      if (options?.mirrorToSlack && actor.userId && authorType === "user") {
+        await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });
+      }
+      if (authorType === "user" || actor.userId) {
+        await resumeSlackConversation(dbOrTx, issue.companyId, issueId);
+      }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx
         .update(issues)
@@ -12490,7 +12663,13 @@ export function issueService(db: Db) {
         // channel" publications use the separate publication path.
         const chatFinalOwnsProviderReply =
           createdByRun !== null &&
-          isExternalChatPresentationContext(createdByRun.contextSnapshot) &&
+          isExternalChatPresentationContext(
+            createdByRun.contextSnapshot,
+            readStringFromRecord(createdByRun.contextSnapshot, "source") === "tool_action_review" &&
+              (await resolveChatOriginPublicationBindings(
+                dbOrTx, issue.companyId, issueId, createdByRunId,
+              )).length > 0,
+          ) &&
           metadata?.authorizationReason !==
             CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;
         const interactionOwnsProviderReply = createdByRunId

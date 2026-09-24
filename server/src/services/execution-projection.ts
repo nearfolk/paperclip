@@ -29,6 +29,7 @@ const executionRunColumns = {
   status: heartbeatRuns.status,
   contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
     'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+    'failureRetriesBeforeAiConnectionWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeAiConnectionWait',
     'failureRetriesBeforeWorkspaceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeWorkspaceWait')`,
 };
 type Run = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof executionRunColumns>;
@@ -184,6 +185,16 @@ export function projectExecution(
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     projection.nextAction = recoveryAction.nextAction;
+    const continuation = recoveryAction.evidence.explicitUserContinuation as
+      { previousRunId?: unknown; runId?: unknown } | undefined;
+    const explicitSuccessor = text(continuation?.runId);
+    if (continuation?.previousRunId === run.id && explicitSuccessor && explicitSuccessor !== run.id) {
+      // The admission transaction already recorded the user's successor. Keep
+      // the old failure diagnostic without making it hold the newer attempt.
+      projection.successorRunId = explicitSuccessor;
+      projection.nextAction = null;
+      return set("completed", "Continued in another run");
+    }
     // Diagnostic projection only: no user decision or replay affordance.
     return set("recovery_needed", "Stopped");
   }
@@ -220,14 +231,23 @@ export function projectExecution(
   )
     return set("finishing", "Finishing");
   if (successorRunId) return set("completed", "Continued in another run");
+  if (run.status === "scheduled_retry" && run.scheduledRetryReason === "ai_connection_busy") {
+    projection.nextAction = "Waiting for the AI subscription's current execution to finish; the scheduled check will revalidate access.";
+    return set("retry_scheduled", "Waiting for AI subscription");
+  }
   if (run.status === "scheduled_retry" && run.scheduledRetryReason === "workspace_busy") {
     projection.nextAction = "Waiting for the live workspace holder to finish; the scheduled check will revalidate ownership.";
     return set("retry_scheduled", "Waiting for workspace");
   }
-  if (
+  // Cleanup can fail before a finalization coordinator exists. The missing
+  // row must not turn a quarantined native session into an ordinary Retry.
+  const cleanupQuarantined = run.runtimeMode === "native" &&
+    ["failed", "timed_out"].includes(run.status) &&
+    run.errorCode === "native_session_cleanup_quarantined";
+  if (!cleanupQuarantined && (
     coordinator?.phase === "retryable_failure" ||
     run.status === "scheduled_retry"
-  ) {
+  )) {
     projection.recoveryOwner = "agent";
     return set(
       projection.retryAt && new Date(projection.retryAt) > now
@@ -238,8 +258,9 @@ export function projectExecution(
         : "Reconnecting",
     );
   }
-  if (coordinator?.phase === "terminal_failure" || recoveryAction) {
+  if (coordinator?.phase === "terminal_failure" || recoveryAction || cleanupQuarantined) {
     if (
+      !cleanupQuarantined &&
       coordinator?.failureCode === "native_provider_terminal_failed" &&
       !detail.replacementDenied &&
       run.finishedAt &&
@@ -256,6 +277,9 @@ export function projectExecution(
       text(detail.replacementDenied) ??
       projection.cause;
     projection.nextAction = recoveryAction?.nextAction ?? projection.nextAction;
+    if (cleanupQuarantined && !projection.nextAction) {
+      projection.nextAction = "Verify the stopped session and its saved work before starting a new attempt.";
+    }
     projection.permittedActions.push("inspect_recovery");
     return set("recovery_needed", "Recovery needed");
   }
