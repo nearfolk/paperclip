@@ -210,6 +210,37 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
+  async function seedLegacyTakeover() {
+    const seeded = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: seeded.managerId })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    const [legacyAction] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: seeded.managerId,
+        previousOwnerAgentId: seeded.coderId,
+        returnOwnerAgentId: seeded.coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `legacy-takeover:${seeded.sourceIssueId}`,
+        evidence: { latestRunErrorCode: "acpx_session_init_failed" },
+        nextAction: "Restore the issue to the named decision owner.",
+        wakePolicy: {
+          type: "bounded_recovery_owner",
+          retryAgentId: seeded.managerId,
+        },
+        maxAttempts: 3,
+      })
+      .returning();
+    return { ...seeded, legacyAction: legacyAction! };
+  }
+
   async function seedHeartbeatRun(input: {
     companyId: string;
     agentId: string;
@@ -670,31 +701,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   );
 
   it("returns a stranded legacy takeover to its named owner and keeps a live recovery action", async () => {
-    const { companyId, managerId, coderId, sourceIssueId } =
-      await seedCompany();
-    await db
-      .update(issues)
-      .set({ status: "blocked", assigneeAgentId: managerId })
-      .where(eq(issues.id, sourceIssueId));
-    const [legacyAction] = await db
-      .insert(issueRecoveryActions)
-      .values({
-        companyId,
-        sourceIssueId,
-        kind: "stranded_assigned_issue",
-        status: "active",
-        ownerType: "agent",
-        ownerAgentId: managerId,
-        previousOwnerAgentId: coderId,
-        returnOwnerAgentId: coderId,
-        cause: "stranded_assigned_issue",
-        fingerprint: `legacy-takeover:${sourceIssueId}`,
-        evidence: { latestRunErrorCode: "acpx_session_init_failed" },
-        nextAction: "Restore the issue to the named decision owner.",
-        wakePolicy: { type: "bounded_recovery_owner", retryAgentId: managerId },
-        maxAttempts: 3,
-      })
-      .returning();
+    const { managerId, coderId, sourceIssueId, legacyAction } =
+      await seedLegacyTakeover();
     const enqueueWakeup = vi.fn(async () => null);
 
     const result = await recoveryService(db, {
@@ -720,7 +728,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [actionAfter] = await db
       .select()
       .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.id, legacyAction!.id));
+      .where(eq(issueRecoveryActions.id, legacyAction.id));
     expect(actionAfter).toMatchObject({
       status: "active",
       ownerType: "board",
@@ -744,6 +752,136 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }),
     });
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["queued", "running", "scheduled_retry"])(
+    "keeps a null-lock legacy takeover while its %s recovery run is live",
+    async (status) => {
+      const { companyId, managerId, sourceIssueId, legacyAction } =
+        await seedLegacyTakeover();
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: managerId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status,
+        contextSnapshot: {
+          issueId: sourceIssueId,
+          recoveryActionId: legacyAction.id,
+        },
+      });
+
+      const result = await recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      }).reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 0, skipped: 1 });
+      expect(
+        (await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0],
+      ).toMatchObject({
+        status: "blocked",
+        assigneeAgentId: managerId,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+      expect(
+        (
+          await db
+            .select()
+            .from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.id, legacyAction.id))
+        )[0],
+      ).toMatchObject({
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+      });
+    },
+  );
+
+  it.each(["queued", "claimed", "deferred_issue_execution"])(
+    "keeps a null-lock legacy takeover while its %s recovery wake is live",
+    async (status) => {
+      const { companyId, managerId, sourceIssueId, legacyAction } =
+        await seedLegacyTakeover();
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: managerId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        status,
+        payload: {
+          issueId: sourceIssueId,
+          recoveryActionId: legacyAction.id,
+        },
+      });
+
+      const result = await recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      }).reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 0, skipped: 1 });
+      expect(
+        (await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0],
+      ).toMatchObject({
+        status: "blocked",
+        assigneeAgentId: managerId,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+      expect(
+        (
+          await db
+            .select()
+            .from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.id, legacyAction.id))
+        )[0],
+      ).toMatchObject({
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+      });
+    },
+  );
+
+  it("ignores an action-shaped recovery wake from another company", async () => {
+    const { coderId, sourceIssueId, legacyAction } =
+      await seedLegacyTakeover();
+    const other = await seedCompany();
+    await db.insert(agentWakeupRequests).values({
+      companyId: other.companyId,
+      agentId: other.managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      status: "queued",
+      payload: {
+        issueId: sourceIssueId,
+        recoveryActionId: legacyAction.id,
+      },
+    });
+
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    }).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 1 });
+    expect(
+      (await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0],
+    ).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    expect(
+      (
+        await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, legacyAction.id))
+      )[0],
+    ).toMatchObject({
+      status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
+    });
   });
 
   it("stands down while the latest run was cancelled by a board operator", async () => {

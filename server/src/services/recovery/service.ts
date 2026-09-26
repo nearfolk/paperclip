@@ -3346,11 +3346,13 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function sourceHasNewPathOutsideRecoveryAction(
+  async function sourceHasExecutionPath(
     action: typeof issueRecoveryActions.$inferSelect,
+    queryDb: Db = db,
+    includeRecoveryActionPath = false,
   ) {
     const [run, wake] = await Promise.all([
-      db
+      queryDb
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
@@ -3359,13 +3361,15 @@ export function recoveryService(
             inArray(heartbeatRuns.status, [
               ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
             ]),
-            sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
-            sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId', '') <> ${action.id}`,
+            sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
+            includeRecoveryActionPath
+              ? undefined
+              : sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId', '') <> ${action.id}`,
           ),
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      db
+      queryDb
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
         .where(
@@ -3376,8 +3380,10 @@ export function recoveryService(
               "claimed",
               "deferred_issue_execution",
             ]),
-            sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId') = ${action.sourceIssueId}`,
-            sql`coalesce(${agentWakeupRequests.payload} ->> 'recoveryActionId', '') <> ${action.id}`,
+            sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId') = ${action.sourceIssueId}`,
+            includeRecoveryActionPath
+              ? undefined
+              : sql`coalesce(${agentWakeupRequests.payload} ->> 'recoveryActionId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'recoveryActionId', '') <> ${action.id}`,
           ),
         )
         .limit(1)
@@ -3446,6 +3452,22 @@ export function recoveryService(
         lockedIssue.assigneeUserId !== null ||
         lockedIssue.executionRunId !== null ||
         lockedIssue.checkoutRunId !== null
+      ) {
+        return false;
+      }
+
+      // Issue-bound admission takes this same issue row lock before it inserts
+      // a run or wake. Probe only after locking the source and action so an
+      // existing path is visible and a racing admission must revalidate the
+      // assignee after this transaction commits. Action-owned recovery work is
+      // included: restoring the owner must not orphan the very wake or run that
+      // is still repairing this legacy takeover.
+      if (
+        await sourceHasExecutionPath(
+          lockedAction,
+          tx as unknown as Db,
+          true,
+        )
       ) {
         return false;
       }
@@ -3576,7 +3598,7 @@ export function recoveryService(
         await Promise.all([
           collectDispositionRepairSourceState(db, { issue }),
           healthyOpenChildIssues(issue),
-          sourceHasNewPathOutsideRecoveryAction(action),
+          sourceHasExecutionPath(action),
         ]);
       const durablePathRestored =
         action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
