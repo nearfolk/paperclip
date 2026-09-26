@@ -7432,6 +7432,9 @@ export function issueService(db: Db) {
     operation: (tx: DbTransaction) => Promise<T>;
   }): Promise<T> {
     return db.transaction(async (tx) => {
+      // Terminal release uses this same issue -> run order. If checkout wins,
+      // release snapshots the durable run claim before clearing it and routes
+      // the still-active issue to a successor or the host handoff policy.
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`,
       );
