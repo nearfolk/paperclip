@@ -120,6 +120,9 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /** A normal successful provider turn delegates its next-path decision to
+   * the host's liveness and successful-run handoff policies. */
+  suppressSuccessfulCheckoutRecovery?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -519,7 +522,9 @@ async function runReleaseRecoveryTail(
       // Checkout and terminalization serialize on the same two rows. When
       // checkout wins, release sees its durable claim here and must create the
       // next execution path before clearing the terminal run IDs.
-      (run.status === "succeeded" && issue.checkoutRunId === run.id));
+      (run.status === "succeeded" &&
+        issue.checkoutRunId === run.id &&
+        input.suppressSuccessfulCheckoutRecovery !== true));
 
   const suppressedByPauseHold =
     reviewParticipantApplies || immediateApplies

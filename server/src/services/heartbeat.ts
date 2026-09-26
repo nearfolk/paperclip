@@ -25236,6 +25236,12 @@ export function heartbeatService(
               ) !== null ||
               parseObject(livenessRun.contextSnapshot)
                 .resumeSessionGoalHeartbeat === true,
+            // A normal successful provider turn reaches the established
+            // liveness/handoff decision immediately below. Do not let the
+            // checkout-before-terminalization recovery rule preempt that
+            // decision with an unconditional generic continuation. Review
+            // participant recovery remains independently eligible.
+            suppressSuccessfulCheckoutRecovery: outcome === "succeeded",
           });
           if (!conversationSettled) {
             await handleIssueReviewPathDisposition(livenessRun);
@@ -26151,7 +26157,10 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      suppressSuccessfulCheckoutRecovery?: boolean;
+    } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -26159,6 +26168,8 @@ export function heartbeatService(
         runId: run.id,
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
+        suppressSuccessfulCheckoutRecovery:
+          options.suppressSuccessfulCheckoutRecovery,
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);
