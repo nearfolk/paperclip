@@ -3,6 +3,7 @@ import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
   checkoutIssueSchema,
+  issueCommentMetadataSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
@@ -46,6 +47,39 @@ describe("issue validators", () => {
         expectedStatuses: ["todo", "done"],
       }).success,
     ).toBe(false);
+  });
+
+  it("validates the typed recovery display snapshot while retaining older metadata", () => {
+    const metadata = {
+      version: 1,
+      sections: [{ rows: [{ type: "text", text: "Details" }] }],
+    };
+    const recovery = {
+      kind: "disposition_repair_escalated",
+      actionId: "9af8228f-0be7-45ae-a104-6fbe0af6f1d3",
+      attemptCount: 2,
+      maxAttempts: 2,
+      reason: "unchanged_source_state_exhausted",
+      assigneeAgentId: null,
+    };
+    expect(
+      issueCommentMetadataSchema.parse({ ...metadata, recovery }).recovery,
+    ).toEqual(recovery);
+    expect(issueCommentMetadataSchema.parse(metadata)).toEqual(metadata);
+    for (const patch of [
+      { actionId: "bad-id" },
+      { attemptCount: -1 },
+      { attemptCount: 0.5 },
+      { maxAttempts: 0 },
+      { kind: "prose" },
+    ]) {
+      expect(
+        issueCommentMetadataSchema.safeParse({
+          ...metadata,
+          recovery: { ...recovery, ...patch },
+        }).success,
+      ).toBe(false);
+    }
   });
 
   it("uses the same bounded unique upload ID contract for comment and update requests", () => {
