@@ -9396,6 +9396,80 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+// A checkout locks issue -> heartbeat run. Suppression release must use the
+// same order: preview immutable routing context without a row lock, lock the
+// context issue, then conditionally move the still-running run back to queued.
+// Reading before locking is safe because the guarded update remains the source
+// of truth; if another terminalizer wins, it updates no row and this is a no-op.
+export async function releaseRunClaimedJustBeforeSuppression(
+  db: Db,
+  runId: string,
+) {
+  const now = new Date();
+  await db.transaction(async (tx) => {
+    const preview = await tx
+      .select({
+        companyId: heartbeatRuns.companyId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!preview) return;
+
+    const issueId = readNonEmptyString(parseObject(preview.contextSnapshot).issueId);
+    if (issueId) {
+      await tx.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.id} = ${issueId}
+          and ${issues.companyId} = ${preview.companyId}
+        for update
+      `);
+    }
+
+    const released = await tx
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        startedAt: null,
+        responsibleUserId: null,
+        updatedAt: now,
+      })
+      .where(
+        and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!released) return;
+
+    if (released.wakeupRequestId) {
+      await tx
+        .update(agentWakeupRequests)
+        .set({ status: "queued", claimedAt: null, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, released.wakeupRequestId));
+    }
+
+    if (issueId) {
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, issueId),
+            eq(issues.companyId, released.companyId),
+            eq(issues.executionRunId, released.id),
+          ),
+        );
+    }
+  });
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -17819,53 +17893,6 @@ export function heartbeatService(
   // activeRunExecutionPromises while the wakeup stayed "claimed" or the
   // issue stayed locked to a queued run — task-drain status would then read
   // quiescent while the database still held part of the old claim.
-  async function releaseRunClaimedJustBeforeSuppression(runId: string) {
-    const now = new Date();
-    await db.transaction(async (tx) => {
-      const released = await tx
-        .update(heartbeatRuns)
-        .set({
-          status: "queued",
-          startedAt: null,
-          responsibleUserId: null,
-          updatedAt: now,
-        })
-        .where(
-          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!released) return;
-
-      if (released.wakeupRequestId) {
-        await tx
-          .update(agentWakeupRequests)
-          .set({ status: "queued", claimedAt: null, updatedAt: now })
-          .where(eq(agentWakeupRequests.id, released.wakeupRequestId));
-      }
-
-      const context = parseObject(released.contextSnapshot);
-      const issueId = readNonEmptyString(context.issueId);
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(issues.id, issueId),
-              eq(issues.companyId, released.companyId),
-              eq(issues.executionRunId, released.id),
-            ),
-          );
-      }
-    });
-  }
-
   async function cancelQueuedRunForBlockedDependencies(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -20035,7 +20062,7 @@ export function heartbeatService(
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
       try {
-        await releaseRunClaimedJustBeforeSuppression(runId);
+        await releaseRunClaimedJustBeforeSuppression(db, runId);
       } catch (err) {
         logger.error(
           { err, runId },

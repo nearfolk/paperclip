@@ -515,7 +515,11 @@ async function runReleaseRecoveryTail(
     issue.assigneeAgentId === run.agentId &&
     (run.status === "failed" ||
       run.status === "timed_out" ||
-      run.status === "cancelled");
+      run.status === "cancelled" ||
+      // Checkout and terminalization serialize on the same two rows. When
+      // checkout wins, release sees its durable claim here and must create the
+      // next execution path before clearing the terminal run IDs.
+      (run.status === "succeeded" && issue.checkoutRunId === run.id));
 
   const suppressedByPauseHold =
     reviewParticipantApplies || immediateApplies

@@ -17,7 +17,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService, getTaskDrainStatus, startTaskDrain, stopTaskDrain } from "../services/heartbeat.ts";
+import {
+  heartbeatService,
+  getTaskDrainStatus,
+  releaseRunClaimedJustBeforeSuppression,
+  startTaskDrain,
+  stopTaskDrain,
+} from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -27,6 +34,20 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres task-drain admission release tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+function postgresErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  if ("code" in error && typeof error.code === "string") return error.code;
+  return "cause" in error ? postgresErrorCode(error.cause) : null;
 }
 
 describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
@@ -223,6 +244,81 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     expect(finished?.status).toBe("succeeded");
+  }, 20_000);
+
+  it("uses issue-before-run ordering when suppression release overlaps checkout", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } =
+      await seedQueuedRun();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "claimed", claimedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, issueId));
+
+    // Hold the run row so suppression must retain its first lock while it
+    // waits for the second. Observing the issue lock proves the production
+    // path acquired issue -> run; the reversed order never reaches it.
+    const runLocked = deferred<void>();
+    const allowRunUnlock = deferred<void>();
+    const heldRunLock = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
+      );
+      runLocked.resolve();
+      await allowRunUnlock.promise;
+    });
+    await runLocked.promise;
+
+    const suppressionRelease = releaseRunClaimedJustBeforeSuppression(db, runId);
+    let issueLockObserved = false;
+    try {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try {
+          await db.transaction((tx) =>
+            tx.execute(
+              sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update nowait`,
+            ),
+          );
+        } catch (error) {
+          if (postgresErrorCode(error) !== "55P03") throw error;
+          issueLockObserved = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(issueLockObserved).toBe(true);
+
+      const checkout = issueService(db).checkout(
+        issueId,
+        agentId,
+        ["todo"],
+        runId,
+      );
+      allowRunUnlock.resolve();
+      await heldRunLock;
+      const [, checkedOut] = await Promise.all([suppressionRelease, checkout]);
+
+      expect(checkedOut).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: runId,
+        executionRunId: runId,
+      });
+      const [run] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("queued");
+    } finally {
+      allowRunUnlock.resolve();
+      await heldRunLock;
+    }
   }, 20_000);
 
   it("keeps a wake that arrives during a task drain queued and runs it once the drain lifts", async () => {

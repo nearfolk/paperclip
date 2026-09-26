@@ -286,6 +286,56 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     }
   });
 
+  it("queues a successor when checkout commits before successful terminalization", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({
+      companyId,
+      assigneeAgentId: agentId,
+      status: "in_progress",
+    });
+    const runId = await seedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: runId, executionRunId: runId })
+      .where(eq(issues.id, issueId));
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => {
+          throw new Error("successful checkout handoff must stay live");
+        },
+        escalateStrandedRecoveryIssueInPlace: async () => {
+          throw new Error("successful checkout handoff must stay live");
+        },
+      },
+    });
+    const result = await release({ companyId, runId, now: new Date() });
+
+    expect(result.outcome.kind).toBe("queued_recovery");
+    expect(result.postCommitEffects).toHaveLength(1);
+    expect(result.postCommitEffects[0]).toMatchObject({ kind: "run_queued" });
+
+    const successor = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .then((rows) => rows.find((row) => row.id !== runId));
+    expect(successor).toMatchObject({ status: "queued" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: successor?.id,
+    });
+  });
+
   for (const hasDeferredMessage of [false, true]) {
     it(`plans conversation recovery during owner cleanup without draining messages (queued=${hasDeferredMessage})`, async () => {
       const companyId = await seedCompany();
