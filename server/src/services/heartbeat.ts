@@ -9510,7 +9510,12 @@ export async function releaseRunClaimedJustBeforeSuppression(
       await tx
         .update(agentWakeupRequests)
         .set({ status: "queued", claimedAt: null, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, released.wakeupRequestId));
+        .where(
+          and(
+            eq(agentWakeupRequests.id, released.wakeupRequestId),
+            ne(agentWakeupRequests.status, "cancelled"),
+          ),
+        );
     }
 
     if (issueId) {
