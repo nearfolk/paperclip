@@ -68,6 +68,87 @@ function hired(response: request.Response) {
 }
 
 describe("agent-created hires use managed AI connections", () => {
+  for (const operation of ["test", "save"] as const) {
+    it.each([401, 403, 429, 503, null])(`${operation} changes API-key health only for a provider rejection (status: %s)`, async (status) => {
+      const f = await fixture("anthropic", "api_key");
+      await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+      const original = getServerAdapter(f.adapterType);
+      registerServerAdapter({ ...original, testEnvironment: async () => ({ adapterType: f.adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+      const network = vi.spyOn(globalThis, "fetch");
+      if (status === null) network.mockRejectedValue(new Error("Network unavailable"));
+      else network.mockResolvedValue(new Response(null, { status }));
+      try {
+        const response = operation === "test"
+          ? await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} })
+          : await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
+        expect(response.status, JSON.stringify(response.body)).toBe(operation === "test" ? 200 : 422);
+        const rejected = status === 401 || status === 403;
+        expect(await aiConnectionService(db).list(f.companyId, f.userId)).toEqual([expect.objectContaining({ status: rejected ? "needs_attention" : "connected" })]);
+      } finally { network.mockRestore(); unregisterServerAdapter(f.adapterType); }
+    });
+  }
+
+  it.each(["test", "save"] as const)("%s marks a hello-test authentication rejection as needing attention and reconnect repairs the same default", async (operation) => {
+    const f = await fixture("anthropic", "subscription");
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    const original = getServerAdapter(f.adapterType);
+    registerServerAdapter({ ...original, testEnvironment: async () => ({
+      adapterType: f.adapterType, status: "fail", testedAt: new Date().toISOString(),
+      checks: [{ code: "claude_hello_probe_auth_required", level: "error", message: "The account needs sign-in." }],
+    }) });
+    try {
+      const response = operation === "test"
+        ? await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} })
+        : await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
+      expect(response.status, JSON.stringify(response.body)).toBe(operation === "test" ? 200 : 422);
+      if (operation === "test") expect(response.body.status).toBe("fail");
+      const service = aiConnectionService(db);
+      expect(await service.list(f.companyId, f.userId)).toEqual([expect.objectContaining({ id: f.account.connectionId, isDefault: true, status: "needs_attention" })]);
+      await expect(service.select({ companyId: f.companyId, userId: f.userId, agentId: f.agentId, adapterType: f.adapterType, binding: f.binding })).rejects.toThrow("Reconnect");
+      const repaired = await service.save(f.companyId, f.userId, {
+        provider: "anthropic", method: "subscription", name: "Ignored reconnect name", ownership: "personal",
+        connectionId: f.account.connectionId, allAgents: true, agentIds: [], loginSessionId: "fixture",
+      }, "repaired-token");
+      expect(repaired).toEqual(f.account);
+      expect(await service.list(f.companyId, f.userId)).toEqual([expect.objectContaining({ id: f.account.connectionId, isDefault: true, status: "connected" })]);
+      const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.account.connectionId));
+      expect(installs).toEqual([expect.objectContaining({ targetType: "agent", targetId: f.agentId })]);
+      registerServerAdapter({ ...original, testEnvironment: async () => ({
+        adapterType: f.adapterType, status: "pass", testedAt: new Date().toISOString(),
+        checks: [{ code: "claude_hello_probe_passed", level: "info", message: "hello" }],
+      }) });
+      const saved = await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
+      expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+      const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId, adapterType: f.adapterType, binding: f.binding, config: saved.body.adapterConfig });
+      try {
+        expect(runtime.attribution.grantId).toBe(f.account.grantId);
+        expect((runtime.config.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN).toBe("repaired-token");
+      } finally { await runtime.cleanup(); }
+    } finally { unregisterServerAdapter(f.adapterType); }
+  });
+
+  it.each([false, true])("a failed environment test preserves connection health for a runtime failure or a newer reconnect (reconnected: %s)", async (reconnected) => {
+    const f = await fixture("anthropic", "subscription");
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    const original = getServerAdapter(f.adapterType);
+    registerServerAdapter({ ...original, testEnvironment: async () => {
+      if (reconnected) await aiConnectionService(db).save(f.companyId, f.userId, {
+        provider: "anthropic", method: "subscription", name: "My Claude", ownership: "personal",
+        connectionId: f.account.connectionId, allAgents: false, agentIds: [f.agentId], loginSessionId: "fixture",
+      }, "newer-token");
+      return {
+        adapterType: f.adapterType, status: "fail", testedAt: new Date().toISOString(),
+        checks: [{ code: reconnected ? "claude_hello_probe_auth_required" : "claude_cli_not_found", level: "error", message: "Test failed." }],
+      };
+    } });
+    try {
+      const response = await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.status).toBe("fail");
+      expect(await aiConnectionService(db).list(f.companyId, f.userId)).toEqual([expect.objectContaining({ status: "connected" })]);
+    } finally { unregisterServerAdapter(f.adapterType); }
+  });
+
   for (const endpoint of ["agent-hires", "agents"]) {
     it.each([
       ["anthropic", "api_key"], ["anthropic", "subscription"],
@@ -173,6 +254,46 @@ describe("agent-created hires use managed AI connections", () => {
     expect(agent.runtimeConfig.aiConnection).toEqual(f.binding);
     const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: agent.id, responsibleUserId: f.userId, adapterType: agent.adapterType, binding: agent.runtimeConfig.aiConnection, config: agent.adapterConfig });
     try { expect(runtime.attribution.connectionId).toBe(f.account.connectionId); } finally { await runtime.cleanup(); }
+  });
+
+  it.each([
+    ["codex", { provider: "codex", model: "gpt-5.6-sol", codexPermissionMode: "never", lifecycleMode: "per_turn" }],
+    ["claude", { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn" }],
+  ] as const)("caller runtime inheritance preserves safe %s settings only", async (_name, parentConfig) => {
+    const f = await fixture("anthropic", "subscription");
+    await db.update(agents).set({
+      adapterType: "paperclip_runner",
+      adapterConfig: {
+        ...parentConfig,
+        cwd: "/private/parent-workspace",
+        env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "parent-secret" } },
+        instructionsFilePath: "/private/parent-instructions.md",
+        runtimeSessionId: "parent-session",
+      },
+    }).where(eq(agents.id, f.agentId));
+    const agent = hired(await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({
+      name: "Inherited teammate", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    }));
+    expect(agent.adapterConfig).toMatchObject(parentConfig);
+    expect(agent.adapterConfig).not.toHaveProperty("cwd");
+    expect(agent.adapterConfig).not.toHaveProperty("env");
+    expect(agent.adapterConfig.instructionsFilePath).not.toBe("/private/parent-instructions.md");
+    expect(agent.adapterConfig).not.toHaveProperty("runtimeSessionId");
+    expect(agent.runtimeConfig.aiConnection).toMatchObject({
+      provider: parentConfig.provider === "codex" ? "openai" : "anthropic",
+      mode: "responsible_user",
+    });
+  });
+
+  it("rejects caller inheritance when the request supplies competing runtime settings", async () => {
+    const f = await fixture("anthropic", "subscription");
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude" } }).where(eq(agents.id, f.agentId));
+    const response = await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({
+      name: "Conflicting teammate", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+      adapterConfig: { model: "caller.override" },
+    });
+    expect(response.status).toBe(422);
+    expect(response.body.error).toContain("cannot be combined");
   });
 
   it.each([true, false])("preserves shared connection access boundaries (company access: %s)", async (allAgents) => {

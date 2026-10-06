@@ -2,11 +2,17 @@ import { validateNativeDeliverableEvidence } from "./native-deliverable-feedback
 import { findAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { issueService } from "../issues.js";
+import { isConversation } from "../agent-conversations.js";
+import { issueTreeControlService } from "../issue-tree-control.js";
+import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { and, eq, inArray, notInArray } from "drizzle-orm";
 import {
   approvals,
   agents,
+  companies,
+  documents,
+  issueDocuments,
   heartbeatRuns,
   completionContracts,
   issueApprovals,
@@ -18,6 +24,30 @@ import {
   normalizePrpResultSignals,
   type PrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+}
+
+/** Reconstruct links from current task state, never from provider-supplied URLs. */
+async function savedDocumentLinks(db: Db, run: typeof heartbeatRuns.$inferSelect, issue: typeof issues.$inferSelect) {
+  const receipts = Object.values(record(run.resultJson?.semanticToolReceipts));
+  const revisions = new Set(receipts.flatMap(value => {
+    const receipt = record(value), result = record(receipt.result), document = record(result.document);
+    return receipt.operationId === "write_document" && result.disposition === "applied"
+      && typeof document.id === "string" && typeof document.latestRevisionId === "string"
+      ? [`${document.id}/${document.latestRevisionId}`] : [];
+  }));
+  if (!revisions.size) return [];
+  const saved = await db.select({ id: documents.id, revisionId: documents.latestRevisionId,
+    key: issueDocuments.key, issuePrefix: companies.issuePrefix })
+    .from(issueDocuments).innerJoin(documents, and(eq(documents.id, issueDocuments.documentId), eq(documents.companyId, run.companyId)))
+    .innerJoin(companies, eq(companies.id, run.companyId))
+    .where(and(eq(issueDocuments.companyId, run.companyId), eq(issueDocuments.issueId, issue.id)));
+  return saved.filter(document => revisions.has(`${document.id}/${document.revisionId}`))
+    .map(document => `[Saved document](/${encodeURIComponent(document.issuePrefix)}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}#document-${encodeURIComponent(document.key)})`);
+}
 
 /** Read current constraints before accepting the report, not a premature status commit. */
 export async function nativeCompletionFeedback(
@@ -161,6 +191,30 @@ export async function nativeCompletionFeedback(
     return `Completion report accepted; this task still has unresolved dependencies. Explain the blockers on [this task](/issues/${issue.identifier ?? issue.id}); do not say the task is done.`;
   }
   if (
+    !isConversation(issue) &&
+    result.reportedWorkDisposition === "yielded" &&
+    result.continuation?.kind === "response_wake" &&
+    result.completionClaim.remainingWork.some((entry) => entry.blocksCompletion) &&
+    signals.actionableAttentionRequests.length === 0
+  ) {
+    const pause = await issueTreeControlService(db).getActivePauseHoldGate(
+      run.companyId, issue.id,
+    );
+    if (pause) {
+      return "Completion report accepted; this task is paused. Wait for the recorded pause to be released before continuing.";
+    }
+    const chatWait = await resolveExternalChatResponseWaitAuthorization({
+      db,
+      binding: { companyId: run.companyId, issueId: issue.id, runId, agentId: run.agentId },
+    });
+    // Conversation turns and revoked chat authority retain their own lifecycle.
+    if (chatWait === "not_applicable") {
+      throw new Error(
+        "The response_wake report includes blocking remaining work without a pending wait condition. Answering a user comment does not pause the task. Continue the authorized work, register a same_agent continuation, or report the concrete blocker or required question. Do not repeat completed work.",
+      );
+    }
+  }
+  if (
     result.reportedWorkDisposition === "needs_review" &&
     signals.actionableAttentionRequests.length === 0
   ) {
@@ -183,5 +237,11 @@ export async function nativeCompletionFeedback(
       throw new Error("The named reviewer is not available in this company. Choose an available reviewer or report the concrete blocker.");
     }
   }
-  return "Completion report accepted. Task status will be committed after this turn and workspace finalization finish. Describe the completed work and any explicitly requested reviewer action; do not claim an approval is needed unless one was requested.";
+  if (result.reportedWorkDisposition === "blocked") {
+    return "Blocker report accepted. Explain why work cannot continue, name the blocker owner and give the unblock action in your final response; do not describe the task as completed.";
+  }
+  const links = await savedDocumentLinks(db, run, issue);
+  const documentGuidance = links.length
+    ? ` Include these clickable links to this run's saved documents in your final response: ${links.join(" ")}` : "";
+  return "Completion report accepted. Task status will be committed after this turn and workspace finalization finish. Describe the completed work and any explicitly requested reviewer action; do not claim an approval is needed unless one was requested." + documentGuidance;
 }

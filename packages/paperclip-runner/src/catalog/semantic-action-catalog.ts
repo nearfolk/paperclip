@@ -1,3 +1,5 @@
+import { listProjectsDescription, listProjectsInputSchema } from "../protocol-actions/list-projects.js";
+import { setTaskTitleAction } from "../protocol-actions/set-task-title.js";
 import { reassignTaskAction } from "../protocol-actions/reassign-task.js";
 import type {
   PaperclipJsonSchema,
@@ -162,6 +164,15 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     ),
   }),
   descriptor({
+    operationId: "set_task_title",
+    title: "Set task title",
+    description: setTaskTitleAction.documentation.description,
+    effect: "write",
+    placement: "optional",
+    inputSchema: setTaskTitleAction.live.descriptor.inputSchema,
+    outputSchema: openObject,
+  }),
+  descriptor({
     operationId: "report_progress",
     title: "Report durable progress",
     description: "Append a durable progress comment to the active task.",
@@ -324,6 +335,30 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     requiredClaims: ["discovery:agents:read"],
   }),
   descriptor({
+    operationId: "hire_agent",
+    title: "Hire a native agent",
+    description:
+      "Create one native Paperclip Runner teammate for the current company and task. The new agent reports to you, inherits your native runtime, and receives no provider, adapter, environment, or credential configuration from the tool. Reuse an existing teammate when appropriate and follow any approval returned by the API.",
+    placement: "optional",
+    effect: "write",
+    requiredClaims: ["delegation:agents:create"],
+    allowedModes: STANDARD_MODE,
+    inputSchema: object(
+      {
+        name: text("Name for the new teammate.", 200),
+        role: {
+          enum: ["ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"],
+          default: "general",
+        },
+        title: nullableText("Optional teammate title.", 300),
+        capabilities: nullableText("Optional concise capability summary.", 2_000),
+        instructions: nullableText("Optional persona or task instructions.", 20_000),
+      },
+      ["name"],
+    ),
+    outputSchema: openObject,
+  }),
+  descriptor({
     operationId: "get_agent",
     title: "Get company agent",
     description: "Read one redacted actor profile in the run company.",
@@ -439,9 +474,9 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     operationId: "list_projects",
     title: "List projects",
     requiredClaims: ["discovery:projects:read"],
-    description: "Inspect available company projects before selecting a project for new work.",
+    description: listProjectsDescription,
     placement: "optional",
-    inputSchema: object({}),
+    inputSchema: listProjectsInputSchema,
   }),
   descriptor({
     operationId: "list_project_repositories",

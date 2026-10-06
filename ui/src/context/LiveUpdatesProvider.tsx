@@ -1289,6 +1289,11 @@ function invalidateActivityQueries(
   }
 
   if (entityType === "issue") {
+    const chatListKey = queryKeys.agentChats.list(companyId, currentActor.userId);
+    const knownChat = entityId && queryClient.getQueryData<Issue[]>(chatListKey)?.some(chat => chat.id === entityId);
+    if (knownChat || action === "issue.conversation_opened" && ownActorActivity) {
+      queryClient.invalidateQueries({ queryKey: chatListKey });
+    }
     if (action === "issue.tree_hold_created" || action === "issue.tree_hold_released" || action === "issue.updated") {
       // An ancestor hold or reparenting changes descendants' effective pause.
       queryClient.invalidateQueries({ queryKey: ["issues", "tree-control-state"] });
@@ -1991,9 +1996,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         stopPolling();
         if (reconnectAttempt > 0) {
           gateRef.current.suppressUntil = Date.now() + RECONNECT_SUPPRESS_MS;
-          // Reconcile all visible data after a gap: missed events cannot be replayed.
-          void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
         }
+        // The initial page queries can finish before the first subscription,
+        // too. Reconcile that gap as well as reconnects: events are not replayed.
+        void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
         reconnectAttempt = 0;
       };
 

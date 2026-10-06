@@ -45,12 +45,12 @@ logical `result_json` characters, issues eight concurrent default list reads,
 requires every response to stop at 200 summary-only rows, and fails if the Node
 process grows by 384 MB or more. The temporary database is deleted afterward.
 
-The 2026-09-22 verification used 24,205 rows and 1,291,640,309 logical JSON
-characters. Eight concurrent reads returned 200 summary-only rows each. Node
-RSS moved from 532,971,520 bytes to a 533,692,416-byte peak, a 720,896-byte
-increase. The pre-fix production observation for the same row count was roughly
-1.29 billion materialized JSON characters per request and overlapping requests
-produced 10–12 GB V8 heaps.
+The 2026-10-05 current-master verification used 24,205 rows and 1,291,640,309
+logical JSON characters. Eight concurrent reads returned 200 summary-only rows
+each. Node RSS moved from 435,453,952 bytes to a 438,976,512-byte peak, a
+3,522,560-byte increase. The pre-fix production observation for the same row
+count was roughly 1.29 billion materialized JSON characters per request and
+overlapping requests produced 10–12 GB V8 heaps.
 
 Set the initial steady-state old-space ceiling to 4 GB only when all of these
 conditions hold for the exact release head:

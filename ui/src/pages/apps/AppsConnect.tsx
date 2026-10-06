@@ -1,55 +1,51 @@
-import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow";
+import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { isRetiredComposioConnection } from "@paperclipai/shared";
+import { findComposioCatalogApp } from "@paperclipai/shared/aggregator-app-catalog";
 import { toolsApi } from "@/api/tools";
-import { RemoteMcpProductionSetup } from "@/features/connections/remote-mcp/RemoteMcpProductionSetup";
-import { useMcpAggregatorsEnabled } from "@/hooks/useMcpAggregatorsEnabled";
-import { isRemoteMcpConnectorId, isRemoteMcpConnectorMethod } from "@paperclipai/shared";
-import { useParams } from "@/lib/router";
-import { useSearchParams } from "@/lib/router";
+import { queryKeys } from "@/lib/queryKeys";
+import { Button } from "@/components/ui/button";
+import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow";
 import type { ToolConnectionCredentialSource } from "@paperclipai/shared";
+import { useCompany } from "@/context/CompanyContext";
+import { useNavigate, useParams, useSearchParams } from "@/lib/router";
+import { consumeSkillSourceReturn, skillSourceReturnPath } from "@/lib/skill-source-connect-return";
 
-export {
-  AccessStep,
-  OAuthConnectStateScreen,
-  type OAuthConnectPhase,
-} from "@/features/connections/ConnectionSetupFlow";
+export { AccessStep, OAuthConnectStateScreen, type OAuthConnectPhase } from "@/features/connections/ConnectionSetupFlow";
 
-/** Full-page host for the shared connection setup implementation. */
-export function AppsConnect({
-  byoOnly = false,
-  credentialSource = "paperclip_vault",
-}: {
+/** Full-page host for the same setup used by inline connection requests. */
+export function AppsConnect({ byoOnly = false, credentialSource = "paperclip_vault" }: {
   byoOnly?: boolean;
   credentialSource?: ToolConnectionCredentialSource;
 } = {}) {
+  const { selectedCompanyId } = useCompany();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const aggregators = useMcpAggregatorsEnabled();
-  const interactionId = searchParams.get("intent")?.trim() || undefined;
-  const params = useParams<{ appKey?: string }>();
-  const existingId = searchParams.get("resume") || searchParams.get("reconnect");
-  const explicitSource = searchParams.get("source") || params.appKey || searchParams.get("appKey");
-  // Ordinary connectors own their existing recovery/loading path. Only load
-  // here when selecting an aggregator controller, or resolving an unknown source.
-  const lookupExisting = !!existingId && (!explicitSource || isRemoteMcpConnectorId(explicitSource));
-  const existing = useQuery({ queryKey: ["tools", "connection", existingId], queryFn: () => toolsApi.getConnection(existingId!), enabled: lookupExisting });
-  const source = explicitSource || existing.data?.config?.sourceTemplateKey;
-  const method = searchParams.get("method") || existing.data?.config?.connectionMethodKey;
-  if (lookupExisting && existing.isPending) return <p className="p-8 text-sm text-muted-foreground">Loading connection…</p>;
-  if (lookupExisting && existing.isError) return <div role="alert" className="space-y-3 p-8"><p>Could not load this connection. Your saved access and credentials have not changed.</p><button type="button" className="text-primary underline" onClick={() => void existing.refetch()}>Try again</button></div>;
-  if (isRemoteMcpConnectorId(source) && (!method || isRemoteMcpConnectorMethod(source, method))) {
-    if (!aggregators.loaded) return <p className="p-8 text-sm text-muted-foreground">Loading connection settings…</p>;
-    if (!aggregators.enabled) return <p role="status" className="p-8 text-sm text-muted-foreground">Enable MCP aggregators in Settings → Experimental to set up this connection.</p>;
+  const { appKey } = useParams<{ appKey?: string }>();
+  const source = searchParams.get("source") ?? appKey ?? searchParams.get("appKey");
+  const toolkit = searchParams.get("targetToolkit");
+  const reuseComposio = source === "composio" && Boolean(toolkit && findComposioCatalogApp(toolkit))
+    && searchParams.get("new") !== "1" && !searchParams.get("resume") && !searchParams.get("reconnect")
+    && !byoOnly && credentialSource === "paperclip_vault";
+  const saved = useQuery({ queryKey: queryKeys.tools.connections(selectedCompanyId ?? "__none__"),
+    queryFn: () => toolsApi.listConnections(selectedCompanyId!), enabled: reuseComposio && Boolean(selectedCompanyId), retry: false });
+  const hasSavedComposio = reuseComposio && saved.data?.connections.some(connection =>
+    connection.config?.sourceTemplateKey === "composio" && connection.transport === "mcp_remote"
+    && connection.status === "active" && connection.enabled && !isRetiredComposioConnection(connection));
+  useEffect(() => {
+    if (hasSavedComposio) navigate(`/apps?source=composio&targetToolkit=${encodeURIComponent(toolkit!)}`, { replace: true });
+  }, [hasSavedComposio, toolkit, navigate]);
+  if (reuseComposio && selectedCompanyId && (saved.isPending || hasSavedComposio)) return <p role="status" className="text-sm text-muted-foreground">Checking saved Composio accounts…</p>;
+  if (reuseComposio && saved.isError) return <div className="space-y-3">
+    <p role="alert" className="text-sm text-destructive">Couldn’t load your Composio accounts.</p>
+    <div className="flex items-center justify-between"><Button variant="ghost" onClick={() => navigate("/apps")}>Cancel</Button><Button onClick={() => void saved.refetch()}>Try again</Button></div>
+  </div>;
+  const returningToSkills = source === "github" && selectedCompanyId && skillSourceReturnPath(selectedCompanyId);
+  function returnToSkills() {
+    const path = selectedCompanyId && consumeSkillSourceReturn(selectedCompanyId);
+    if (path) navigate(path);
   }
-  if (!byoOnly && !interactionId && credentialSource === "paperclip_vault" && isRemoteMcpConnectorId(source)
-    && (!method || isRemoteMcpConnectorMethod(source, method))) {
-    return <RemoteMcpProductionSetup key={existingId || source} providerId={source} connection={existing.data} />;
-  }
-  return (
-    <ConnectionSetupFlow
-      byoOnly={byoOnly}
-      credentialSource={credentialSource}
-      host="page"
-      interactionId={interactionId}
-    />
-  );
+  return <ConnectionSetupFlow byoOnly={byoOnly} credentialSource={credentialSource} host="page"
+    onComplete={returningToSkills ? returnToSkills : undefined}
+    onCancel={returningToSkills ? returnToSkills : undefined} />;
 }

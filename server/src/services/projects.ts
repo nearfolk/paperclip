@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   projects,
@@ -18,6 +18,7 @@ import {
   normalizeProjectUrlKey,
   type BudgetWindowKind,
   type ProjectBudgetSummary,
+  type ProjectDiscoverySummary,
   type ProjectCodebase,
   type ProjectExecutionWorkspacePolicy,
   type ProjectGoalRef,
@@ -33,6 +34,7 @@ import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runt
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -591,19 +593,21 @@ export function projectService(db: Db) {
     // together (goalIds wins resolution, mirroring the update path).
     const legacyGoalId = ids?.[0] ?? null;
 
-    const row = await db
-      .insert(projects)
-      .values({ ...projectData, goalId: legacyGoalId, companyId })
-      .returning()
-      .then((rows) => rows[0]);
-
-    if (ids && ids.length > 0) {
-      await syncGoalLinks(db, row.id, companyId, ids);
-    }
-
-    const [withGoals] = await attachGoals(db, [row]);
-    const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
-    return enriched!;
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const row = await tx
+        .insert(projects)
+        .values({ ...projectData, goalId: legacyGoalId, companyId })
+        .returning()
+        .then((rows) => rows[0]);
+      if (ids && ids.length > 0) {
+        await syncGoalLinks(txDb, row.id, companyId, ids);
+      }
+      await recordResourceCreationEvent(txDb, companyId, "project", row.id);
+      const [withGoals] = await attachGoals(txDb, [row]);
+      const [enriched] = withGoals ? await attachWorkspaces(txDb, [withGoals]) : [];
+      return enriched!;
+    });
   };
 
   const getProjectById = async (id: string): Promise<ProjectWithGoals | null> => {
@@ -620,6 +624,27 @@ export function projectService(db: Db) {
   };
 
   return {
+    // Project discovery never reads workspace JSON, goals, metrics, or full descriptions.
+    listSummaries: async (companyId: string, opts: { limit: number; cursor?: string; includeArchived: boolean; candidateIds: string[] | null }): Promise<ProjectDiscoverySummary[]> => {
+      return db.select({
+        id: projects.id,
+        name: sql<string>`left(${projects.name}, 500)`,
+        status: projects.status,
+        description: sql<string | null>`left(${projects.description}, 1000)`,
+        descriptionTruncated: sql<boolean>`coalesce(length(${projects.description}) > 1000, false)`,
+      }).from(projects).where(and(
+        eq(projects.companyId, companyId),
+        opts.includeArchived ? undefined : isNull(projects.archivedAt),
+        opts.cursor ? gt(projects.id, opts.cursor) : undefined,
+        opts.candidateIds === null ? undefined : or(
+          inArray(projects.id, opts.candidateIds),
+          // Project policy can add a root/project boundary to the actor scope.
+          // Keep these candidates for the authoritative per-project decision.
+          sql`${projects.executionWorkspacePolicy}->'authorizationPolicy' is not null`,
+        ),
+      )).orderBy(asc(projects.id)).limit(opts.limit);
+    },
+
     list: async (companyId: string, opts: { includeArchived?: boolean } = {}): Promise<ProjectWithGoals[]> => {
       // NOTE: this service default is intentionally the inverse of the HTTP route default.
       // The route (`GET /companies/:companyId/projects`) defaults `includeArchived` to `false`
