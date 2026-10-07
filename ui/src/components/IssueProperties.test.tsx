@@ -467,6 +467,36 @@ describe("IssueProperties", () => {
     document.body.innerHTML = "";
   });
 
+  it("uses a bounded issue fetch when opening the parent picker", async () => {
+    const root = renderProperties(container, {
+      issue: createIssue(),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    const parentButton = findRowTrigger(container, "Parent");
+    expect(parentButton).toBeDefined();
+    if (!parentButton) {
+      act(() => root.unmount());
+      return;
+    }
+
+    await act(async () => {
+      parentButton.click();
+    });
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+        limit: 100,
+        sortField: "updated",
+        sortDir: "desc",
+      });
+    });
+
+    act(() => root.unmount());
+  });
+
   it("shows assignee and originating without responsible wording", async () => {
     mockAgentsApi.list.mockResolvedValue([{ id: "agent-1", name: "CodexCoder", status: "active", adapterType: "codex_local" }]);
     const root = renderProperties(container, {
@@ -860,7 +890,7 @@ describe("IssueProperties", () => {
     const onUpdate = vi.fn();
     const loadedIssue = createIssue({ id: "issue-3", identifier: "PAP-3", title: "Loaded issue", status: "todo" });
     const remoteIssue = createIssue({ id: "issue-99", identifier: "PAP-99", title: "Remote blocker", status: "in_progress" });
-    mockIssuesApi.list.mockImplementation((_companyId: string, filters?: { q?: string; limit?: number }) => {
+    mockIssuesApi.list.mockImplementation((_companyId: string, filters?: { q?: string; limit?: number; sortField?: string; sortDir?: string }) => {
       if (filters?.q === "remote") return Promise.resolve([remoteIssue]);
       return Promise.resolve([loadedIssue]);
     });
@@ -892,7 +922,12 @@ describe("IssueProperties", () => {
     });
 
     await waitForAssertion(() => {
-      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 50 });
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+        q: "remote",
+        limit: 50,
+        sortField: "updated",
+        sortDir: "desc",
+      });
       expect(container.textContent).toContain("PAP-99 Remote blocker");
       expect(container.textContent).not.toContain("PAP-3 Loaded issue");
     });
