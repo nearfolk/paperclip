@@ -139,6 +139,7 @@ interface IssuePropertiesProps {
 }
 
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
+const ISSUE_PROPERTY_PICKER_LIMIT = 100;
 const ISSUE_PROPERTY_RELATION_PREVIEW_COUNT = 5;
 
 export function IssueProperties({
@@ -253,7 +254,11 @@ export function IssueProperties({
 
   const { data: allIssues, isFetching: isFetchingIssuePickerIssues } = useQuery({
     queryKey: queryKeys.issues.list(companyId!),
-    queryFn: () => issuesApi.list(companyId!),
+    queryFn: () => issuesApi.list(companyId!, {
+      limit: ISSUE_PROPERTY_PICKER_LIMIT,
+      sortField: "updated",
+      sortDir: "desc",
+    }),
     enabled: !!companyId && (parentOpen || (blockedByOpen && normalizedBlockedBySearch.length === 0)),
   });
 
@@ -264,6 +269,8 @@ export function IssueProperties({
     queryFn: () => issuesApi.list(companyId!, {
       q: normalizedBlockedBySearch,
       limit: ISSUE_BLOCKER_SEARCH_LIMIT,
+      sortField: "updated",
+      sortDir: "desc",
     }),
     enabled: !!companyId && blockedByOpen && normalizedBlockedBySearch.length > 0,
   });
