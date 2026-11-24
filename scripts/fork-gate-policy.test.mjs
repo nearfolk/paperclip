@@ -1,0 +1,120 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { evaluateForkGithub, evaluateForkTickets, parseContract, digest, MAPPING_DIGEST, PR_WORKFLOW_DIGEST, BOOTSTRAP_BASE, ORIGINAL_FAILED_HEAD, REQUIRED_JOBS, REPOSITORY } from './fork-gate-policy.mjs';
+const head = 'a'.repeat(40), reviewer = 'qa', operator = 'cto';
+const at = '2026-11-24T12:00:00.000Z';
+const contract = () => ({ version: 1, repository: REPOSITORY, pr: 7, head, mappingDigest: MAPPING_DIGEST, reviewerId: reviewer, operatorId: operator, implementationTicket: 'implementation', requiredVerdicts: [], failureHistoryTickets: ['original'], bootstrap: true });
+const comment = (id, body, createdAt = at, authorAgentId = reviewer) => ({ id, body, createdAt, authorAgentId });
+function tickets() {
+  const c = contract();
+  const pass = comment('pass', `PASS\nHead ${head}\nSecurity verdict: PASS\nFork gate mapping: ${MAPPING_DIGEST}\nBootstrap exception: PR #7 base ${BOOTSTRAP_BASE}; missing COMMITPERCLIP_KEY only.\nNo other team verdicts are required.`);
+  // The base mentioned in the required bootstrap receipt is not a second
+  // candidate head; the policy checks candidate scope separately below.
+  return {
+    contract: c, identity: { id: operator, role: 'cto' }, actors: [{ id: operator, role: 'cto' }, { id: 'ceo', role: 'ceo' }],
+    snapshot: { issue: { id: 'gate', status: 'in_review', assigneeAgentId: operator, createdAt: '2026-11-24T11:00:00Z' }, comments: [comment('retract', `I retract FAIL at comment original-fail for corrected head ${head}.`, '2026-11-24T11:59:00Z'), pass], authorityScope: [], interactions: [], activity: [{ action: 'issue.updated', actorId: reviewer, createdAt: '2026-11-24T12:00:30Z', details: { assigneeAgentId: operator, _previous: { assigneeAgentId: reviewer } } }] },
+    histories: [{ issue: { id: 'original', description: '', createdAt: '2026-11-24T10:00:00Z' }, comments: [comment('original-fail', `FAIL\nHead ${ORIGINAL_FAILED_HEAD}`, '2026-11-24T11:00:00Z')], authorityScope: [] }],
+    required: [], implementation: { issue: { assigneeAgentId: 'author', description: `Head ${head}` }, comments: [] }, nowMs: Date.parse(at) + 300_000,
+  };
+}
+function github() {
+  const c = contract();
+  const reviewRun = { id: 2, path: '.github/workflows/commitperclip-review.yml', event: 'pull_request_target', head_sha: head, status: 'completed', conclusion: 'failure' };
+  return {
+    contract: c, pr: { state: 'OPEN', isDraft: false, headRefOid: head, baseRefName: 'master', baseRefOid: BOOTSTRAP_BASE, labels: [] }, master: BOOTSTRAP_BASE,
+    compare: { base_commit: { sha: BOOTSTRAP_BASE }, behind_by: 0, status: 'ahead' }, workflow: readFileSync(new URL('../.github/workflows/pr.yml', import.meta.url), 'utf8'),
+    run: { id: 1, path: '.github/workflows/pr.yml', event: 'pull_request', head_sha: head, status: 'completed', conclusion: 'success' },
+    jobs: REQUIRED_JOBS.map(name => ({ name, run_id: 1, head_sha: head, status: 'completed', conclusion: 'success' })),
+    reviewRun, reviewJobs: [{ name: 'review', run_id: 2, head_sha: head, conclusion: 'failure', steps: [
+      ...['Checkout base branch (never PR code)', 'Dependency Review', 'Set up Node'].map(name => ({ name, conclusion: 'success' })),
+      { name: 'Generate commitperclip token', conclusion: 'failure' },
+    ] }],
+    reviewLog: 'ERROR: COMMITPERCLIP_KEY env var not set.',
+    oldReview: execFileSync('git', ['show', `${BOOTSTRAP_BASE}:.github/workflows/commitperclip-review.yml`], { encoding: 'utf8' }), checks: [], reviews: [],
+  };
+}
+test('workflow mapping includes the current immutable file and all 17 jobs', () => {
+  assert.equal(digest(github().workflow), PR_WORKFLOW_DIGEST); assert.equal(REQUIRED_JOBS.length, 17);
+});
+test('bounded old-base bootstrap accepts only complete ordinary CI', () => assert.equal(evaluateForkGithub(github()).bootstrap, true));
+for (const [name, mutate] of [
+  ['changed head', x => x.pr.headRefOid = 'b'.repeat(40)],
+  ['changed master', x => x.master = 'c'.repeat(40)],
+  ['closed PR', x => x.pr.state = 'MERGED'], ['draft', x => x.pr.isDraft = true],
+  ['behind master', x => x.compare.behind_by = 1], ['missing compare', x => x.compare = {}],
+  ['wrong comparison base', x => x.compare.base_commit.sha = head],
+  ['changed workflow', x => x.workflow += '\n# changed'],
+  ['wrong workflow provenance', x => x.run.path = '.github/workflows/other.yml'],
+  ['old CI head', x => x.run.head_sha = BOOTSTRAP_BASE], ['CI pending', x => x.run.status = 'in_progress'],
+  ['missing shard', x => x.jobs.pop()], ['aggregate only', x => x.jobs = x.jobs.filter(j => j.name === 'verify')],
+  ['skipped shard', x => x.jobs[3].conclusion = 'skipped'], ['failed shard', x => x.jobs[3].conclusion = 'failure'],
+  ['duplicate shard', x => x.jobs[3] = x.jobs[2]], ['wrong job run', x => x.jobs[2].run_id = 99],
+  ['bootstrap wrong PR', x => x.contract.pr = 8], ['wrong old workflow', x => x.oldReview += '\n'],
+  ['unrelated review failure', x => x.reviewJobs[0].steps[3].name = 'Dependency Review'],
+  ['bootstrap missing failure log', x => x.reviewLog = 'failed'],
+  ['review pending', x => x.reviewRun.status = 'in_progress'],
+  ['review older head', x => x.reviewRun.head_sha = BOOTSTRAP_BASE],
+  ['additional failure', x => x.checks.push({ name: 'unrelated', head_sha: head, status: 'completed', conclusion: 'failure' })],
+  ['changes requested', x => x.reviews.push({ user: { login: 'reviewer' }, submitted_at: at, state: 'CHANGES_REQUESTED' })],
+  ['normal path missing security', x => { x.contract.bootstrap = false; x.reviewRun.conclusion = 'success'; x.reviewJobs[0].conclusion = 'success'; }],
+]) test(`fork GitHub guard rejects ${name}`, () => { const x = github(); mutate(x); assert.throws(() => evaluateForkGithub(x)); });
+
+test('contract must name mapping, reviewers, implementation and original history', () => {
+  const c = contract(); const issue = { description: '```fork-release-contract\n' + JSON.stringify(c) + '\n```' };
+  assert.deepEqual(parseContract(issue, head, 7), c);
+  for (const field of ['mappingDigest', 'operatorId', 'implementationTicket', 'failureHistoryTickets']) {
+    const bad = structuredClone(c); delete bad[field];
+    assert.throws(() => parseContract({ description: '```fork-release-contract\n' + JSON.stringify(bad) + '\n```' }, head, 7));
+  }
+});
+test('QA gate permits exactly five minutes with original author retraction', () => assert.equal(evaluateForkTickets(tickets()).reviewerId, reviewer));
+for (const [name, mutate] of [
+  ['4:59', x => x.nowMs--], ['same author QA', x => x.implementation.issue.assigneeAgentId = reviewer],
+  ['wrong operator', x => x.identity.id = 'other'], ['non-CTO operator', x => x.identity.role = 'engineer'],
+  ['completed review-deliverable used as gate', x => x.snapshot.issue.status = 'done'],
+  ['no handoff', x => x.snapshot.activity = []], ['operator fabricated handoff', x => x.snapshot.activity[0].actorId = operator],
+  ['head changed', x => x.contract.head = 'b'.repeat(40)], ['missing history', x => x.histories = []],
+  ['no original FAIL', x => x.histories[0].comments = []],
+  ['unretracted old FAIL', x => x.snapshot.comments.shift()],
+  ['other seat retraction', x => x.snapshot.comments[0].authorAgentId = 'other'],
+  ['retraction after PASS', x => x.snapshot.comments[0].createdAt = '2026-11-24T12:01:00Z'],
+  ['missing security verdict', x => x.snapshot.comments[1].body = x.snapshot.comments[1].body.replace('Security verdict: PASS', '')],
+  ['missing mapping acceptance', x => x.snapshot.comments[1].body = x.snapshot.comments[1].body.replace(MAPPING_DIGEST, 'unknown')],
+  ['missing bootstrap acceptance', x => x.snapshot.comments[1].body = x.snapshot.comments[1].body.replace('Bootstrap exception:', 'Unknown exception:')],
+  ['new QA FAIL', x => x.snapshot.comments.push(comment('new-fail', `FAIL ${head}`, '2026-11-24T12:01:00Z'))],
+  ['ancestor hold', x => x.snapshot.authorityScope.push(comment('ancestor-hold', `HOLD ${head}`, '2026-11-24T12:01:00Z', 'ceo'))],
+  ['ambiguous ancestor denial', x => x.snapshot.authorityScope.push(comment('denial', 'Do not approve the release.', '2026-11-24T12:01:00Z', 'ceo'))],
+  ['required team evidence omitted', x => x.contract.requiredVerdicts.push({ ticket: 'security', reviewerId: 'security' })],
+]) test(`fork ticket guard rejects ${name}`, () => { const x = tickets(); mutate(x); assert.throws(() => evaluateForkTickets(x)); });
+test('clearance restarts the full five minutes', () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('hold', `HOLD ${head}`, '2026-11-24T12:01:00Z', 'ceo'));
+  x.snapshot.comments.push(comment('clear', `I clear the earlier HOLD at comment hold solely for protected merge at exact head ${head}.`, '2026-11-24T12:02:00Z', 'ceo'));
+  assert.throws(() => evaluateForkTickets(x));
+  x.nowMs = Date.parse('2026-11-24T12:07:00Z');
+  assert.equal(evaluateForkTickets(x).eligibleAt, '2026-11-24T12:07:00.000Z');
+});
+test('editing an old PASS cannot backdate the five-minute interval', () => {
+  const x = tickets(); x.snapshot.comments[1].updatedAt = '2026-11-24T12:04:00Z';
+  assert.throws(() => evaluateForkTickets(x), /Edited PASS/);
+});
+test('missing authoritative ancestor history fails closed', () => {
+  const x = tickets(); delete x.snapshot.authorityScope;
+  assert.throws(() => evaluateForkTickets(x));
+});
+test('a required security verdict from the wrong actor does not qualify', () => {
+  const x = tickets();
+  x.contract.requiredVerdicts = [{ ticket: 'security', reviewerId: 'security-reviewer' }];
+  x.required = [{ issue: { id: 'security' }, comments: [comment('security-pass', `PASS ${head}`, at, 'author')], authorityScope: [] }];
+  assert.throws(() => evaluateForkTickets(x), /author or head mismatch/);
+});
+test('normal mode requires completed same-head repository security check', () => {
+  const x = github(); x.contract.bootstrap = false;
+  x.reviewRun.conclusion = 'success'; x.reviewJobs[0].conclusion = 'success';
+  x.checks = [{ name: 'security-review', head_sha: head, app: { slug: 'github-actions' }, status: 'completed', conclusion: 'neutral' }];
+  assert.equal(evaluateForkGithub(x).bootstrap, false);
+  x.checks[0].head_sha = ORIGINAL_FAILED_HEAD;
+  assert.throws(() => evaluateForkGithub(x), /security scan/);
+});

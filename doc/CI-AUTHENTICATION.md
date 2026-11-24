@@ -7,7 +7,7 @@ pull requests write (quality comments), and checks write (security results).
 The token expires with the job. Checkout does not persist it in Git configuration.
 
 `pull_request_target` executes trusted base code at the event's immutable base SHA.
-It never checks out or executes the PR head. The PR diff is API data only.
+It never checks out or executes the PR head. The PR diff is inert Git-object data only; its code is never executed.
 Keep this boundary when updating the workflow. Dependency Review and all six
 quality/security scanners remain enabled. Quality failures fail the review job;
 security reporting errors also fail the job rather than silently suppressing them.
@@ -25,8 +25,10 @@ callers with appropriate credentials, but this fork workflow does not invoke it.
 
 ## Activation and verification
 
-Merge this workflow repair through the repository review process before resuming
-blocked safeguard PRs. A rerun of an old workflow uses the old workflow definition;
+Use the [protected fork activation command](FORK-RELEASE.md) after independent
+exact-head review before resuming blocked safeguard PRs. The runbook defines the
+fork gate mapping, original FAIL retraction, operator handoff, five-minute delay,
+and the bounded old-base authentication exception. A rerun of an old workflow uses the old workflow definition;
 it cannot prove the repair. Generate a new pull-request event after activation
 (for example, update the candidate branch to the new base), then verify a new
 `commitperclip PR Review / review` run and its exact-head `security-review` check.
@@ -39,5 +41,5 @@ checks on each updated safeguard PR. CI repair alone does not authorize release.
 Local regression command:
 
 ```sh
-node --test .github/scripts/tests/*.test.mjs
+node --test .github/scripts/tests/*.test.mjs scripts/fork-*.test.mjs
 ```

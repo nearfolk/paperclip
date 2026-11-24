@@ -9,7 +9,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
-import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
+import { immutableSnapshot, assertCurrentPair } from './immutable-pr-diff.mjs';
 import { resolveBaseRef } from './check-pr-dependencies.mjs';
 
 // ── Pure check functions (exported for testing) ───────────────────────────────
@@ -153,7 +153,7 @@ export function scanSensitivePaths(files) {
 }
 
 function buildContentsPath(repo, filename, ref) {
-  return `/repos/${repo}/contents/${filename}?${new URLSearchParams({ ref }).toString()}`;
+  return `/repos/${repo}/contents/${filename.split('/').map(encodeURIComponent).join('/')}?${new URLSearchParams({ ref }).toString()}`;
 }
 
 export async function validateSensitivePaths(token, repo, prNumber, baseRef, fetchFromGitHub = ghFetch) {
@@ -352,12 +352,35 @@ export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = proce
   return timer;
 }
 
+export async function reviewSecurity({ GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, reportMode = 'check-run' }, fetchFromGitHub = ghFetch, collect) {
+  const prNumber = PR_NUMBER;
+  const { pr, files } = await immutableSnapshot(fetchFromGitHub, GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, collect);
+
+  // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
+  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber, PR_BASE_SHA, fetchFromGitHub);
+  if (stalePaths.length > 0) {
+    throw new Error('Sensitive path configuration is stale at the immutable base');
+  }
+
+  const allFlags = [
+    ...scanSecrets(files),
+    ...scanCITampering(files),
+    ...scanBuildScripts(files),
+    ...scanSupplyChain(files),
+    ...scanTestPatterns(files),
+    ...scanSensitivePaths(files),
+  ];
+
+  await assertCurrentPair(fetchFromGitHub, GH_TOKEN, GH_REPO, prNumber, PR_HEAD_SHA, PR_BASE_SHA);
+  await reportSecurityFindings(fetchFromGitHub, GH_TOKEN, GH_REPO, pr, allFlags, reportMode);
+}
+
 async function main() {
   const reportMode = process.env.SECURITY_REPORT_MODE ?? 'advisory';
   if (!['advisory', 'check-run'].includes(reportMode)) throw new Error('Invalid SECURITY_REPORT_MODE');
   const watchdog = startScriptWatchdog();
 
-  const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER required');
@@ -375,32 +398,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
-  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber);
-  if (stalePaths.length > 0) {
-    console.error('ERROR: Stale sensitive paths in check-pr-security.mjs:');
-    for (const p of stalePaths) console.error(`  - ${p}`);
-    console.error('');
-    console.error('These paths no longer exist on the PR base branch. The security gate will silently produce no signal for them.');
-    console.error('Update SENSITIVE_PATHS in check-pr-security.mjs to reflect the current code structure.');
-    process.exit(1);
-  }
-
-  const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
-  ]);
-
-  const allFlags = [
-    ...scanSecrets(files),
-    ...scanCITampering(files),
-    ...scanBuildScripts(files),
-    ...scanSupplyChain(files),
-    ...scanTestPatterns(files),
-    ...scanSensitivePaths(files),
-  ];
-
-  await reportSecurityFindings(ghFetch, GH_TOKEN, GH_REPO, pr, allFlags, reportMode);
+  await reviewSecurity({ GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, reportMode });
 
   // Findings remain informational; reaching here means reporting succeeded.
   clearTimeout(watchdog);

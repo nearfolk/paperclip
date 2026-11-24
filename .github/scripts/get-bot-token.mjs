@@ -51,8 +51,13 @@ export async function ghFetch(path, token, options = {}) {
       },
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`GitHub API ${fetchOptions.method ?? 'GET'} ${path} → ${res.status}: ${text}`);
-    return JSON.parse(text);
+    if (!res.ok) {
+      const error = new Error(`GitHub API request failed: HTTP ${res.status}`);
+      error.status = res.status;
+      throw error;
+    }
+    try { return JSON.parse(text); }
+    catch { throw new Error('Malformed GitHub API JSON response'); }
   } finally {
     clearTimeout(timer);
     if (externalSignal) externalSignal.removeEventListener('abort', abortOnExternal);
