@@ -148,6 +148,31 @@ describe("persistent heartbeat progress admission", () => {
     expect((await service.summary(agent.companyId, agent.id)).noOpRuns).toBe(2);
   });
 
+  it("counts newly created documents as work without suppressing timers", async () => {
+    await seed(); const target = await issue();
+    const runs = [await run(target.id), await run(target.id)];
+    for (const r of runs) {
+      await service.evaluate(agent, { source: "assignment", issueId: target.id }, r.id, true);
+      await service.markInvoked(r);
+    }
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, target.id));
+    for (const r of runs) {
+      // The document-create route emits this action, independently of issue updates.
+      await db.insert(activityLog).values({ companyId: agent.companyId, actorType: "agent",
+        actorId: agent.id, agentId: agent.id, runId: r.id, entityType: "issue",
+        entityId: target.id, action: "issue.document_created",
+        details: { key: `receipt-${r.id}`, documentId: randomUUID(), revisionNumber: 1 },
+      });
+      await finish(r);
+      service = makeService();
+      expect(await db.select().from(heartbeatProgressOutcomes)
+        .where(eq(heartbeatProgressOutcomes.runId, r.id))).toMatchObject([{ outcome: "worked" }]);
+    }
+    expect(await service.summary(agent.companyId, agent.id)).toMatchObject({
+      noOpRuns: 0, consecutiveNoOps: 0, timersSuppressed: false, modelRuns: 2,
+    });
+  });
+
   it("separates unique delivered transitions, success, failure and unknown pricing", async () => {
     await seed(); const target = await issue(); const r = await run(target.id);
     await service.evaluate(agent, { source: "assignment", issueId: target.id }, r.id, true); await service.markInvoked(r);

@@ -217,7 +217,7 @@ export function heartbeatProgressService(db: Db, deps: ProgressDependencies) {
       if (!record || record.finishedAt) return;
       const events = await tx.select().from(activityLog).where(and(eq(activityLog.companyId, run.companyId),
         eq(activityLog.runId, run.id), eq(activityLog.entityType, "issue"),
-        inArray(activityLog.action, ["issue.updated", "issue.work_product_created", "issue.work_product_updated", "issue.document_upserted", "issue.document_updated", "issue.attachment_added"])));
+        inArray(activityLog.action, ["issue.updated", "issue.work_product_created", "issue.work_product_updated", "issue.document_created", "issue.document_updated", "issue.attachment_added"])));
       let delivered = false;
       for (const event of events) {
         const details = object(event.details);
