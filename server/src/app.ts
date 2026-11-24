@@ -18,6 +18,7 @@ import {
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
+import { controlPlaneWriteGuard } from "./middleware/control-plane-write-guard.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
@@ -561,6 +562,15 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  app.use(controlPlaneWriteGuard(db, async (incident) => {
+    if (!incident.ownerAgentId) return;
+    await heartbeatService(db).wakeup(incident.ownerAgentId, {
+      source: "on_demand", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: incident.issueId }, contextSnapshot: { issueId: incident.issueId },
+      idempotencyKey: `control-plane-incident:${incident.issueId}`,
+      requestedByActorType: "system",
+    });
+  }));
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);

@@ -376,6 +376,25 @@ describe("runner API request boundary", () => {
     expect(options.redirect).toBe("manual");
     expect(JSON.stringify(result)).not.toContain("private-agent-token");
   });
+  it("reserves before dispatch and reports transport settlement without retry", async () => {
+    const events: string[] = [];
+    const transportError = Object.assign(new Error("private socket detail"), { code: "ECONNRESET" });
+    const fetcher = vi.fn<typeof fetch>(async () => { events.push("fetch"); throw transportError; });
+    const settled = vi.fn(async (error?: unknown) => { events.push("settle"); expect(error).toBe(transportError); });
+    const result = await executeRunnerApi({ operationId: createProject, body: { name: "Test" } }, context, {
+      ...io(fetcher), beforeDispatch: async () => { events.push("reserve"); }, afterTransport: settled,
+    });
+    expect(events).toEqual(["reserve", "fetch", "settle"]);
+    expect(result).toMatchObject({ status: null, outcome: "unknown" });
+    expect(JSON.stringify(result)).not.toContain("private socket detail");
+  });
+  it("does not dispatch when the durable failure budget denies reservation", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    await expect(executeRunnerApi({ operationId: createProject, body: { name: "Test" } }, context, {
+      ...io(fetcher), beforeDispatch: async () => { throw new Error("budget exhausted"); },
+    })).rejects.toThrow("budget exhausted");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it("never retries a mutation after a transport failure", async () => {
     const request = vi.fn<typeof fetch>(async () => {
       throw new Error("socket reset");

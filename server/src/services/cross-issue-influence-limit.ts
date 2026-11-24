@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { resolveRunSourceIssue } from "./validated-run-context.js";
 import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
@@ -32,15 +33,6 @@ export function crossIssueInfluenceRunContextError() {
   // so the agent reading this 403 is told the fix, not just the refusal.
   const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
   return forbidden(body.error, body.details);
-}
-
-function readRunSourceIssueId(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const context = contextSnapshot as Record<string, unknown>;
-  for (const candidate of [context.issueId, context.taskId]) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-  }
-  return null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -92,6 +84,9 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        nativeIssueId: heartbeatRuns.nativeIssueId,
+        status: heartbeatRuns.status,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -104,19 +99,16 @@ export async function observeCrossIssueInfluence(
     if (
       !run ||
       run.companyId !== input.companyId ||
-      run.agentId !== input.agentId
+      run.agentId !== input.agentId ||
+      run.status !== "running" || run.finishedAt
     ) {
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
-    if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
-    ) {
-      return null;
-    }
+    const source = await resolveRunSourceIssue(tx, input.companyId, run);
+    if (source.executionRunId && source.executionRunId !== run.id) throw crossIssueInfluenceRunContextError();
+    const sourceIssueId = source.id;
+    if (sourceIssueId === input.targetIssueId) return null;
 
     const priorCount = await tx
       .select({ count: count() })

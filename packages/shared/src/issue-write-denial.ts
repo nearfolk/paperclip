@@ -258,7 +258,8 @@ export function describeIssueWriteDenial(
         whoCanAct: `${actor}, once the request carries its own run id.`,
         sanctionedPath:
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
+          `only for an active run bound to your assigned source issue. A header alone does not authorize a write. ` +
+          `If context is invalid, resume the source issue with a fresh run; stop identical failed writes after two failures.`,
 
       };
 

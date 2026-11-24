@@ -45,6 +45,11 @@ function readZodIssues(err: unknown): unknown[] | null {
   return Array.isArray(issues) ? issues : null;
 }
 
+function isSensitiveErrorRequest(req: Request) {
+  return isSecretSensitiveHttpRequest(req.method, req.originalUrl) ||
+    (req.actor?.type === "agent" && !["GET", "HEAD", "OPTIONS"].includes(req.method) && /(?:^|\/)issues(?:\/|$)/.test(req.path ?? req.originalUrl.split("?")[0]));
+}
+
 function attachErrorContext(
   req: Request,
   res: Response,
@@ -54,10 +59,10 @@ function attachErrorContext(
   (res as any).__errorContext = {
     error: payload,
     method: req.method,
-    url: req.originalUrl,
-    reqBody: req.body,
-    reqParams: req.params,
-    reqQuery: req.query,
+    url: isSensitiveErrorRequest(req) ? req.path : req.originalUrl,
+    reqBody: isSensitiveErrorRequest(req) ? undefined : req.body,
+    reqParams: isSensitiveErrorRequest(req) ? undefined : req.params,
+    reqQuery: isSensitiveErrorRequest(req) ? undefined : req.query,
   } satisfies ErrorContext;
   if (rawError) {
     (res as any).err = rawError;
@@ -65,7 +70,7 @@ function attachErrorContext(
 }
 
 function sanitizeSecretSensitiveError(req: Request, error: Error): Error {
-  if (!isSecretSensitiveHttpRequest(req.method, req.originalUrl)) return error;
+  if (!isSensitiveErrorRequest(req)) return error;
   const sanitized = new Error("Secret-sensitive request failed");
   // Both `name` and `message` are attacker/provider-controlled properties on
   // JavaScript errors. Do not preserve either on a credential-bearing route.
@@ -77,7 +82,7 @@ function sanitizeSecretSensitiveResponse(
   req: Request,
   value: unknown,
 ): unknown {
-  if (!isSecretSensitiveHttpRequest(req.method, req.originalUrl)) return value;
+  if (!isSensitiveErrorRequest(req)) return value;
   return redactSensitiveValueOccurrences(
     value,
     collectSensitiveStringValues(req.body),
@@ -128,6 +133,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  (res.locals ??= {}).controlPlaneError = err;
   if (err instanceof HttpError) {
     const details =
       err.details &&
@@ -166,7 +172,7 @@ export function errorHandler(
       attachErrorContext(
         req,
         res,
-        isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+        isSensitiveErrorRequest(req)
           ? { message: reportableError.message, name: reportableError.name }
           : {
               message: err.message,
@@ -180,7 +186,7 @@ export function errorHandler(
     }
     const secretSensitiveServerError =
       err.status >= 500 &&
-      isSecretSensitiveHttpRequest(req.method, req.originalUrl);
+      isSensitiveErrorRequest(req);
     res.status(err.status).json(
       secretSensitiveServerError
         ? { error: "Internal server error" }
@@ -241,7 +247,7 @@ export function errorHandler(
   attachErrorContext(
     req,
     res,
-    isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+    isSensitiveErrorRequest(req)
       ? { message: reportableError.message, name: reportableError.name }
       : err instanceof Error
         ? { message: err.message, stack: err.stack, name: err.name }

@@ -1,3 +1,5 @@
+import { reserveControlPlaneWrite, settleControlPlaneWrite } from "../control-plane-write-budget.js";
+import { classifyControlPlaneFailure, operationFingerprint } from "../control-plane-failures.js";
 import { isConnectorTool, executeConnectorTool, type ConnectorAssignment } from "../connector-runtime.js";
 import { resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 import { connectionIntentService } from "../connection-intents.js";
@@ -19,7 +21,7 @@ import { assetService } from "../assets.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
 import { badRequest, forbidden } from "../../errors.js";
 import { searchRunnerApi } from "./runner-api-catalog.js";
-import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
+import { executeRunnerApi, runnerApiUrl, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
 import { and, desc, eq, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -402,6 +404,7 @@ export class PaperclipRunnerToolAuthority {
     const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, bound.actor.adapterType, this.binding.runId, bound.run.responsibleUserId);
     if (!token) throw new Error("Paperclip run authentication is unavailable");
     const execute = async () => {
+      let transportReservation: string | undefined;
       const current = await this.#boundContext();
       if (!runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)) throw new Error("paperclip_runner_tool_not_advertised");
       return executeRunnerApi(input, { ...context, workMode: current.issue.workMode }, {
@@ -410,6 +413,28 @@ export class PaperclipRunnerToolAuthority {
           const fresh = await this.#boundContext();
           if (!runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)) throw new Error("paperclip_runner_tool_not_advertised");
           validateRunnerApiCall(input, { ...context, workMode: fresh.issue.workMode });
+          if (!["GET", "HEAD", "OPTIONS"].includes(operation.method)) {
+            transportReservation = await reserveControlPlaneWrite(this.db, {
+              ...this.binding,
+              fingerprint: operationFingerprint(`TRANSPORT ${operation.method}`, runnerApiUrl(operation, input, context, apiUrl).pathname),
+            });
+          }
+        },
+        afterTransport: async (error) => {
+          if (!transportReservation) return;
+          const incident = await settleControlPlaneWrite(this.db, {
+            ...this.binding, reservationId: transportReservation,
+            ...(error ? { failure: classifyControlPlaneFailure({ error, code: "api_transport_failure" }) } : {}),
+          });
+          if (incident?.created && incident.ownerAgentId && this.binding.enqueueWakeup) {
+            await this.binding.enqueueWakeup(incident.ownerAgentId, {
+              source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+              payload: { issueId: incident.issueId }, contextSnapshot: { issueId: incident.issueId },
+              idempotencyKey: `control-plane-incident:${incident.issueId}`,
+              requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
+              issueStateGuard: { statuses: ["todo"], assigneeAgentId: incident.ownerAgentId },
+            });
+          }
         },
         readFile: (file) => this.#readApiFile(file),
         saveResponse: async (bytes, contentType) => {

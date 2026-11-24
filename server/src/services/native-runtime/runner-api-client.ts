@@ -34,6 +34,7 @@ export interface RunnerApiIo {
   fetch?: typeof fetch;
   /** Revalidate server-owned authority after asynchronous file preparation. */
   beforeDispatch?(): Promise<void>;
+  afterTransport?(error?: unknown): Promise<void>;
   readFile(file: RunnerApiFile): Promise<{ bytes: Buffer; filename: string; contentType: string }>;
   saveResponse(bytes: Buffer, contentType: string): Promise<Record<string, unknown>>;
 }
@@ -181,9 +182,11 @@ export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiC
   try {
     response = await (io.fetch ?? fetch)(url, { method: operation.method, headers, body, redirect: "manual", signal: AbortSignal.timeout(RUNNER_API_TIMEOUT_MS) });
     bytes = await readBoundedResponse(response);
-  } catch {
+  } catch (error) {
+    await io.afterTransport?.(error);
     return { ok: false, status: null, operationId: operation.operationId, error: "api_transport_failure", outcome: ["GET", "HEAD", "OPTIONS"].includes(operation.method) ? "read_failed" : "unknown", guidance: "Inspect current state before retrying a mutation; it may already have succeeded." };
   }
+  await io.afterTransport?.();
   const type = response.headers.get("content-type") ?? "application/octet-stream";
   const mutation = !["GET", "HEAD", "OPTIONS"].includes(operation.method);
   // A server can commit a write before an error response or redirect. Preserve

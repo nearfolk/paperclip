@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -31,6 +32,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -63,6 +65,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       runtimeConfig: {},
       permissions: {},
     });
+    await db.insert(issues).values({ id: sourceIssueId, companyId, title: "Source" });
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
