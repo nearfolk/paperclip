@@ -1,3 +1,5 @@
+import { reconcileControlPlaneOutages } from "./services/control-plane-outage.js";
+import { reconcileIncidentNotifications, type IncidentNotification } from "./services/control-plane-incident-outbox.js";
 import { emailChannelService } from "./services/email-channels.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
@@ -562,15 +564,24 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
-  app.use(controlPlaneWriteGuard(db, async (incident) => {
+  const notifyControlPlaneIncident = async (incident: IncidentNotification) => {
     if (!incident.ownerAgentId) return;
     await heartbeatService(db).wakeup(incident.ownerAgentId, {
       source: "on_demand", triggerDetail: "system", reason: "issue_assigned",
       payload: { issueId: incident.issueId }, contextSnapshot: { issueId: incident.issueId },
-      idempotencyKey: `control-plane-incident:${incident.issueId}`,
+      idempotencyKey: incident.idempotencyKey,
       requestedByActorType: "system",
     });
-  }));
+  };
+  app.use(controlPlaneWriteGuard(db, notifyControlPlaneIncident));
+  let incidentReconciliation: Promise<void> | undefined;
+  const reconcileIncidents = () => {
+    if (!incidentReconciliation) incidentReconciliation = reconcileControlPlaneOutages(db).then(() => reconcileIncidentNotifications(db, notifyControlPlaneIncident))
+      .catch(() => undefined).finally(() => { incidentReconciliation = undefined; });
+  };
+  const incidentTimer = setInterval(reconcileIncidents, 30_000);
+  incidentTimer.unref();
+  reconcileIncidents();
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -1292,6 +1303,7 @@ export async function createApp(
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
+      clearInterval(incidentTimer);
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();

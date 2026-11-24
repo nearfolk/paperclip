@@ -6,6 +6,7 @@ import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
+import { issueWriteRoute } from "../services/control-plane-route.js";
 import { logger } from "./logger.js";
 import { isSecretSensitiveHttpRequest } from "./http-log-policy.js";
 import {
@@ -47,7 +48,7 @@ function readZodIssues(err: unknown): unknown[] | null {
 
 function isSensitiveErrorRequest(req: Request) {
   return isSecretSensitiveHttpRequest(req.method, req.originalUrl) ||
-    (req.actor?.type === "agent" && !["GET", "HEAD", "OPTIONS"].includes(req.method) && /(?:^|\/)issues(?:\/|$)/.test(req.path ?? req.originalUrl.split("?")[0]));
+    (req.actor?.type === "agent" && issueWriteRoute(req.method, req.path ?? req.originalUrl) !== null);
 }
 
 function attachErrorContext(
@@ -59,8 +60,8 @@ function attachErrorContext(
   (res as any).__errorContext = {
     error: payload,
     method: req.method,
-    url: isSensitiveErrorRequest(req) ? req.path : req.originalUrl,
-    reqBody: isSensitiveErrorRequest(req) ? undefined : req.body,
+    url: issueWriteRoute(req.method, req.path ?? req.originalUrl) ? "/api/issues/:resource" : isSensitiveErrorRequest(req) ? req.path : req.originalUrl,
+    reqBody: req.actor?.type === "agent" && issueWriteRoute(req.method, req.path ?? req.originalUrl) ? undefined : req.body,
     reqParams: isSensitiveErrorRequest(req) ? undefined : req.params,
     reqQuery: isSensitiveErrorRequest(req) ? undefined : req.query,
   } satisfies ErrorContext;

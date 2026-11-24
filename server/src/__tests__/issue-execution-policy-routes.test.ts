@@ -1,3 +1,4 @@
+import { getTableName } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,7 +39,8 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
         id: "55555555-5555-4555-8555-555555555555",
         companyId: "company-1",
         agentId: "33333333-3333-4333-8333-333333333333",
-        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
         permissions: null,
       }]).then(onFulfilled, onRejected),
   }),
@@ -47,11 +49,12 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
       id: "55555555-5555-4555-8555-555555555555",
       companyId: "company-1",
       agentId: "33333333-3333-4333-8333-333333333333",
-      contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+      status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
       permissions: null,
     }]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((_table?: unknown) => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
@@ -200,6 +203,8 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockLogActivity.mockReset();
+    mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
@@ -210,7 +215,9 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation((table?: unknown) => table && getTableName(table as any) === "issues"
+      ? { where: () => Promise.resolve([{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", executionRunId: null }]) } as any
+      : { where: mockDbSelectWhere });
     mockDbSelectWhere.mockImplementation(() => ({
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -218,6 +225,7 @@ describe("issue execution policy routes", () => {
             id: "55555555-5555-4555-8555-555555555555",
             companyId: "company-1",
             agentId: "33333333-3333-4333-8333-333333333333",
+            status: "running", finishedAt: null,
             contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
             permissions: null,
           }]).then(onFulfilled, onRejected),
@@ -227,7 +235,8 @@ describe("issue execution policy routes", () => {
           id: "55555555-5555-4555-8555-555555555555",
           companyId: "company-1",
           agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
           permissions: null,
         }]).then(onFulfilled, onRejected),
     }));

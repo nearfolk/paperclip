@@ -1,3 +1,4 @@
+import { enqueueIncidentNotification } from "./control-plane-incident-outbox.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, companies, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
@@ -67,6 +68,9 @@ export async function settleControlPlaneWrite(db: Db, input: WriteIdentity & { r
         ...(existing.status === "done" || existing.status === "cancelled" ? { status: "todo", completedAt: null, cancelledAt: null } : {}),
         updatedAt: new Date(),
       }).where(eq(issues.id, existing.id));
+      if (existing.status === "done" || existing.status === "cancelled") {
+        await enqueueIncidentNotification(tx, input.companyId, { issueId: existing.id, ownerAgentId: existing.assigneeAgentId });
+      }
       return { issueId: existing.id, ownerAgentId: existing.assigneeAgentId, created: false };
     }
     const [owner] = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, input.companyId), eq(agents.role, "cto"), inArray(agents.status, ["active", "idle", "running", "error"]))).limit(1);
@@ -82,6 +86,7 @@ export async function settleControlPlaneWrite(db: Db, input: WriteIdentity & { r
     }).returning({ id: issues.id });
     await tx.insert(activityLog).values({ companyId: input.companyId, actorType: "system", actorId: "control_plane_failure_guard", action: "control_plane.incident_summary", entityType: "issue", entityId: incident!.id, details: { occurrences: 1, ...failure, lastObservedAt: new Date().toISOString() } });
     await tx.insert(activityLog).values({ companyId: input.companyId, actorType: "system", actorId: "control_plane_failure_guard", action: "issue.created", entityType: "issue", entityId: incident!.id, details: { originKind: "control_plane_incident", rootCause: failure.rootCause } });
+    await enqueueIncidentNotification(tx, input.companyId, { issueId: incident!.id, ownerAgentId: owner?.id ?? (company.defaultResponsibleUserId ? null : input.agentId) });
     return { issueId: incident!.id, ownerAgentId: owner?.id ?? (company.defaultResponsibleUserId ? null : input.agentId), created: true };
   });
 }

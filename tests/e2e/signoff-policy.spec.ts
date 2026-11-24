@@ -71,13 +71,14 @@ async function invokeHeartbeat(
   });
   expect(res.ok()).toBe(true);
   const run = await res.json();
-  if (typeof run.id === "string" && run.id.length > 0) return run.id;
+  // A returned receipt may still be queued or already terminal. Select only
+  // the active, issue-bound run below before attempting a mutation.
 
   // A stage transition can already be replacing the previous executor's run
   // with the participant's queued run. If the legacy invoke is skipped and
   // that run has already released the issue lock, recover it from the agent's
   // recent run receipts.
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + 15_000;
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agentId) {
@@ -87,6 +88,7 @@ async function invokeHeartbeat(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
     const candidates = new Set<string>([
+      run.id,
       run.executionRunId,
       issueRunLock.executionRunId,
       issueRunLock.checkoutRunId,
@@ -107,6 +109,7 @@ async function invokeHeartbeat(
       const context = candidateRun.contextSnapshot ?? {};
       if (
         candidateRun.agentId === agentId &&
+        candidateRun.status === "running" && !candidateRun.finishedAt &&
         (context.issueId === issueId || context.taskId === issueId)
       ) {
         return candidate;
@@ -140,7 +143,7 @@ async function retryAgentPatchWithCurrentLockOnConflict(
 ) {
   if (failedRes.status() !== 409) return failedRes;
   let res = failedRes;
-  for (let attempt = 0; attempt < 8 && res.status() === 409; attempt++) {
+  for (let attempt = 0; attempt < 1 && res.status() === 409; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, Math.min(500, 50 * 2 ** attempt)));
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agent.agentId) return res;
@@ -179,7 +182,7 @@ async function agentPatch(
   issueId: string,
   data: Record<string, unknown>,
   {
-    maxAttempts = 8,
+    maxAttempts = 2,
     backoffMs = 50,
     maxBackoffMs = 500,
   }: { maxAttempts?: number; backoffMs?: number; maxBackoffMs?: number } = {},
@@ -311,7 +314,8 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
         adapterType: "process",
         adapterConfig: {
           command: process.execPath,
-          args: ["-e", "process.stdout.write('done\\n')"],
+          // Keep a real process run active long enough for the authenticated write.
+          args: ["-e", "setTimeout(() => process.stdout.write('done\\n'), 10000)"],
         },
       },
     });
@@ -375,6 +379,8 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
 
 test.describe("Signoff execution policy", () => {
   let ctx: TestContext;
+
+  test.setTimeout(60_000);
 
   test.beforeAll(async () => {
     const boardRequest = await pwRequest.newContext({ baseURL: BASE_URL });

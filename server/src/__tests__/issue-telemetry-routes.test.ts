@@ -1,3 +1,4 @@
+import { getTableName } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,7 +24,8 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
         id: "22222222-2222-4222-8222-222222222222",
         companyId: "company-1",
         agentId: "agent-1",
-        contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+        status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
         permissions: null,
       }]).then(onFulfilled, onRejected),
   }),
@@ -32,11 +34,12 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
       id: "22222222-2222-4222-8222-222222222222",
       companyId: "company-1",
       agentId: "agent-1",
-      contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+      status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
       permissions: null,
     }]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((_table?: unknown) => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
@@ -176,7 +179,9 @@ describe("issue telemetry routes", () => {
       ...patch,
     }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation((table?: unknown) => table && getTableName(table as any) === "issues"
+      ? { where: () => Promise.resolve([{ id: "11111111-1111-4111-8111-111111111111", executionRunId: null }]) } as any
+      : { where: mockDbSelectWhere });
     mockDbSelectWhere.mockImplementation(() => ({
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -184,6 +189,7 @@ describe("issue telemetry routes", () => {
             id: "22222222-2222-4222-8222-222222222222",
             companyId: "company-1",
             agentId: "agent-1",
+            status: "running", finishedAt: null,
             contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
             permissions: null,
           }]).then(onFulfilled, onRejected),
@@ -193,7 +199,8 @@ describe("issue telemetry routes", () => {
           id: "22222222-2222-4222-8222-222222222222",
           companyId: "company-1",
           agentId: "agent-1",
-          contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+          status: "running", finishedAt: null,
+            contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
           permissions: null,
         }]).then(onFulfilled, onRejected),
     }));
