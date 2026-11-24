@@ -62,6 +62,12 @@ qualifying PASS. This applies across head changes and ticket boundaries. A PASS
 from another reviewer cannot clear that FAIL. The evidence attachment and
 original verdict remain part of the review record.
 
+Failure history uses the same verdict classifier as the authority evaluator,
+including line-leading `FAIL`, `changes requested`, and `Security verdict: FAIL`.
+Include every completed review ticket with an outstanding failure in the history
+inventory, not just the first review. Each failure needs its original author's
+explicit retraction naming that comment and the new candidate.
+
 After activation, the exception cannot apply because master has changed. New
 PR events must exercise the updated trusted-base workflow. Historical reruns
 cannot prove activation. Normal mode requires the review workflow to succeed
@@ -134,6 +140,13 @@ team inventory is empty; otherwise supply all required tickets. A changed head
 requires fresh independent review, including the gate mapping and all security
 findings. Every qualifying verdict/clearance starts a five-full-minute interval;
 4:59 fails. A hold blocks immediately. Silence is never clearance.
+
+Primary QA and required team PASS comments must be immutable: an `updatedAt`
+different from `createdAt` rejects the receipt. Post a new verdict comment after
+an edit; its creation time restarts the full interval. Factual statements that
+previous-head test results cannot approve the current head are stale-evidence
+warnings, not release denials. Actual denials, adjacent restrictions, holds and
+ambiguous authority still fail closed.
 
 Ticket and ancestor descriptions/comments, original review histories,
 assignment activity, required verdicts, and operator identity are re-fetched.

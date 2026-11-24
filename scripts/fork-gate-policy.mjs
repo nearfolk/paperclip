@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { evaluateQaTicket, evaluateRequiredVerdict, isHold, isClearance } from './fork-ticket-authority.mjs';
+import { evaluateQaTicket, evaluateRequiredVerdict, isHold, isClearance, isFail, isFailRetraction } from './fork-ticket-authority.mjs';
 
 export const REPOSITORY = 'nearfolk/paperclip';
 export const BOOTSTRAP_BASE = '916c13501f80c7d1d659b89e4a06dc47366aa80f';
@@ -65,10 +65,10 @@ export function evaluateForkTickets({ snapshot, identity, actors, contract, hist
   }
   // Across heads and across tickets: no PASS can outrun an original QA FAIL.
   const allComments = [...snapshot.comments, ...historySources, ...required.flatMap(s => s.comments)];
-  const failures = allComments.filter(c => /^\s*(?:#{1,6}\s*)?(?:FAIL|changes requested)\b/im.test(c.body ?? '') && !/retract(?:ed|s|ion)?[^\n]{0,80}FAIL/i.test(c.body));
+  const failures = allComments.filter(c => isFail(c.body) && !isFailRetraction(c.body));
   if (contract.bootstrap && !failures.some(c => c.authorAgentId === contract.reviewerId && String(c.body).includes(ORIGINAL_FAILED_HEAD))) fail('Original QA FAIL history is missing');
   for (const failure of failures) {
-    const retraction = allComments.find(c => c.authorAgentId === failure.authorAgentId && c.id !== failure.id && heads(c.body).length === 1 && heads(c.body)[0] === contract.head && /\bretract(?:ed|s|ion)?\b[^\n]{0,80}\bFAIL\b/i.test(c.body) && String(c.body).includes(failure.id) && date(c.createdAt) > date(failure.createdAt) && date(c.createdAt) <= date(qa.passAt));
+    const retraction = allComments.find(c => c.authorAgentId === failure.authorAgentId && c.id !== failure.id && heads(c.body).length === 1 && heads(c.body)[0] === contract.head && isFailRetraction(c.body) && String(c.body).includes(failure.id) && date(c.createdAt) > date(failure.createdAt) && date(c.createdAt) <= date(qa.passAt));
     if (!retraction) fail(`Unretracted FAIL: ${failure.id}`);
   }
   // Holds in any declared ticket/ancestor apply regardless of author. Only the

@@ -70,6 +70,85 @@ test('contract must name mapping, reviewers, implementation and original history
   }
 });
 test('QA gate permits exactly five minutes with original author retraction', () => assert.equal(evaluateForkTickets(tickets()).reviewerId, reviewer));
+for (const format of ['FAIL', '## FAIL', 'changes requested', 'Security verdict: FAIL']) {
+  for (const failedHead of [head, 'c'.repeat(40)]) test(`${format} requires its author's retraction across tickets at ${failedHead === head ? 'current' : 'older'} head`, () => {
+    const x = tickets();
+    x.histories[0].comments.push(comment('additional-failure', `${format}\nHead ${failedHead}`, '2026-11-24T11:30:00Z', 'security-reviewer'));
+    assert.throws(() => evaluateForkTickets(x), /FAIL/);
+    const retraction = comment('additional-retraction', `I retract FAIL at comment additional-failure for corrected head ${head}.`, '2026-11-24T11:59:30Z', reviewer);
+    x.snapshot.comments.push(retraction);
+    assert.throws(() => evaluateForkTickets(x), /FAIL/);
+    retraction.authorAgentId = 'security-reviewer';
+    retraction.body = `I retract FAIL at comment additional-failure for corrected head ${'d'.repeat(40)}.`;
+    assert.throws(() => evaluateForkTickets(x), /FAIL/);
+    retraction.body = `I retract FAIL at comment additional-failure for corrected head ${head}.`;
+    assert.doesNotThrow(() => evaluateForkTickets(x));
+  });
+}
+function requiredTeamTickets() {
+  const x = tickets();
+  x.contract.requiredVerdicts = [{ ticket: 'security', reviewerId: 'security-reviewer' }];
+  x.required = [{ issue: { id: 'security' }, comments: [comment('team-pass', `Security verdict: PASS\nHead ${head}`, '2026-11-24T11:00:00Z', 'security-reviewer')], authorityScope: [] }];
+  return x;
+}
+test('a failure report discussing required retraction remains an outstanding FAIL', () => {
+  const x = tickets();
+  x.histories[0].comments.push(comment('followup-failure', `FAIL\nHead ${'c'.repeat(40)}\nOriginal FAIL retraction remains required.`, '2026-11-24T11:30:00Z'));
+  assert.throws(() => evaluateForkTickets(x), /Unretracted FAIL: followup-failure/);
+  x.snapshot.comments.push(comment('followup-retraction', `I retract FAIL at comment followup-failure for corrected head ${head}.`, '2026-11-24T11:59:30Z'));
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
+test('edited required PASS cannot inherit the old creation timestamp', () => {
+  const x = requiredTeamTickets();
+  x.required[0].comments[0].updatedAt = '2026-11-24T12:04:59Z';
+  assert.throws(() => evaluateForkTickets(x), /Edited required PASS/);
+  // A fresh immutable replacement starts a full new interval.
+  x.required[0].comments.push(comment('new-team-pass', `PASS ${head}`, '2026-11-24T12:04:59Z', 'security-reviewer'));
+  x.nowMs = Date.parse('2026-11-24T12:09:58Z');
+  assert.throws(() => evaluateForkTickets(x), /Five full minutes/);
+  x.nowMs += 1000;
+  assert.equal(evaluateForkTickets(x).eligibleAt, '2026-11-24T12:09:59.000Z');
+});
+test('unchanged required PASS timestamp is accepted; malformed update fails closed', () => {
+  const x = requiredTeamTickets();
+  x.required[0].comments[0].updatedAt = x.required[0].comments[0].createdAt;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  x.required[0].comments[0].updatedAt = 'invalid';
+  assert.throws(() => evaluateForkTickets(x), /timestamp/);
+});
+function realReviewLifecycle() {
+  // Saved authoritative review description from the independent QA evidence.
+  // All verdicts/assignments below are offline fixtures, never API mutations.
+  const issue = JSON.parse(readFileSync(new URL('./fixtures/fork-review-liv-11645.json', import.meta.url), 'utf8'));
+  const candidate = 'c64e1cf3530a195940a7b19a3059be74a7eb519c';
+  const x = JSON.parse(JSON.stringify(tickets()).replaceAll(head, candidate));
+  x.contract.failureHistoryTickets.push(issue.id);
+  x.histories.push({ issue, comments: [comment('second-failure', `Security verdict: FAIL\nHead ${'c64e1cf3530a195940a7b19a3059be74a7eb519c'}`, '2026-11-24T11:30:00Z')], authorityScope: [] });
+  x.snapshot.comments.push(comment('second-retraction', `I retract FAIL at comment second-failure for corrected head ${candidate}.`, '2026-11-24T11:59:30Z'));
+  return x;
+}
+test('real review description permits a fresh separate reviewer-to-CTO gate', () => {
+  const x = realReviewLifecycle();
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  x.snapshot.issue.status = 'done';
+  assert.throws(() => evaluateForkTickets(x));
+});
+for (const denial of [
+  'Do not approve this head.',
+  'I cannot authorize release.',
+  'HOLD: freeze the release.',
+  "Current head's results do not approve this head.",
+  "Previous head's results do not approve this head until the board clears it.",
+]) test(`stale-evidence exception preserves actual or ambiguous restriction: ${denial}`, () => {
+  const x = realReviewLifecycle();
+  x.histories[1].issue.description += `\n${denial}`;
+  assert.throws(() => evaluateForkTickets(x), /denial|hold|authority/i);
+});
+test('stale-evidence exception preserves an adjacent same-sentence denial', () => {
+  const x = realReviewLifecycle();
+  x.histories[1].issue.description += "\nPrevious head's results do not approve this head. Do not approve this head.";
+  assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+});
 for (const [name, mutate] of [
   ['4:59', x => x.nowMs--], ['same author QA', x => x.implementation.issue.assigneeAgentId = reviewer],
   ['wrong operator', x => x.identity.id = 'other'], ['non-CTO operator', x => x.identity.role = 'engineer'],

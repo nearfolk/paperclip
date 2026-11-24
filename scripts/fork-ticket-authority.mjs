@@ -56,14 +56,17 @@ function isPass(body) {
   )
 }
 
-function isFail(body) {
+export function isFail(body) {
   return (
     /^\s*#{0,6}\s*(?:FAIL|changes requested)\b/im.test(body ?? '')
     || /\bverdict\s*:\s*FAIL\b/i.test(body ?? '')
   )
 }
 
-function isFailRetraction(body) {
+export function isFailRetraction(body) {
+  // A failure report may discuss the retraction needed next. An explicit FAIL
+  // verdict in that report must never be erased by those instructions.
+  if (isFail(body)) return false
   return (
     /\bretract(?:s|ed|ion)?\b[^\n]{0,80}\b(?:FAIL|changes requested)\b/i.test(body ?? '')
     || /\b(?:FAIL|changes requested)\b[^\n]{0,80}\bretract(?:s|ed|ion)?\b/i.test(body ?? '')
@@ -543,6 +546,12 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
     .join('\n')
 
   return withoutQuotedDiagnosticExamples
+    // Evidence from an older candidate is not a release decision. Match only
+    // the complete factual sentence; leave adjacent or qualified denials intact.
+    .replace(
+      /(^|[.!?]\s+|\n)(?:earlier|prior|previous|old)[ -]head['’]s\s+(?:(?:\d+-test|full-suite|CI|test|build|typecheck)(?:\/(?:\d+-test|full-suite|CI|test|build|typecheck))*\s+)?results\s+(?:do not|cannot)\s+(?:approve|authorize)\s+(?:this|the current)\s+head\.(?=\s|$)/gim,
+      '$1',
+    )
     .replace(
       /an authenticated current-head `Do not approve or publish the release\.\.\.` directive remains fail-closed\.?/gi,
       '',
@@ -1162,6 +1171,9 @@ export function evaluateRequiredVerdict({ issue, comments, expectedHead }) {
   const latest = matching.at(-1)
   if (!latest || !isPass(latest.body)) {
     throw new Error(`${issue.identifier ?? 'Required ticket'} lacks a current exact-head PASS`)
+  }
+  if (latest.updatedAt && timestamp(latest.updatedAt, 'Required PASS update') !== timestamp(latest.createdAt, 'Required PASS')) {
+    throw new Error('Edited required PASS requires a new immutable verdict comment')
   }
   const later = ordered.filter(
     (comment) => timestamp(comment.createdAt, 'Required verdict comment') > timestamp(latest.createdAt, 'Required PASS'),
