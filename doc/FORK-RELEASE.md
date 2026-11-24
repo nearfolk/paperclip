@@ -124,6 +124,12 @@ node --input-type=module -e "import { MAPPING_DIGEST } from './scripts/fork-gate
 
 Use separate retraction and PASS comments. Example retraction:
 `I retract FAIL at comment <original comment ID> for corrected head <new SHA>.`
+Post each retraction as this complete standalone affirmative sentence, ending in
+a period. The guard extracts the exact cited comment ID and head from that
+sentence. Negated, prospective, conditional, quoted, instructional, or edited
+receipts cannot clear a failure. A retraction must precede the qualifying PASS;
+equal timestamps do not prove that ordering. Put supporting discussion in a
+separate comment.
 The qualifying PASS contains these explicit receipts, with real values:
 
 ```text
@@ -147,6 +153,11 @@ an edit; its creation time restarts the full interval. Factual statements that
 previous-head test results cannot approve the current head are stale-evidence
 warnings, not release denials. Actual denials, adjacent restrictions, holds and
 ambiguous authority still fail closed.
+Direct merge, release and deployment prohibitions also block, whether posted on
+the gate or an ancestor; a missing exact head does not default to permission.
+Reviewer-only assignment instructions remain scoped to the reviewer when they
+explicitly hand protected activation to the distinct CTO. They cannot mask an
+adjacent prohibition directed at that operator or candidate.
 
 Ticket and ancestor descriptions/comments, original review histories,
 assignment activity, required verdicts, and operator identity are re-fetched.

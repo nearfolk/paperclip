@@ -98,6 +98,50 @@ test('a failure report discussing required retraction remains an outstanding FAI
   x.snapshot.comments.push(comment('followup-retraction', `I retract FAIL at comment followup-failure for corrected head ${head}.`, '2026-11-24T11:59:30Z'));
   assert.doesNotThrow(() => evaluateForkTickets(x));
 });
+for (const receipt of [
+  'I do not retract FAIL at comment original-fail for corrected head HEAD.',
+  'I never retract FAIL at comment original-fail for corrected head HEAD.',
+  'I will retract FAIL at comment original-fail for corrected head HEAD after remediation is validated.',
+  'A future retraction of FAIL at comment original-fail for corrected head HEAD is required.',
+  'Please retract FAIL at comment original-fail for corrected head HEAD.',
+  'I retract FAIL at comment original-fail for corrected head HEAD if validation passes.',
+  'I retract FAIL at comment original-fail for corrected head HEAD unless new findings appear.',
+  'I retract FAIL at comment original-fail for corrected head HEAD. This is conditional.',
+  'Example: I retract FAIL at comment original-fail for corrected head HEAD.',
+  'I retract FAIL at comment original-fail for corrected head HEAD.\nI do not retract that finding.',
+  'I retract FAIL at comment original-fail-suffix for corrected head HEAD.',
+  'I retract FAIL at comment other-fail for corrected head HEAD. Original: original-fail.',
+]) test(`only a completed unqualified receipt clears FAIL: ${receipt}`, () => {
+  const x = tickets(); x.snapshot.comments[0].body = receipt.replace('HEAD', head);
+  assert.throws(() => evaluateForkTickets(x), /FAIL/);
+});
+test('retraction edits and same-time retraction/PASS cannot qualify', () => {
+  const x = tickets(); x.snapshot.comments[0].updatedAt = at;
+  assert.throws(() => evaluateForkTickets(x), /FAIL/);
+  delete x.snapshot.comments[0].updatedAt;
+  x.snapshot.comments[0].createdAt = at;
+  assert.throws(() => evaluateForkTickets(x), /FAIL/);
+});
+for (const prohibition of ['Do not merge', 'Must not merge', 'Never merge', 'Do not release', 'Do not deploy', 'Merge is prohibited']) {
+  for (const scope of ['gate', 'ancestor', 'description']) test(`direct prohibition blocks ${scope}: ${prohibition}`, () => {
+    const x = tickets();
+    const denial = comment('direct-denial', `${prohibition} PR #7 at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo');
+    if (scope === 'description') x.snapshot.authorityScope.push({ ...denial, sourceKind: 'issue_description', sourceIssueId: 'ancestor' });
+    else (scope === 'gate' ? x.snapshot.comments : x.snapshot.authorityScope).push(denial);
+    assert.throws(() => evaluateForkTickets(x), /denied|denial|authority|hold/i);
+  });
+}
+test('direct prohibition with absent or unknown authority fails closed; older head stays scoped', () => {
+  const x = tickets();
+  const denial = comment('direct-denial', 'Do not merge.', '2026-11-24T12:01:00Z', 'ceo');
+  x.snapshot.authorityScope.push(denial);
+  assert.throws(() => evaluateForkTickets(x), /ambiguous/);
+  denial.body = `Do not merge PR #7 at exact head ${head}.`;
+  denial.authorAgentId = 'unknown';
+  assert.throws(() => evaluateForkTickets(x), /authority is unavailable/);
+  denial.authorAgentId = 'ceo'; denial.body = `Do not merge PR #7 at exact head ${'c'.repeat(40)}.`;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
 test('edited required PASS cannot inherit the old creation timestamp', () => {
   const x = requiredTeamTickets();
   x.required[0].comments[0].updatedAt = '2026-11-24T12:04:59Z';
@@ -135,6 +179,8 @@ test('real review description permits a fresh separate reviewer-to-CTO gate', ()
 });
 for (const denial of [
   'Do not approve this head.',
+  'Do not merge this head.',
+  'Must not release this head.',
   'I cannot authorize release.',
   'HOLD: freeze the release.',
   "Current head's results do not approve this head.",

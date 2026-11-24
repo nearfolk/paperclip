@@ -63,14 +63,22 @@ export function isFail(body) {
   )
 }
 
-export function isFailRetraction(body) {
-  // A failure report may discuss the retraction needed next. An explicit FAIL
-  // verdict in that report must never be erased by those instructions.
-  if (isFail(body)) return false
-  return (
-    /\bretract(?:s|ed|ion)?\b[^\n]{0,80}\b(?:FAIL|changes requested)\b/i.test(body ?? '')
-    || /\b(?:FAIL|changes requested)\b[^\n]{0,80}\bretract(?:s|ed|ion)?\b/i.test(body ?? '')
+export function parseFailRetractionReceipt(body) {
+  // A receipt is a completed first-person act, not nearby retraction words.
+  // Keep its comment ID and head in the same unqualified sentence. The fork
+  // requires a standalone receipt; supporting discussion belongs elsewhere.
+  const match = String(body ?? '').trim().match(
+    /^(?:RETRACTION\s*[—:-]\s*)?I\s+(?:(?:explicitly|hereby)\s+)?retract\s+(?:(?:my|the|earlier|prior|previous|controlling|cited)\s+){0,4}(?:FAIL|changes requested)\s+(?:in\s+[A-Z][A-Z0-9]*-\d+\s+)?(?:at\s+)?comment\s+`?([0-9a-z-]+)`?\s+(?:for\s+(?:PR\s*#\d+\s+)?(?:corrected|exact|new)\s+head|after\s+verifying\s+exact\s+head)\s+`?([0-9a-f]{40})`?\.$/i,
   )
+  return match ? { commentId: match[1], head: match[2].toLowerCase() } : null
+}
+
+export function isFailRetraction(body) {
+  if (isFail(body)) return false
+  // Historical authority receipts may have supporting paragraphs. Their first
+  // line must still be an explicit completed receipt. Cross-ticket eligibility
+  // below uses the stricter whole-comment parser and exact extracted bindings.
+  return Boolean(parseFailRetractionReceipt(String(body ?? '').trim().split('\n')[0]))
 }
 
 function isPassRetraction(body) {
@@ -515,10 +523,18 @@ function isReleaseDenial(body) {
       /\bdo not approve or publish on UNKNOWN\/FAIL\.(?=\s|$)/gi,
       '',
     )
+    // These clauses assign the merge to another actor; they do not prohibit
+    // that actor's protected merge. Do not strip an adjacent prohibition.
+    .replace(/\bOn PASS leave this gate in_review, assign it to that merge operator, and do not merge\./gi, '')
+    .replace(/\bOn PASS, do not merge; hand off to the operator\./gi, '')
+    // This exact conditional remains enforced by releaseAuthorityRequirement.
+    .replace(/\bDo not release without the CEO explicitly authorizing this PR at this exact head in this ticket thread\./gi, '')
 
   return (
     /^\s*#{0,6}\s*(?:release\s+)?(?:DENIED|NOT AUTHORIZED)\b/im.test(releaseScopedBody)
     || /\b(?:do not|cannot|refuse to)\s+(?:authorize|approve)\b/i.test(releaseScopedBody)
+    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)\s+(?:merge|release|deploy)\b/i.test(releaseScopedBody)
+    || /\b(?:merge|release|deployment)\s+(?:is\s+)?(?:prohibited|forbidden|not permitted|not allowed)\b/i.test(releaseScopedBody)
     || /\b(?:authorization|approval)\s+(?:is\s+)?(?:denied|withheld|refused)\b/i.test(releaseScopedBody)
     || /\bno\s+(?:merge|release)\s+authority\b/i.test(releaseScopedBody)
     || /\b(?:merge|release)\s+authority\b[^\n]{0,80}\b(?:withheld|revoked|void|withdrawn)\b/i.test(releaseScopedBody)
@@ -779,9 +795,18 @@ function evaluateReleaseAuthority({
     ) {
       requiredRole = null
     }
-    const sourceBody = retractedQaFailureIds.has(source?.id)
+    let sourceBody = retractedQaFailureIds.has(source?.id)
       ? withoutRetractedQaFailureEffect(source?.body)
       : source?.body
+    // A review-deliverable assignment forbids the reviewer from performing
+    // operations explicitly delegated to the CTO. Limit this boundary to the
+    // recorded description and exact reviewer-only instruction sentence.
+    if (source?.sourceKind === 'issue_description'
+      && /Lifecycle resolution: THIS is a review-deliverable child\./.test(sourceBody ?? '')
+      && /No merge is requested from QA\./.test(sourceBody ?? '')
+      && /The CTO alone handles activation/.test(sourceBody ?? '')) {
+      sourceBody = String(sourceBody).replace(/Do not merge, deploy, procure credentials, mutate production, rerun the old review job, or use browser automation\./g, '')
+    }
     const denialBody = ['ceo', 'board'].includes(authorRole)
       ? sourceBody
       : withoutFactualStaleVerdictNonAuthorization(sourceBody)
