@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { addIssueCommentSchema } from "@paperclipai/shared";
 import { agents, companies, createDb, issues, issueRelations, issueComments, heartbeatRuns,
   heartbeatProgressState, heartbeatProgressOutcomes, agentWakeupRequests, activityLog,
 } from "@paperclipai/db";
@@ -63,7 +64,11 @@ describe("persistent heartbeat progress admission", () => {
     }).returning().then(rows => rows[0]!);
   }
   async function comment(issueId: string, body: string, metadata = {}) {
-    return db.insert(issueComments).values({ companyId: agent.companyId, issueId, body, authorUserId: "human", metadata })
+    const input = addIssueCommentSchema.parse({ body, metadata: {
+      version: 1, sections: [{ rows: [{ type: "text", text: "Scheduling context" }] }], ...metadata,
+    } });
+    return db.insert(issueComments).values({ companyId: agent.companyId, issueId,
+      body: input.body, authorUserId: "human", metadata: input.metadata })
       .returning().then(rows => rows[0]!);
   }
   async function finish(r: Awaited<ReturnType<typeof run>>, usageJson: Record<string, unknown> | null = null, status = "succeeded") {

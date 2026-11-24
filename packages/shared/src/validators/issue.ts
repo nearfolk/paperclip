@@ -999,6 +999,7 @@ export const issueCommentMetadataSectionSchema = z
 export const issueCommentMetadataSchema = z
   .object({
     version: z.literal(1),
+    wakeRelevance: z.enum(["none", "reminder", "action_required"]).optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z
       .string()

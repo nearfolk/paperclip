@@ -30,7 +30,12 @@ A valid relevant event can admit a context-only turn when no dependency blocks i
   wake cannot bypass an otherwise entirely dependency-blocked queue.
 
 `wakeRelevance: "none"` or `"reminder"` suppresses a comment. Self comments never
-qualify. Comment identity hashes normalized content, issue and author, so a new
+qualify. The supported comment API accepts this optional enum inside its existing
+structured metadata envelope, for example
+`{"version":1,"wakeRelevance":"action_required","sections":[{"rows":[{"type":"text","text":"Revised requirement needs action"}]}]}`.
+The required version and sections remain unchanged. This field never bypasses
+dependency, ownership, pause or budget checks.
+Comment identity hashes normalized content, issue and author, so a new
 comment ID with identical text is not new input. Content hashes are local, not
 telemetry. This is a deterministic protocol, not semantic classification of prose;
 callers should explicitly mark advisory comments. Human messages other than the
