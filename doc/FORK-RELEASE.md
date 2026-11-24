@@ -253,3 +253,9 @@ Conversational `hold, do not approve yet` remains a single directive. Descriptiv
 phrases such as “authority and hold evaluation” do not create hold directives.
 The inherited conversational-hold regression was an unsafe acceptance, not a
 legacy-receipt compatibility exception; it is now required to block release.
+
+The narrow reviewer-only lifecycle assignment may be recorded by a nonexecutive
+in a comment when an active QA checkout prevents description edits. It retains
+the explicit completed-review/separate-CTO-activation boundary. Only its exact
+reviewer instruction is exempt; adjacent live denials and executive directives
+remain effective. The same assignment cannot confer release authority.

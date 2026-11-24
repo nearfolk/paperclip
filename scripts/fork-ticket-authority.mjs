@@ -714,8 +714,10 @@ function evaluateReleaseAuthority({
       : source?.body
     // A review-deliverable assignment forbids the reviewer from performing
     // operations explicitly delegated to the CTO. Limit this boundary to the
-    // recorded description and exact reviewer-only instruction sentence.
-    if (source?.sourceKind === 'issue_description'
+    // recorded review assignment and exact reviewer-only instruction sentence.
+    // A task owner may receive this assignment in a comment when its active
+    // checkout prevents description edits. Executive directives stay intact.
+    if (!['ceo', 'board'].includes(authorRole)
       && /Lifecycle resolution: THIS is a review-deliverable child\./.test(sourceBody ?? '')
       && /No merge is requested from QA\./.test(sourceBody ?? '')
       && /The CTO alone handles activation/.test(sourceBody ?? '')) {

@@ -457,3 +457,15 @@ for (const denial of ["don't merge PR #7", "mustn’t deploy this candidate", "m
   diagnostic.body += ` Do not merge at exact head ${head}.`;
   assert.throws(() => evaluateForkTickets(x));
 });
+
+test('nonexecutive review assignment can arrive through an active-checkout comment', () => {
+  const x = tickets();
+  const assignment = comment('review-assignment', 'Do not merge, deploy, procure credentials, mutate production, rerun the old review job, or use browser automation.\nLifecycle resolution: THIS is a review-deliverable child. The CTO alone handles activation. No merge is requested from QA.', '2026-11-24T12:01:00Z', 'implementation-author');
+  x.snapshot.authorityScope.push(assignment);
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  assignment.body += ` Do not merge at exact head ${head}.`;
+  assert.throws(() => evaluateForkTickets(x));
+  assignment.body = assignment.body.replace(` Do not merge at exact head ${head}.`, '');
+  assignment.authorAgentId = 'ceo';
+  assert.throws(() => evaluateForkTickets(x));
+});
