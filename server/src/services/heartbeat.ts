@@ -42,6 +42,7 @@ import {
 import { agentService } from "./agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
+import { heartbeatProgressService } from "./heartbeat-progress.js";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -732,7 +733,6 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "cancelled",
   "timed_out",
 ] as const;
-const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -9231,6 +9231,33 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const progress = heartbeatProgressService(db, {
+    readiness: (companyId, ids, client) => issuesSvc.listDependencyReadiness(companyId, ids, client),
+    held: (companyId, issueId) => treeControlSvc.getActivePauseHoldGate(companyId, issueId),
+    invocationBlock: async (agent, issueId) => {
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) return "agent.not_invokable";
+      const budget = await budgets.getInvocationBlock(agent.companyId, agent.id, { issueId });
+      return budget ? "budget.blocked" : null;
+    },
+  });
+
+  async function progressRunGate(run: typeof heartbeatRuns.$inferSelect) {
+    const agent = await getAgent(run.agentId);
+    if (!agent || !parseHeartbeatPolicy(agent).skipTimerWhenNoActionableWork) return true;
+    const decision = await progress.evaluate(agent, await progress.wakeForRun(run), run.id, true);
+    if (decision.allowed) return true;
+    await progress.skipped(run, decision.reason);
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      errorCode: `heartbeat.preflight.${decision.reason}`,
+      error: `Skipped before model invocation: ${decision.reason}`,
+      finishedAt: new Date(),
+    });
+    await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date() });
+    if (cancelled) await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+    return false;
+  }
+
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
@@ -16210,24 +16237,6 @@ export function heartbeatService(
     return cancelled;
   }
 
-  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
-      .select({ id: issues.id })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, agent.companyId),
-          eq(issues.assigneeAgentId, agent.id),
-          isNull(issues.assigneeUserId),
-          isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
-  }
-
   async function markTimerHeartbeatChecked(
     agentId: string,
     source: WakeupOptions["source"],
@@ -16632,6 +16641,7 @@ export function heartbeatService(
       return null;
     }
 
+    if (!(await progressRunGate(run))) return null;
     const context = parseObject(run.contextSnapshot);
     const budgetBlock = await budgets.getInvocationBlock(
       run.companyId,
@@ -19339,6 +19349,7 @@ export function heartbeatService(
         throw new Error("Agent adapter changed during startup; start a new turn with the updated agent.");
       }
 
+      if (!(await progressRunGate(run))) return;
       const runtime = await ensureRuntimeState(agent);
       const context = parseObject(run.contextSnapshot);
       const authorizeFailedChatRetryExecution = () =>
@@ -21265,6 +21276,7 @@ export function heartbeatService(
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
+        if (!(await progressRunGate(run))) return { dispatched: false };
         await controllerLease.assertOwned("dispatching");
         // Recheck after workspace/credential preparation, immediately before the
         // provider handoff. Never hold validation locks while adapter code runs.
@@ -21285,6 +21297,7 @@ export function heartbeatService(
           (!isResolvedInteractionContinuationWakeContext(context) &&
             run.scheduledRetryReason !== "native_safe_replacement")
         ) {
+          await progress.markInvoked(run);
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
@@ -21296,6 +21309,8 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
+        if (!(await progressRunGate(run))) return { dispatched: false };
+        await progress.markInvoked(run);
         const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
           runId: run.id,
           companyId: run.companyId,
@@ -21306,6 +21321,9 @@ export function heartbeatService(
         });
 
         if (gate.dispatched) return gate;
+        if (parseHeartbeatPolicy(agent).skipTimerWhenNoActionableWork) {
+          await progress.skipped(run, "execution_gate_changed");
+        }
         if (gate.cancellation.outcome === "cancelled") {
           applyRunDispatchPostCommitEffects(
             gate.cancellation.postCommitEffects,
@@ -24825,6 +24843,11 @@ export function heartbeatService(
           },
         );
       }
+      if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        await progress.finish(latestRun).catch(err => {
+          logger.error({ err, runId: run.id }, "progress outcome persistence failed; outcome remains unknown");
+        });
+      }
       // Warm retention is earned only by a fully successful turn. A failed,
       // cancelled, or timed-out run stops the reusable sandbox so the next
       // acquisition must revalidate and explicitly resume it.
@@ -25218,6 +25241,23 @@ export function heartbeatService(
       return null;
     }
 
+    if (parseHeartbeatPolicy(agent).skipTimerWhenNoActionableWork) {
+      const decision = await progress.evaluate(agent, {
+        source, issueId, commentId: wakeCommentId, actorType: opts.requestedByActorType,
+        // Admission is read-only; execution uses the persisted request identity.
+        eventId: opts.requestedByActorType === "user" ? "admission" : null,
+      });
+      if (!decision.allowed) {
+        const skipReason = source === "timer" && !issueId && decision.reason === "no_actionable_work"
+          ? "heartbeat.timer.no_actionable_work" : `heartbeat.preflight.${decision.reason}`;
+        await writeSkippedHeartbeatRequest(skipReason, {
+          version: 1, outcome: "skipped_preflight", reason: decision.reason,
+        });
+        await markTimerHeartbeatChecked(agentId, source);
+        return null;
+      }
+    }
+
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(
       agent,
       payload,
@@ -25418,24 +25458,6 @@ export function heartbeatService(
       return null;
     }
 
-    const genericTimerWake =
-      source === "timer" &&
-      !issueId &&
-      !wakeCommentId &&
-      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
-      !readNonEmptyString(enrichedContextSnapshot.taskKey);
-    if (
-      policy.skipTimerWhenNoActionableWork &&
-      genericTimerWake &&
-      !(await hasActionableTimerWork(agent))
-    ) {
-      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason:
-          "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
-      });
-      await markTimerHeartbeatChecked(agentId, source);
-      return null;
-    }
 
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
@@ -28023,6 +28045,8 @@ export function heartbeatService(
     sweepExpiredRuntimeStatuses: sweepExpiredHeartbeatRunRuntimeStatuses,
 
     getRunLogAccess,
+
+    getProgressSummary: progress.summary,
 
     getRuntimeState: async (agentId: string) => {
       const state = await getRuntimeState(agentId);

@@ -2762,3 +2762,4 @@ export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from
 
 export * from "./types/email.js";
 export * from "./validators/email.js";
+export type { HeartbeatProgressOutcome, HeartbeatProgressSummary } from "./types/heartbeat-progress.js";

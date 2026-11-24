@@ -341,7 +341,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     expect(wakeup?.payload).toMatchObject({
       heartbeatSkip: {
-        reason: expect.stringContaining("No assigned todo or in_progress issue"),
+        reason: "no_actionable_work",
+        outcome: "skipped_preflight",
+        version: 1,
       },
     });
     expect(runRows).toHaveLength(0);

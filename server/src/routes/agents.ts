@@ -4115,6 +4115,15 @@ export function agentRoutes(
     res.json(state);
   });
 
+  router.get("/agents/:id/progress-summary", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!agent) return;
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    res.json(await heartbeat.getProgressSummary(agent.companyId, id));
+  });
+
   router.get("/agents/:id/task-sessions", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;

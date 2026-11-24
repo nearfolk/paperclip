@@ -555,3 +555,11 @@ A paused task takes over the composer with an amber notice and a Resume action.
 Operators must release the effective task or ancestor pause before sending a new
 message. The draft stays intact. This applies to both task interfaces and to
 board comment API requests; an agent may still report interrupted work.
+
+
+## Progress-aware execution
+
+The opt-in heartbeat progress gate skips unchanged non-actionable work before
+instruction/history hydration. Durable outcomes distinguish delivered work,
+no-op turns, preflight skips and unknown evidence from process exit status.
+The implemented contract is in [heartbeat progress gating](runbooks/heartbeat-progress-gating.md).

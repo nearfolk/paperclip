@@ -1594,3 +1594,12 @@ normal task conversation; rich email cards show the correspondence and delivery
 outcomes without a separate email composer. See
 [AgentMail connections](connections/AGENTMAIL.md) for setup, transports, recovery,
 authorization, and the API/CLI contract.
+
+### Opt-in deterministic heartbeat progress admission
+
+`runtimeConfig.heartbeat.skipTimerWhenNoActionableWork` also gates scoped wakes
+before history/instruction hydration and provider dispatch. It enforces current
+ownership, dependencies, holds and invokability, deduplicates relevant persisted
+inputs, and persists progress independently from process status. See
+[heartbeat progress gating](runbooks/heartbeat-progress-gating.md) for the v1
+relevance, outcome, measured/unknown cost and rollout contracts.
