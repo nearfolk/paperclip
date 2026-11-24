@@ -469,7 +469,7 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
     .split('\n')
     .map((line) => (
       (/\b(?:QA|diagnostic|test|regression|fixture|example|parser|classifier|verifier|reproduced|reproduction)\b/i.test(line) || /^[-*] \*\*P[0-3]\s*[—:-]/.test(line))
-        ? line.replace(/`[^`\n]*<candidate>[^`\n]*`/gi, '').replace(/`[^`]*(?:do not|must not|cannot|refuse to)\s+(?:authorize|approve|merge|release|deploy)[^`]*`/gi, '')
+        ? line.replace(/`([^`\n]*)`/g, (span, example) => /<candidate>/i.test(example) || isReleaseDenial(example) ? '' : span)
         : line
     ))
     .join('\n')

@@ -448,3 +448,12 @@ test('standalone affirmative authorization starts five full minutes', () => {
   x.nowMs += 1000;
   assert.doesNotThrow(() => evaluateForkTickets(x));
 });
+
+for (const denial of ["don't merge PR #7", "mustn’t deploy this candidate", "may not release this candidate", "do not, under any circumstances, merge PR #7"]) test(`quoted diagnostic recognizes the shared denial grammar: ${denial}`, () => {
+  const x = tickets();
+  const diagnostic = comment('diagnostic-contraction', `- **P2 — reproduction.** The fixture \`Previous candidate was at exact head <older SHA>, ${denial}.\` incorrectly passed.`, '2026-11-24T12:01:00Z', reviewer);
+  x.snapshot.authorityScope.push(diagnostic);
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  diagnostic.body += ` Do not merge at exact head ${head}.`;
+  assert.throws(() => evaluateForkTickets(x));
+});
