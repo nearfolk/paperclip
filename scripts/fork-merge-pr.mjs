@@ -51,7 +51,7 @@ export async function ticket(reference, cfg) {
     const a = await paperclip(`/issues/${encodeURIComponent(ancestor.id)}`, cfg);
     const c = await paperclip(`/issues/${encodeURIComponent(ancestor.id)}/comments`, cfg);
     if (!Array.isArray(c)) throw new Error('Ancestor history unavailable');
-    authorityScope.push({ body: a.description, authorAgentId: a.createdByAgentId, createdAt: a.createdAt, sourceIssueId: a.id, sourceIssueIdentifier: a.identifier, sourceKind: 'issue_description' }, ...c.map(x => ({ ...x, sourceIssueId: a.id })));
+    authorityScope.push({ body: a.description, authorAgentId: a.createdByAgentId, createdAt: a.createdAt, updatedAt: a.updatedAt, sourceIssueId: a.id, sourceIssueIdentifier: a.identifier, sourceKind: 'issue_description' }, ...c.map(x => ({ ...x, sourceIssueId: a.id })));
   }
   return { issue, comments, activity, interactions, authorityScope };
 }

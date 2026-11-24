@@ -243,3 +243,124 @@ test('normal mode requires completed same-head repository security check', () =>
   x.checks[0].head_sha = ORIGINAL_FAILED_HEAD;
   assert.throws(() => evaluateForkGithub(x), /security scan/);
 });
+
+// QA authority-boundary regressions. Keep valid controls beside rejection cases.
+for (const scope of ['gate', 'ancestor', 'required description']) {
+  for (const body of [
+    `Merge is not authorized for PR #7 at exact head ${head}.`,
+    `Deployment is not authorized for exact head ${head}.`,
+    `Do not under any circumstances merge PR #7 at exact head ${head}.`,
+    `Do not, under any circumstances, merge PR #7 at exact head ${head}.`,
+    `Do not automatically merge PR #7 at exact head ${head}.`,
+    `Merge is not yet authorized for exact head ${head}.`,
+    `Previous candidate was ${'c'.repeat(40)}. Do not merge the current head of PR #7.`,
+    `Previous candidate was ${'c'.repeat(40)}; Do not merge.`,
+    `Previous candidate was ${'c'.repeat(40)}, do not merge the current head.`,
+    `Previous candidate was at exact head ${'c'.repeat(40)}, do not merge.`,
+    `Do not merge at exact head ${'c'.repeat(40)} and deployment is not authorized.`,
+    `Do not merge for exact head ${'c'.repeat(40)} and do not merge the current head.`,
+    `Do not merge for exact head ${'c'.repeat(40)} or ${'d'.repeat(40)}.`,
+    `Do not merge for exact head ${'c'.repeat(40)}. Do not merge for exact head ${head}.`,
+  ]) test(`${scope} retains each current or ambiguous denial: ${body}`, () => {
+    const x = scope === 'required description' ? requiredTeamTickets() : tickets();
+    const denial = comment('denial', body, '2026-11-24T12:01:00Z', 'ceo');
+    if (scope === 'required description') Object.assign(x.required[0].issue, {
+      description: body, createdByAgentId: 'ceo', createdAt: denial.createdAt,
+    });
+    else (scope === 'gate' ? x.snapshot.comments : x.snapshot.authorityScope).push(denial);
+    assert.throws(() => evaluateForkTickets(x), /denied|denial|authority/i);
+  });
+}
+test('a single explicitly bound old-head denial does not govern this candidate', () => {
+  const x = tickets();
+  x.snapshot.authorityScope.push(comment('old-denial', `Do not merge PR #7 at exact head ${'c'.repeat(40)}.`, '2026-11-24T12:01:00Z', 'ceo'));
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
+for (const receipt of [
+  'I will clear hold at comment hold for exact head HEAD after remediation.',
+  'If remediation passes, I clear hold at comment hold for exact head HEAD.',
+  'I have not cleared hold at comment hold for exact head HEAD.',
+  'Please clear hold at comment hold for exact head HEAD.',
+  '> I clear hold at comment hold for exact head HEAD.',
+  'I clear hold at comment hold for exact head HEAD if validation passes.',
+  'I clear hold at comment hold for exact head HEAD. This is conditional.',
+  'I clear hold at comment hold-suffix for exact head HEAD.',
+  'I clear hold at comment other for exact head HEAD. Original: hold.',
+  'I clear hold at description hold for exact head HEAD.',
+  `I clear hold at comment hold for exact head ${'c'.repeat(40)}.`,
+]) test(`hold clearance rejects non-receipt or wrong binding: ${receipt}`, () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('hold', `HOLD ${head}`, '2026-11-24T12:01:00Z', operator),
+    comment('clear', receipt.replace('HEAD', head), '2026-11-24T12:02:00Z', operator));
+  x.nowMs = Date.parse('2026-11-24T12:10:00Z');
+  assert.throws(() => evaluateForkTickets(x), /hold/i);
+});
+for (const holder of [operator, 'ceo']) test(`immutable ${holder} clearance restarts timing and rejects edits/wrong actors`, () => {
+  const x = tickets();
+  const clear = comment('clear', `I clear hold at comment hold for exact head ${head}.`, '2026-11-24T12:02:00Z', holder);
+  x.snapshot.comments.push(comment('hold', `HOLD ${head}`, '2026-11-24T12:01:00Z', holder), clear);
+  x.nowMs = Date.parse('2026-11-24T12:06:59Z');
+  assert.throws(() => evaluateForkTickets(x), /minute/i);
+  x.nowMs += 1000;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  clear.authorAgentId = 'unrelated';
+  assert.throws(() => evaluateForkTickets(x));
+  clear.authorAgentId = holder; clear.updatedAt = '2026-11-24T12:06:59Z';
+  assert.throws(() => evaluateForkTickets(x));
+  const fresh = { ...clear, id: 'fresh', createdAt: clear.updatedAt };
+  x.snapshot.comments.push(fresh);
+  assert.throws(() => evaluateForkTickets(x), /minute/i);
+  x.nowMs = Date.parse(fresh.createdAt) + 300_000;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
+test('required ticket description holds preserve source identity and require a fresh bound clearance', () => {
+  const x = requiredTeamTickets();
+  Object.assign(x.required[0].issue, { description: `HOLD ${head}`, createdByAgentId: operator, createdAt: '2026-11-24T11:00:00Z', updatedAt: '2026-11-24T12:01:00Z' });
+  assert.throws(() => evaluateForkTickets(x), /hold/i);
+  const clearance = comment('clear', `I clear hold at description security for exact head ${head}.`, '2026-11-24T12:02:00Z', operator);
+  x.snapshot.comments.push(clearance);
+  x.nowMs = Date.parse(clearance.createdAt) + 299_000;
+  assert.throws(() => evaluateForkTickets(x), /minute/i);
+  x.nowMs += 1000;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  x.required[0].issue.updatedAt = '2026-11-24T12:03:00Z';
+  assert.throws(() => evaluateForkTickets(x), /hold/i);
+});
+test('each hold needs its own receipt even when another hold was cleared', () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('hold-1', `HOLD ${head}`, '2026-11-24T12:01:00Z', operator),
+    comment('hold-2', `HOLD ${head}`, '2026-11-24T12:01:01Z', operator),
+    comment('clear-2', `I clear hold at comment hold-2 for exact head ${head}.`, '2026-11-24T12:02:00Z', operator));
+  x.nowMs = Date.parse('2026-11-24T12:10:00Z');
+  assert.throws(() => evaluateForkTickets(x), /hold/i);
+  x.snapshot.comments.push(comment('clear-1', `I clear hold at comment hold-1 for exact head ${head}.`, '2026-11-24T12:02:01Z', operator));
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
+test('a contextual older SHA cannot hide a current or unscoped hold', () => {
+  const x = tickets();
+  x.snapshot.authorityScope.push(comment('hold', `Previous head was ${'c'.repeat(40)}. HOLD current head.`, '2026-11-24T12:01:00Z', operator));
+  assert.throws(() => evaluateForkTickets(x), /hold/i);
+});
+
+test('diagnostic placeholders do not mask adjacent live prohibitions', () => {
+  const x = tickets();
+  const diagnostic = comment('diagnostic', '- **P2 — reproduction.** The fixture `Previous candidate was <older SHA>. Do not merge current head.` previously passed.', '2026-11-24T12:01:00Z', reviewer);
+  x.snapshot.authorityScope.push(diagnostic);
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  diagnostic.body += ` Do not merge at exact head ${head}.`;
+  assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+});
+
+test('bounded immutable CEO receipt clears duplicate ancestor description snapshots', () => {
+  const x = tickets();
+  const hold = { body: 'HOLD', sourceKind: 'issue_description', sourceIssueId: 'ancestor', authorAgentId: 'ceo', createdAt: '2026-11-24T11:00:00Z' };
+  x.snapshot.authorityScope.push(hold, { ...hold });
+  const clear = comment('clear', `I clear hold at description ancestor solely for protected merge and normal dormant deployment at exact head ${head}.`, '2026-11-24T12:02:00Z', 'ceo');
+  x.snapshot.comments.push(clear);
+  x.nowMs = Date.parse(clear.createdAt) + 299_000;
+  assert.throws(() => evaluateForkTickets(x), /minute/i);
+  x.nowMs += 1000;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  clear.body = clear.body.replace('ancestor', 'ancestor-suffix');
+  assert.throws(() => evaluateForkTickets(x));
+});

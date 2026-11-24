@@ -159,6 +159,35 @@ Reviewer-only assignment instructions remain scoped to the reviewer when they
 explicitly hand protected activation to the distinct CTO. They cannot mask an
 adjacent prohibition directed at that operator or candidate.
 
+Required-review tickets contribute their own descriptions, authors, timestamps
+and issue IDs as well as their comments and ancestor histories. A team PASS does
+not erase a description-level denial or hold. Edited restrictions take effect at
+their update time. Each denial clause must bind its own head; a contextual SHA in
+another sentence cannot hide a current or ambiguous prohibition. Multiple heads
+and unscoped prohibitions fail closed. Negative authorization and qualified
+prohibitions, such as “Merge is not authorized” and “Do not under any circumstances
+merge,” are denials.
+
+Hold clearances use the same strict receipt parser in every guard path. Post a
+new standalone comment, with a period, using one of these forms:
+
+```text
+I clear hold at comment <hold comment ID> for exact head <SHA>.
+I clear hold at description <issue ID> for exact head <SHA>.
+I clear hold at comment <hold comment ID> solely for protected merge and normal dormant deployment at exact head <SHA>.
+```
+
+Only the hold author or an authenticated CEO/board actor may clear the cited
+source. An unscoped authority hold requires the bounded protected-merge form.
+Each hold needs its own receipt; substring ID matches do not qualify. The receipt
+must follow the latest hold timestamp and have equal creation/update timestamps
+when an update timestamp exists. Future, conditional, negated, quoted,
+instructional, edited, or misbound comments cannot clear it. New replacement
+receipts restart five full minutes. This intentionally rejects legacy narrative
+clearances such as “Release hold cleared”; historical product-guard fixtures
+using those forms must be reissued in the fork receipt format. The product
+repository's release controls are unchanged.
+
 Ticket and ancestor descriptions/comments, original review histories,
 assignment activity, required verdicts, and operator identity are re-fetched.
 Unavailable or ambiguous authority blocks. Routine release needs no additional

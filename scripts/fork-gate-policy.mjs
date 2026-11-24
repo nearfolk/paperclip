@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { evaluateQaTicket, evaluateRequiredVerdict, isHold, isClearance, isFail, isFailRetraction, parseFailRetractionReceipt } from './fork-ticket-authority.mjs';
+import { evaluateQaTicket, evaluateRequiredVerdict, hasHoldForHead, validHoldClearance, isFail, isFailRetraction, parseFailRetractionReceipt } from './fork-ticket-authority.mjs';
 
 export const REPOSITORY = 'nearfolk/paperclip';
 export const BOOTSTRAP_BASE = '916c13501f80c7d1d659b89e4a06dc47366aa80f';
@@ -42,12 +42,16 @@ export function evaluateForkTickets({ snapshot, identity, actors, contract, hist
   if (identity.id !== contract.operatorId || identity.role !== 'cto' || snapshot.issue.assigneeAgentId !== identity.id) fail('Named authenticated CTO must own the operator handoff');
   if (implementation.issue.assigneeAgentId === contract.reviewerId || !String(implementation.issue.description + implementation.comments.map(x => x.body).join('\n')).includes(contract.head)) fail('Implementation must name the head and have an independent author');
   if (histories.length !== contract.failureHistoryTickets.length || required.length !== contract.requiredVerdicts.length) fail('Incomplete declared verdict history');
-  const historySources = histories.flatMap(s => [
-    { body: s.issue.description, createdAt: s.issue.createdAt, authorAgentId: s.issue.createdByAgentId, sourceIssueId: s.issue.id, sourceKind: 'issue_description' },
+  const ticketSources = s => [
+    { body: s.issue.description, createdAt: s.issue.createdAt, updatedAt: s.issue.updatedAt,
+      authorAgentId: s.issue.createdByAgentId, sourceIssueId: s.issue.id,
+      sourceIssueIdentifier: s.issue.identifier, sourceKind: 'issue_description' },
     ...s.comments.map(c => ({ ...c, sourceIssueId: s.issue.id })), ...s.authorityScope,
-  ]);
+  ];
+  const historySources = histories.flatMap(ticketSources);
+  const requiredSources = required.flatMap(ticketSources);
   const qa = evaluateQaTicket({ ...snapshot,
-    authorityScope: [...snapshot.authorityScope, ...historySources, ...required.flatMap(s => [...s.comments, ...s.authorityScope]), ...(implementation.authorityScope ?? [])],
+    authorityScope: [...snapshot.authorityScope, ...historySources, ...requiredSources, ...(implementation.authorityScope ?? [])],
     expectedHead: contract.head, operatorId: identity.id, authorityActors: actors, nowMs,
   });
   if (qa.reviewerId !== contract.reviewerId) fail('PASS is not from the designated independent QA seat');
@@ -79,10 +83,10 @@ export function evaluateForkTickets({ snapshot, identity, actors, contract, hist
   }
   // Holds in any declared ticket/ancestor apply regardless of author. Only the
   // same actor (or CEO/board) can clear one, naming this head and its source id.
-  const sources = [{ body: snapshot.issue.description, createdAt: snapshot.issue.createdAt, authorAgentId: snapshot.issue.createdByAgentId }, ...snapshot.comments, ...snapshot.authorityScope, ...historySources, ...required.flatMap(s => [...s.comments, ...s.authorityScope])];
-  for (const hold of sources.filter(c => isHold(c.body))) {
-    if (heads(hold.body).length && !heads(hold.body).includes(contract.head)) continue;
-    const clearance = sources.find(c => isClearance(c.body) && heads(c.body).length === 1 && heads(c.body)[0] === contract.head && hold.id && String(c.body).includes(hold.id) && date(c.createdAt) > date(hold.createdAt) && (c.authorAgentId === hold.authorAgentId || actors.some(a => a.id === c.authorAgentId && ['ceo', 'board'].includes(a.role))));
+  const sources = [...ticketSources(snapshot), ...historySources, ...requiredSources];
+  const actorRoles = new Map(actors.map(a => [a.id, a.role]));
+  for (const hold of sources.filter(c => hasHoldForHead(c.body, contract.head))) {
+    const clearance = sources.filter(c => validHoldClearance(c, hold, contract.head, actorRoles)).sort((a, b) => date(b.createdAt) - date(a.createdAt))[0];
     if (!clearance) fail('Open or ambiguous ticket/ancestor hold');
     eligibleAt = Math.max(eligibleAt, date(clearance.createdAt) + 300_000);
   }

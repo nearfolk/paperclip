@@ -103,114 +103,30 @@ function isPassAmendment(comment, reviewerId, passAtMs) {
   return /\bamend(?:ment|ed|s|ing)?\b/i.test(comment.body ?? '')
 }
 
+export function parseHoldClearanceReceipt(body) {
+  // A clearance is an immutable completed act, with one parsed source and head.
+  // Narrative, quotations, instructions and future/conditional acts are not receipts.
+  const match = String(body ?? '').trim().match(
+    /^I\s+(?:(?:explicitly|hereby)\s+)?clear\s+(?:(?:the|earlier|original)\s+){0,2}(?:hold|freeze)\s+at\s+(comment|description)\s+`?([0-9a-z-]+)`?\s+(?:for\s+exact\s+head|solely\s+for\s+protected\s+merge(?:\s+and\s+normal\s+dormant\s+deployment)?\s+at\s+exact\s+head)\s+`?([0-9a-f]{40})`?\.$/i,
+  )
+  return match ? { sourceKind: match[1].toLowerCase(), sourceId: match[2], head: match[3].toLowerCase(), bounded: /solely for protected merge/i.test(body) } : null
+}
+
 export function isClearance(body) {
-  if (
-    /\b(?:do not|cannot|must not|refuse to)\b[^\n]{0,40}\b(?:clear|lift|retract|resolve)(?:s|ed)?\b/i
-      .test(body ?? '')
-  ) {
-    return false
-  }
-  return (
-    /\b(?:hold|freeze)\b[^\n]{0,60}\b(?:clear|lift|retract|resolve)(?:s|ed)?\b/i.test(body ?? '')
-    || /\b(?:clear|lift|retract|resolve)(?:s|ed)?\b[^\n]{0,60}\b(?:hold|freeze)\b/i.test(body ?? '')
-  )
+  return Boolean(parseHoldClearanceReceipt(body))
 }
 
-function normalizeClearanceDirectiveMarkdown(clause) {
-  return String(clause ?? '').replace(
-    /\[([^\]]+)\]\(([^)]+)\)/g,
-    (link, label, target) => {
-      const commentId = target.match(/#comment-([0-9a-z-]+)(?:[?#][^)]*)?$/i)?.[1]
-      if (commentId) {
-        const normalizedLabel = label.trim()
-        return /\b(?:hold|freeze)\b/i.test(normalizedLabel)
-          ? `${normalizedLabel} at comment \`${commentId}\``
-          : `comment \`${commentId}\``
-      }
-      if (/^#\d+$/.test(label.trim())) return label.trim()
-      return link
-    },
-  )
-}
-
-function isBoundedProtectedMergeClearanceClause(clause) {
-  const bounded = normalizeClearanceDirectiveMarkdown(clause).trim().match(
-    /^(?<directive>.+?)\s+(?<limit>(?:solely|exclusively)(?:\s+for)?|only\s+for|strictly\s+limited\s+to|limited\s+only\s+to)\s+(?<scope>.+)$/i,
-  )
-  if (!bounded?.groups || !isClearance(bounded.groups.directive)) return false
-
-  const structuralRemainder = bounded.groups.directive
-    .replace(/\bcomment\s+`[^`]+`/gi, 'comment')
-    .replace(/\bcomment\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, 'comment')
-    .replace(/[0-9a-f]{40}/gi, '')
-    .replace(
-      /\b(?:for|exact|head|sha|I|we|CEO|board|explicitly|hereby|clear|clears|cleared|lift|lifts|lifted|retract|retracts|retracted|resolve|resolves|resolved|and|only|the|original|earlier|prior|previous|hold|freeze|at|comment)\b/gi,
-      '',
-    )
-    .replace(/[\s`#.,:;()\-]/g, '')
-  if (structuralRemainder !== '') return false
-
-  return /^protected\s+merge(?:\s+and\s+normal\s+dormant\s+deployment)?(?:(?:\s+of\s+PR\s*#\d+)?(?:\s+at\s+exact\s+head\s+`?[0-9a-f]{40}`?)?|\s+of\s+exact\s+PR\s*#\d+\s+head\s+`?[0-9a-f]{40}`?)[.;:]?$/i
-    .test(bounded.groups.scope.trim())
-}
-
-function isExplicitDenyOnlyFollowOnClause(clause) {
-  const normalized = clause
-    .trim()
-    .replace(/^\s*(?:(?:[-*+] |#{1,6}\s+|>\s+))+/, '')
-    .trim()
-  if (!normalized) return true
-
-  if (/\b(?:authoriz(?:e|es|ed|ing|ation)|approv(?:e|es|ed|ing|al)|clear(?:s|ed|ing)?|lift(?:s|ed|ing)?|retract(?:s|ed|ing)?|resolv(?:e|es|ed|ing)|permit(?:s|ted|ting)?|allow(?:s|ed|ing)?|merg(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?)\b/i.test(normalized)) {
-    return false
-  }
-  if (/\b(?:but|except|however|although|though|while|whereas|unless|may|can|will|shall|should|proceed|ship|publish|send|execute|perform|trigger)\b/i.test(normalized)) {
-    return false
-  }
-
-  return (
-    /^(?:the\s+)?(?:(?:earlier|prior|previous)\s+)?(?:hold|freeze)\s+(?:remains?|stays?)\s+(?:(?:fully\s+)?active|in\s+(?:full\s+)?effect)(?:\s+for\b[^.!?;]*)?[.!?]?$/i.test(normalized)
-    || /^Every\s+customer-facing\s+(?:hold|freeze)\s+(?:remains?|stays?)\s+(?:fully\s+)?active(?:,\s*including\b[^.!?;]*)?[.!?]?$/i.test(normalized)
-  )
-}
-
-function isBoundedClearanceContextClause(clause) {
-  const normalized = clause
-    .trim()
-    .replace(/^\s*(?:(?:[-*+] |#{1,6}\s+|>\s+))+/, '')
-    .trim()
-  if (!normalized) return true
-  if (isExplicitDenyOnlyFollowOnClause(normalized)) return true
-
-  return (
-    /^(?:CEO\s+)?Post-PASS exact-head clearance\s+[—-]\s+protected repair only$/i.test(normalized)
-    || /^This clearance is authored after the (?:valid|amended|fresh) same-author \[QA PASS\]\([^)]+#comment-[0-9a-z-]+\)[.!?]?$/i.test(normalized)
-    || /^Any head or base change invalidates this clearance and requires the full gate again[.!?]?$/i.test(normalized)
-    || /^Implementation remains delegated through \[[^\]]+\]\([^)]+\); [^.;!?]+ remains the same-author verdict seat on \[[^\]]+\]\([^)]+\), and [^.;!?]+ remains the distinct protected merge operator[.!?]?$/i.test(normalized)
-    || /^\[@[^\]]+\]\(agent:\/\/[0-9a-f-]+\) may now restart the five-minute interval and rerun the exact-head protected verifier[.!?]?$/i.test(normalized)
-    || /^\[@[^\]]+\]\(agent:\/\/[0-9a-f-]+\) remains the distinct protected merge operator and may restart the five-minute interval for this exact head[.!?]?$/i.test(normalized)
-    || /^This decision (?:does not authorize|authorizes? no)\b[^.!?]*(?:[.!?])?$/i.test(normalized)
-  )
-}
-
-function isBoundedProtectedMergeClearance(body, expectedHead) {
-  const heads = [...new Set(exactHeads(body))]
-  if (heads.length !== 1 || heads[0] !== expectedHead || !isClearance(body)) return false
-
-  const clauses = String(body ?? '')
-    .replaceAll('\\n', '\n')
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((clause) => clause.trim())
-    .filter(Boolean)
-  const clearanceIndexes = clauses
-    .map((clause, index) => isBoundedProtectedMergeClearanceClause(clause) ? index : -1)
-    .filter((index) => index !== -1)
-  if (clearanceIndexes.length !== 1) return false
-
-  const clearanceIndex = clearanceIndexes[0]
-  return clauses.every((clause, index) => (
-    index === clearanceIndex || isBoundedClearanceContextClause(clause)
-  ))
+export function validHoldClearance(comment, hold, expectedHead, actorRoles) {
+  const receipt = parseHoldClearanceReceipt(comment?.body)
+  if (!receipt || receipt.head !== expectedHead) return false
+  const description = hold?.sourceKind === 'issue_description'
+  if (receipt.sourceKind !== (description ? 'description' : 'comment')
+    || receipt.sourceId !== (description ? hold.sourceIssueId : hold?.id)) return false
+  if (!comment.authorAgentId || !(comment.authorAgentId === hold.authorAgentId
+    || ['ceo', 'board'].includes(actorRoles.get(comment.authorAgentId)))) return false
+  const created = timestamp(comment.createdAt, 'Hold clearance')
+  if (comment.updatedAt && timestamp(comment.updatedAt, 'Hold clearance update') !== created) return false
+  return created > timestamp(hold.updatedAt ?? hold.createdAt, 'Hold source')
 }
 
 function isBoundedDescriptionDenialClearance(body, expectedHead, expectedOperatorId) {
@@ -250,78 +166,8 @@ function isBoundedDescriptionDenialClearance(body, expectedHead, expectedOperato
 }
 
 function isBoundedUnavailableDenialClearance(body, expectedHead) {
-  const heads = exactHeads(body)
-  if (heads.length !== 1 || heads[0] !== expectedHead || !isClearance(body)) return false
-
-  const normalized = String(body ?? '').replaceAll('\\n', '\n')
-  const clauses = normalized
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((clause) => clause.trim())
-    .filter(Boolean)
-  const clearanceClauses = clauses.filter((clause) => isClearance(clause))
-  if (clearanceClauses.length !== 1) return false
-  const clearanceClause = clearanceClauses[0]
-  if (!clearanceClause) return false
-
-  const hasAdditionalAuthorization = clauses.some((clause) => (
-    clause !== clearanceClause
-    && /\b(?:authoriz(?:e|es|ed|ing|ation)|approv(?:e|es|ed|ing|al)|permit(?:s|ted|ting)?|allow(?:s|ed|ing)?)\b/i.test(clause)
-    && !/\b(?:no|not|never)\b[^.!?]{0,500}\b(?:authoriz(?:e|es|ed|ing|ation)|approv(?:e|es|ed|ing|al)|permit(?:s|ted|ting)?|allow(?:s|ed|ing)?)\b/i.test(clause)
-    && !/\bunauthoriz(?:e|es|ed|ing|ation)\b/i.test(clause)
-  ))
-  if (hasAdditionalAuthorization) return false
-
-  const bounded = clearanceClause.match(
-    /\b(?:explicitly\s+)?(?:clear|lift|retract|resolve)(?:s|ed)?\b[^.!?]*(?:hold|denial)\b[^.!?]*\bsolely\s+for\s+(?<scope>[^.!?]+)[.!?]?$/i,
-  )
-  if (!bounded?.groups?.scope) return false
-
-  return /^(?:named\s+[^.!?]{1,150}\s+to\s+use\s+)?the\s+protected(?:\s+admin\s+squash)?\s+merge\s+and\s+normal(?:\s+dormant)?\s+deployment(?:\s+path)?(?:\s+of\s+PR\s*#\d+)?(?:\s+at\s+exact\s+head\s+`?[0-9a-f]{40}`?)?(?:\s+by\s+named\s+[^.!?]{1,150})?$/i
-    .test(bounded.groups.scope.trim())
-}
-
-function unavailableDenialClearanceTargetsSource(body, candidate) {
-  const clearanceClause = String(body ?? '')
-    .replaceAll('\\n', '\n')
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((clause) => clause.trim())
-    .find((clause) => isClearance(clause))
-  if (!clearanceClause) return false
-
-  if (candidate.source?.id) {
-    return clearanceClause.includes(candidate.source.id)
-  }
-
-  if (!candidate.source?.sourceIssueId) return false
-  if (/\bdescription-level\b[^.!?]*(?:do-not-merge|hold|denial)\b/i.test(clearanceClause)) {
-    return true
-  }
-
-  return /\bancestor-scoped\s+HOLD\b/i.test(clearanceClause)
-    && /\bancestor\b[^.!?]*\bscoped\s+HOLD\b/i.test(candidate.source?.body ?? '')
-}
-
-function explicitlyTargetsEarlierHold(body, holdSource) {
-  if (!isClearance(body)) return false
-  const clearanceClauses = String(body ?? '')
-    .replaceAll('\\n', '\n')
-    .split(/(?<=[.!?])\s+|\n+/)
-    .filter((clause) => isClearance(clause))
-  const commentReferences = clearanceClauses.flatMap((clause) => [
-    ...[...clause.matchAll(/\bcomment\s+`([^`]+)`/gi)].map((match) => match[1]),
-    ...[...clause.matchAll(/\bcomment\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi)]
-      .map((match) => match[1]),
-    ...[...clause.matchAll(/\]\([^)]+#comment-([0-9a-z-]+)(?:[?#][^)]*)?\)/gi)].map((match) => match[1]),
-  ])
-  if (commentReferences.length > 0) {
-    const uniqueReferences = [...new Set(commentReferences)]
-    return Boolean(
-      holdSource?.id
-      && uniqueReferences.length === 1
-      && uniqueReferences[0] === holdSource.id,
-    )
-  }
-  return /\b(?:earlier|prior|previous)\b[^\n]{0,40}\b(?:hold|freeze)\b/i.test(body ?? '')
+  const receipt = parseHoldClearanceReceipt(body)
+  return receipt?.bounded === true && receipt.head === expectedHead
 }
 
 function conversationalReleaseHold(body) {
@@ -515,14 +361,15 @@ function withoutGithubOnlyReviewRestriction(body) {
   )
 }
 
-function isReleaseDenial(body) {
-  const releaseScopedBody = withoutGithubOnlyReviewRestriction(
+function releaseDenialText(body) {
+  return withoutGithubOnlyReviewRestriction(
     withoutUnrelatedConversationalApprovalHold(body),
   )
     .replace(
       /\bdo not approve or publish on UNKNOWN\/FAIL\.(?=\s|$)/gi,
       '',
     )
+    .replace(/\bIf review authority cannot approve that scoped activation, return the concrete action required rather than looping on credential procurement\./g, '')
     // These clauses assign the merge to another actor; they do not prohibit
     // that actor's protected merge. Do not strip an adjacent prohibition.
     .replace(/\bOn PASS leave this gate in_review, assign it to that merge operator, and do not merge\./gi, '')
@@ -530,16 +377,42 @@ function isReleaseDenial(body) {
     // This exact conditional remains enforced by releaseAuthorityRequirement.
     .replace(/\bDo not release without the CEO explicitly authorizing this PR at this exact head in this ticket thread\./gi, '')
 
+}
+
+function isReleaseDenial(body) {
+  const releaseScopedBody = releaseDenialText(body)
   return (
     /^\s*#{0,6}\s*(?:release\s+)?(?:DENIED|NOT AUTHORIZED)\b/im.test(releaseScopedBody)
     || /\b(?:do not|cannot|refuse to)\s+(?:authorize|approve)\b/i.test(releaseScopedBody)
-    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)\s+(?:merge|release|deploy)\b/i.test(releaseScopedBody)
-    || /\b(?:merge|release|deployment)\s+(?:is\s+)?(?:prohibited|forbidden|not permitted|not allowed)\b/i.test(releaseScopedBody)
+    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)\s+(?:merge(?!\s+eligibility)|release|deploy)\b/i.test(releaseScopedBody)
+    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)[\s,]+(?:(?:under any circumstances|under any condition|at any time|for any reason|ever|yet|[a-z]+ly)[\s,]+)+(?:merge(?!\s+eligibility)|release|deploy)\b/i.test(releaseScopedBody)
+    || /\b(?:merge|release|deployment)\s+(?:is\s+)?(?:prohibited|forbidden|not\s+(?:(?:yet|currently|explicitly)\s+)?(?:permitted|allowed|authorized|approved))\b/i.test(releaseScopedBody)
     || /\b(?:authorization|approval)\s+(?:is\s+)?(?:denied|withheld|refused)\b/i.test(releaseScopedBody)
     || /\bno\s+(?:merge|release)\s+authority\b/i.test(releaseScopedBody)
     || /\b(?:merge|release)\s+authority\b[^\n]{0,80}\b(?:withheld|revoked|void|withdrawn)\b/i.test(releaseScopedBody)
     || /\b(?:withhold|revoke|void|withdraw)\b[^\n]{0,80}\b(?:merge|release)\s+authority\b/i.test(releaseScopedBody)
   )
+}
+
+function directiveClauses(body) {
+  return String(body ?? '').split(/(?<=[.!?;])\s+|\n+|(?:,\s*|\s+(?:and|but)\s+)(?=(?:do not|must not|never|cannot|(?:merge|release|deployment)\s+(?:is\s+)?not)\b)/i)
+}
+
+function directiveHead(clause) {
+  const heads = [...new Set(exactHeads(clause))]
+  // A contextual hash is not a scope binding. Multiple heads or a current-head
+  // reference mixed with another candidate are ambiguous and cannot be skipped.
+  if (heads.length !== 1 || /\bcurrent\s+head\b/i.test(clause)) return null
+  const binding = clause.match(/\b(?:at|for)\s+(?:exact\s+)?head\s+`?([0-9a-f]{40})`?\b/i)
+    ?? clause.match(/^\s*(?:The\s+)?(?:Exact\s+)?head\s+`?([0-9a-f]{40})`?\s+(?:has|is|must|may|cannot)\b/i)
+    ?? clause.match(/^\s*(?:HOLD|FREEZE)\s+`?([0-9a-f]{40})`?\b/i)
+  return binding?.[1]?.toLowerCase() === heads[0] ? heads[0] : null
+}
+
+export function hasHoldForHead(body, expectedHead) {
+  if (isClearance(body)) return false
+  return directiveClauses(body).some(clause => isHold(clause)
+    && (!directiveHead(clause) || directiveHead(clause) === expectedHead))
 }
 
 function isReviewerOnlyDescriptionDenial(body) {
@@ -555,8 +428,8 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
   const withoutQuotedDiagnosticExamples = String(body ?? '')
     .split('\n')
     .map((line) => (
-      /\b(?:QA|diagnostic|test|regression|fixture|example|parser|classifier|verifier)\b/i.test(line)
-        ? line.replace(/`[^`]*(?:do not|cannot|refuse to)\s+(?:authorize|approve)[^`]*`/gi, '')
+      (/\b(?:QA|diagnostic|test|regression|fixture|example|parser|classifier|verifier|reproduced|reproduction)\b/i.test(line) || /^[-*] \*\*P[0-3]\s*[—:-]/.test(line))
+        ? line.replace(/`[^`\n]*<candidate>[^`\n]*`/gi, '').replace(/`[^`]*(?:do not|must not|cannot|refuse to)\s+(?:authorize|approve|merge|release|deploy)[^`]*`/gi, '')
         : line
     ))
     .join('\n')
@@ -767,6 +640,7 @@ function evaluateReleaseAuthority({
       body: issue.description,
       authorAgentId: issue.createdByAgentId,
       createdAt: issue.createdAt,
+      updatedAt: issue.updatedAt,
       sourceIssueId: issue.id,
       sourceKind: 'issue_description',
     },
@@ -807,6 +681,11 @@ function evaluateReleaseAuthority({
       && /The CTO alone handles activation/.test(sourceBody ?? '')) {
       sourceBody = String(sourceBody).replace(/Do not merge, deploy, procure credentials, mutate production, rerun the old review job, or use browser automation\./g, '')
     }
+    if (source?.sourceKind === 'issue_description'
+      && /Named merge\/activation operator: CTO/.test(sourceBody ?? '')
+      && /distinct from your verdict author seat/.test(sourceBody ?? '')) {
+      sourceBody = String(sourceBody).replace(/(Post exact-head PASS or FAIL, evidence, and any concrete fixes ON THIS QA TICKET\.) Do not merge\.(?= For this review-deliverable child,)/g, '$1')
+    }
     const denialBody = ['ceo', 'board'].includes(authorRole)
       ? sourceBody
       : withoutFactualStaleVerdictNonAuthorization(sourceBody)
@@ -814,9 +693,13 @@ function evaluateReleaseAuthority({
       ['ceo', 'board'].includes(authorRole)
       || retractedQaFailureIds.has(source?.id)
     )
-    const denial = isReleaseDenial(denialBody) || holdDenial
+    const denialClauses = directiveClauses(releaseDenialText(denialBody))
+      .filter(clause => isReleaseDenial(clause) || (holdDenial && isHold(clause)))
+      .filter(clause => !directiveHead(clause) || directiveHead(clause) === expectedHead)
+    const denial = denialClauses.length > 0
+    const ambiguousDenial = denialClauses.some(clause => !directiveHead(clause))
     const boundedHoldClearance = authorRole === 'ceo'
-      && isBoundedProtectedMergeClearance(source?.body, expectedHead)
+      && parseHoldClearanceReceipt(source?.body)?.bounded === true
     const boundedDescriptionClearance = authorRole === 'ceo'
       && isBoundedDescriptionDenialClearance(source?.body, expectedHead, operatorId)
     const boundedUnavailableDenialClearance = authorRole === 'ceo'
@@ -824,17 +707,14 @@ function evaluateReleaseAuthority({
     if (boundedDescriptionClearance || boundedUnavailableDenialClearance) {
       requiredRole = mergeRequiredAuthorityRole(requiredRole, 'ceo')
     }
-    const authorization = isReleaseAuthorization(source?.body)
+    const holdReceipt = parseHoldClearanceReceipt(source?.body)
+    const immutableReceipt = !source?.updatedAt || timestamp(source.updatedAt, 'Authority update') === timestamp(source.createdAt, 'Authority creation')
+    const authorization = immutableReceipt && ((holdReceipt && holdReceipt.head === expectedHead) || isReleaseAuthorization(source?.body)
       || boundedHoldClearance
       || boundedDescriptionClearance
       || boundedUnavailableDenialClearance
-      || targetedBoardOnlyClearance
+      || targetedBoardOnlyClearance)
     if (!requiredRole && !denial && !authorization) return []
-
-    const scopedHeads = exactHeads(source?.body)
-    if (denial && scopedHeads.length > 0 && !scopedHeads.includes(expectedHead)) {
-      return []
-    }
 
     return [{
       source,
@@ -842,13 +722,14 @@ function evaluateReleaseAuthority({
       authorRole,
       requiredRole,
       denial,
+      ambiguousDenial,
       holdDenial,
       authorization,
       boundedHoldClearance,
       targetedBoardOnlyClearance,
       boundedDescriptionClearance,
       boundedUnavailableDenialClearance,
-      createdAtMs: timestamp(source?.createdAt, `Paperclip authority source ${authoritySourceLabel(source)}`),
+      createdAtMs: timestamp(denial || requiredRole ? (source?.updatedAt ?? source?.createdAt) : source?.createdAt, `Paperclip authority source ${authoritySourceLabel(source)}`),
     }]
   }).sort((left, right) => left.createdAtMs - right.createdAtMs || left.index - right.index)
 
@@ -880,7 +761,7 @@ function evaluateReleaseAuthority({
         continue
       }
       requiredRole = mergeRequiredAuthorityRole(requiredRole, denyingRole)
-      if (!includesHead(directive.source.body, expectedHead)) {
+      if (directive.ambiguousDenial) {
         ambiguousDenials.push(directive)
       }
       denial = directive
@@ -920,28 +801,23 @@ function evaluateReleaseAuthority({
               && candidate.source?.sourceIssueId === issue.id
             )
             || (
-              (candidate.source?.id || candidate.source?.sourceIssueId === issue.id)
-              && unavailableDenialClearanceTargetsSource(directive.source.body, candidate)
+              validHoldClearance(directive.source, candidate.source, expectedHead, actorRoles)
             )
           )
         ))
-        if (explicitlyTargeted.length !== 1) continue
+        if (explicitlyTargeted.length === 0) continue
         const targeted = new Set(explicitlyTargeted)
         unavailableActorDenials = unavailableActorDenials.filter((candidate) => !targeted.has(candidate))
         if (unavailableActorDenials.length > 0) continue
       }
+      if (denial?.holdDenial && !validHoldClearance(directive.source, denial.source, expectedHead, actorRoles)) continue
       if (ambiguousDenials.length > 0) {
-        if (!directive.boundedHoldClearance) continue
+        if (!parseHoldClearanceReceipt(directive.source.body)?.bounded) continue
         const explicitlyTargeted = ambiguousDenials.filter((candidate) => (
           candidate.createdAtMs < directive.createdAtMs
-          && explicitlyTargetsEarlierHold(directive.source.body, candidate.source)
+          && validHoldClearance(directive.source, candidate.source, expectedHead, actorRoles)
         ))
         if (explicitlyTargeted.length === 0) continue
-        if (explicitlyTargeted.length > 1 && !explicitlyTargeted.every((candidate) => (
-          candidate.source?.id && String(directive.source.body ?? '').includes(candidate.source.id)
-        ))) {
-          continue
-        }
         const targeted = new Set(explicitlyTargeted)
         ambiguousDenials = ambiguousDenials.filter((candidate) => !targeted.has(candidate))
         if (ambiguousDenials.length > 0) continue
@@ -1012,26 +888,20 @@ function matchingHandoffs(activity, operatorId) {
   })
 }
 
-function activeHoldAfter(comments, startMs) {
-  let hold = null
+function activeHoldAfter(comments, startMs, expectedHead, actorRoles) {
+  const holds = []
   let restartAtMs = startMs
-
   for (const comment of comments) {
-    const createdAtMs = timestamp(comment.createdAt, 'Paperclip comment')
-    if (createdAtMs <= startMs) continue
-    if (isClearance(comment.body)) {
-      if (hold) {
-        hold = null
-        restartAtMs = createdAtMs
-      }
-      continue
-    }
-    if (isHold(comment.body)) {
-      hold = comment
-    }
+    const effectiveAt = timestamp(comment.updatedAt ?? comment.createdAt, 'Paperclip comment')
+    if (effectiveAt <= startMs) continue
+    if (hasHoldForHead(comment.body, expectedHead)) holds.push(comment)
   }
-
-  return { hold, restartAtMs }
+  for (const hold of holds) {
+    const clearance = comments.filter(c => validHoldClearance(c, hold, expectedHead, actorRoles)).at(-1)
+    if (!clearance) return { hold, restartAtMs }
+    restartAtMs = Math.max(restartAtMs, timestamp(clearance.createdAt, 'Hold clearance'))
+  }
+  return { hold: null, restartAtMs }
 }
 
 export function evaluateQaTicket({
@@ -1163,7 +1033,7 @@ export function evaluateQaTicket({
     passAtMs,
   })
 
-  const { hold, restartAtMs } = activeHoldAfter(ordered, passAtMs)
+  const { hold, restartAtMs } = activeHoldAfter(ordered, passAtMs, expectedHead, actorRoles)
   if (hold) {
     throw new Error(`QA ticket has an open release hold from ${hold.createdAt}`)
   }
