@@ -2,10 +2,10 @@
 /**
  * check-pr-security.mjs
  * Runs 6 security checks against a PR diff. Never posts public comments.
- * Creates a draft security advisory in the repo if any check fires.
+ * Reports flags through a private advisory or a sanitized repository check.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, SECURITY_REPORT_MODE
+ * Findings are informational. Reporting errors fail the CLI.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
@@ -304,22 +304,48 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
   });
 }
 
+// Repository tokens cannot create private repository security advisories.
+// Report only fixed scanner categories, never matched text, paths, or PR titles.
+export async function reportSecurityFindings(fetchImpl, token, repo, pr, flags, mode = 'advisory') {
+  if (mode === 'advisory') {
+    if (flags.length) await syncDraftAdvisory(fetchImpl, token, repo, pr.number, pr.title, flags);
+    return postSecurityCheckRun(fetchImpl, token, repo, pr.head.sha, flags.length > 0);
+  }
+  if (mode !== 'check-run') throw new Error('Invalid SECURITY_REPORT_MODE');
+  const categories = [...new Set(flags.map(flag => flag.check))]
+    .filter(check => Object.hasOwn(SEVERITY_MAP, check)).sort();
+  await fetchImpl(`/repos/${repo}/check-runs`, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'security-review', head_sha: pr.head.sha, status: 'completed',
+      conclusion: flags.length ? 'neutral' : 'success',
+      output: {
+        title: flags.length ? 'Security Review Recommended' : 'Security Review Passed',
+        summary: flags.length
+          ? `${flags.length} flag(s): ${categories.join(', ')}. Maintainer review of the PR diff is required before release. Matched content is intentionally omitted. No private advisory was created.`
+          : 'No security concerns detected.',
+      },
+    }),
+  });
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 // Wall-clock budget for the whole script. The workflow job has a 5-minute
 // timeout-minutes, and `continue-on-error: true` on a step does NOT override
 // a job-level timeout — it only suppresses step failures. So if any API call
 // (e.g. security-advisories POST/PATCH) hangs, the whole job is cancelled,
-// failing the `review` check. This watchdog enforces the script's documented
-// "always exit 0" contract regardless of API behaviour.
+// failing the `review` check. The watchdog also fails closed so a timeout
+// cannot be mistaken for a completed security scan.
 export const SCRIPT_WATCHDOG_MS = 90_000;
 
 export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = process.exit) {
   const timer = setTimeout(() => {
     console.warn(
-      `[security] script exceeded ${timeoutMs}ms wall-clock budget; exiting 0 per always-exit-0 contract`
+      `[security] script exceeded ${timeoutMs}ms wall-clock budget; ending security scan`
     );
-    exit(0);
+    exit(1);
   }, timeoutMs);
   // Don't keep the event loop alive solely for the watchdog.
   timer.unref?.();
@@ -327,6 +353,8 @@ export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = proce
 }
 
 async function main() {
+  const reportMode = process.env.SECURITY_REPORT_MODE ?? 'advisory';
+  if (!['advisory', 'check-run'].includes(reportMode)) throw new Error('Invalid SECURITY_REPORT_MODE');
   const watchdog = startScriptWatchdog();
 
   const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
@@ -372,18 +400,9 @@ async function main() {
     ...scanSensitivePaths(files),
   ];
 
-  if (allFlags.length > 0) {
-    console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
-    ]);
-  } else {
-    console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
-  }
+  await reportSecurityFindings(ghFetch, GH_TOKEN, GH_REPO, pr, allFlags, reportMode);
 
-  // Always exit 0 — security flags are silent, never block the PR publicly
+  // Findings remain informational; reaching here means reporting succeeded.
   clearTimeout(watchdog);
   process.exit(0);
 }
