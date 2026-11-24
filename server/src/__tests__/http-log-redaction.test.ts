@@ -12,6 +12,26 @@ import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it.each([false, true])("omits all mixed-case issue failure content at HTTP log sinks (crash=%s)", async (crash) => {
+    const chunks: string[] = [];
+    const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    const app = express();
+    app.use(createHttpLogger(pino({}, stream)));
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "agent" }; next(); });
+    app.post("/api/issues/:id/comments", (_req, res) => {
+      if (crash) throw new Error("synthetic-body-secret");
+      res.status(503).json({ error: "Unavailable" });
+    });
+    app.use(errorHandler);
+    const response = await request(app).post("/API/ISSUES/synthetic-path-secret/comments?token=synthetic-query-secret")
+      .set("Authorization", "Bearer synthetic-header-secret").send({ innocentField: "synthetic-body-secret" });
+    expect(response.status).toBe(crash ? 500 : 503);
+    const output = chunks.join("");
+    for (const value of ["synthetic-body-secret", "synthetic-path-secret", "synthetic-query-secret", "synthetic-header-secret"]) expect(output).not.toContain(value);
+    expect(JSON.parse(output).reqBody).toBe("[REDACTED]");
+  });
+
   it.each([
     {
       method: "POST",
@@ -268,7 +288,7 @@ describe("HTTP logger redaction", () => {
     },
   );
 
-  it("preserves ordinary request diagnostics outside the exact webhook route", async () => {
+  it("preserves ordinary request diagnostics outside content-free mutation routes", async () => {
     const chunks: string[] = [];
     const stream = new Writable({
       write(chunk, _encoding, callback) {
@@ -281,7 +301,7 @@ describe("HTTP logger redaction", () => {
     app.use(
       createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)),
     );
-    app.post("/api/issues/:id", (req, res) => {
+    app.post("/api/projects/:id", (req, res) => {
       (res as any).__errorContext = {
         error: { name: "Error", message: "ordinary diagnostic" },
         reqBody: req.body,
@@ -290,7 +310,7 @@ describe("HTTP logger redaction", () => {
       res.status(422).end();
     });
     await request(app)
-      .post("/api/issues/issue-1")
+      .post("/api/projects/issue-1")
       .send({ title: "ordinary task", token: "redact-me" });
     const log = JSON.parse(chunks.join("").trim());
     expect(log.reqBody).toEqual({

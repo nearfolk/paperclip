@@ -1,3 +1,7 @@
+import { withControlPlaneStorage } from "../control-plane-outage.js";
+import { issueWriteFingerprint } from "../control-plane-route.js";
+import { reserveControlPlaneWrite, settleControlPlaneWrite } from "../control-plane-write-budget.js";
+import { classifyControlPlaneFailure } from "../control-plane-failures.js";
 import { isConnectorTool, executeConnectorTool, type ConnectorAssignment } from "../connector-runtime.js";
 import { resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 import { connectionIntentService } from "../connection-intents.js";
@@ -19,7 +23,7 @@ import { assetService } from "../assets.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
 import { badRequest, forbidden } from "../../errors.js";
 import { searchRunnerApi } from "./runner-api-catalog.js";
-import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
+import { executeRunnerApi, runnerApiUrl, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
 import { and, desc, eq, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -251,7 +255,9 @@ export class PaperclipRunnerToolAuthority {
     ) {
       throw new Error("paperclip_runner_tool_not_advertised");
     }
-    const context = await this.#boundContext();
+    const context = call.tool === "call_api"
+      ? await withControlPlaneStorage(this.binding, () => this.#boundContext())
+      : await this.#boundContext();
     const input = record(call.arguments);
     if (call.tool === READ_CHAT_ATTACHMENT_TOOL_NAME) {
       const scope = this.binding.chatAttachmentReadScope;
@@ -394,7 +400,7 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async #callApi(callId: string, value: unknown): Promise<unknown> {
-    const bound = await this.#boundContext();
+    const bound = await withControlPlaneStorage(this.binding, () => this.#boundContext());
     const context = { ...this.binding, issueIdentifier: bound.issue.identifier, workMode: bound.issue.workMode };
     const { input, operation } = validateRunnerApiCall(value, context);
     const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
@@ -402,14 +408,28 @@ export class PaperclipRunnerToolAuthority {
     const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, bound.actor.adapterType, this.binding.runId, bound.run.responsibleUserId);
     if (!token) throw new Error("Paperclip run authentication is unavailable");
     const execute = async () => {
-      const current = await this.#boundContext();
+      let transportReservation: string | undefined;
+      const current = await withControlPlaneStorage(this.binding, () => this.#boundContext());
       if (!runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)) throw new Error("paperclip_runner_tool_not_advertised");
       return executeRunnerApi(input, { ...context, workMode: current.issue.workMode }, {
         apiUrl, token,
         beforeDispatch: async () => {
-          const fresh = await this.#boundContext();
+          const fresh = await withControlPlaneStorage(this.binding, () => this.#boundContext());
           if (!runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)) throw new Error("paperclip_runner_tool_not_advertised");
           validateRunnerApiCall(input, { ...context, workMode: fresh.issue.workMode });
+          if (!["GET", "HEAD", "OPTIONS"].includes(operation.method)) {
+            transportReservation = await withControlPlaneStorage(this.binding, async () => reserveControlPlaneWrite(this.db, {
+              ...this.binding,
+              fingerprint: await issueWriteFingerprint(this.db, this.binding.companyId, `TRANSPORT ${operation.method}`, runnerApiUrl(operation, input, context, apiUrl).pathname),
+            }));
+          }
+        },
+        afterTransport: async (error) => {
+          if (!transportReservation) return;
+          await withControlPlaneStorage(this.binding, () => settleControlPlaneWrite(this.db, {
+            ...this.binding, reservationId: transportReservation!,
+            ...(error ? { failure: classifyControlPlaneFailure({ error, code: "api_transport_failure" }) } : {}),
+          }), transportReservation);
         },
         readFile: (file) => this.#readApiFile(file),
         saveResponse: async (bytes, contentType) => {
@@ -429,7 +449,7 @@ export class PaperclipRunnerToolAuthority {
     // outcome rather than replaying a possibly committed external mutation.
     const key = createHash("sha256").update(callId).digest("hex");
     const digest = createHash("sha256").update(canonicalJson(input)).digest("hex");
-    const prior = await this.db.transaction(async (tx) => {
+    const prior = await withControlPlaneStorage(this.binding, () => this.db.transaction(async (tx) => {
       const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       const resultJson = record(locked.run.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
@@ -442,7 +462,7 @@ export class PaperclipRunnerToolAuthority {
       receipts[key] = { digest, operationId: operation.operationId, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
-    });
+    }));
     if (prior) return prior.result;
     const result = await execute();
     // Some older routes attribute the agent but omit runId. Retain their domain

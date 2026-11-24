@@ -1,3 +1,4 @@
+import { reservePersistentControlPlaneWrite } from "./control-plane-intents.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -4338,7 +4339,19 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
       forwardInit.body = request.body as BodyInit;
     }
-    const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+    let ticket: Awaited<ReturnType<typeof reservePersistentControlPlaneWrite>> | null = null;
+    try { if (!isSafeBridgeMethod(method)) ticket = await reservePersistentControlPlaneWrite(input.runId, "transport"); }
+    catch {
+      return { status: 409, headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "control_plane_write_budget_exhausted", retryable: false })) };
+    }
+    let response: Response;
+    try { response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit); }
+    catch {
+      await ticket?.fail();
+      throw new Error("control_plane_transport_failure");
+    }
+    if (response.status >= 400) await ticket?.fail(response.status);
     if (emitDebugLog) {
       await onLog(
         "stdout",
@@ -4361,6 +4374,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     try {
       responseBody = await readBridgeForwardResponseBody(response, maxBodyBytes, options?.reservation);
     } catch (error) {
+      await ticket?.fail();
       // A denied reservation is retryable capacity pressure for a safe
       // method, not a body-read fault: rethrow it before the method-safety
       // classification below runs, so it reaches the HTTP/2 bridge's own
@@ -4405,6 +4419,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         ),
       };
     }
+    if (response.status < 400) await ticket?.succeed();
     const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
     if (commentMarker) await onLog("stdout", commentMarker);
     return {

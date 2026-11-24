@@ -1,3 +1,4 @@
+import { issueWriteRoute } from "../services/control-plane-route.js";
 import pino from "pino";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
@@ -62,11 +63,16 @@ function isPrivateWebhook(req: {
   );
 }
 
+function isContentFreeRequest(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
+  return isPrivateWebhook(req) || Boolean(issueWriteRoute(req.method ?? "GET", requestClassificationUrl(req) ?? ""));
+}
+
 function requestLogUrl(req: {
   method?: string;
   originalUrl?: unknown;
   url?: unknown;
 }) {
+  if (issueWriteRoute(req.method ?? "GET", requestClassificationUrl(req) ?? "")) return "/api/issues/:resource";
   return isPrivateWebhook(req)
     ? "/api/chat-webhooks/:publicId/:provider"
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
@@ -78,7 +84,7 @@ export function createHttpLogger(baseLogger: Logger) {
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown }) {
         if (
-          isPrivateWebhook({
+          isContentFreeRequest({
             method: typeof req.method === "string" ? req.method : undefined,
             url: req.url,
           })
@@ -89,7 +95,7 @@ export function createHttpLogger(baseLogger: Logger) {
           return {
             id: req.id,
             method: req.method,
-            url: "/api/chat-webhooks/:publicId/:provider",
+            url: requestLogUrl({ method: typeof req.method === "string" ? req.method : undefined, url: req.url }),
           };
         }
         return {
@@ -113,7 +119,7 @@ export function createHttpLogger(baseLogger: Logger) {
       ) {
         // A provider error may also be reflected in response headers. Keep the
         // same content-free contract on both sides of a webhook request.
-        return res.raw?.req && isPrivateWebhook(res.raw.req)
+        return res.raw?.req && isContentFreeRequest(res.raw.req)
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -131,7 +137,7 @@ export function createHttpLogger(baseLogger: Logger) {
     },
     customErrorMessage(req, res, err) {
       if (
-        isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
+        (isContentFreeRequest(req) || isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req)))
       ) {
         return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       }
@@ -146,17 +152,17 @@ export function createHttpLogger(baseLogger: Logger) {
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.
       // Do not rely on a particular error handler having sanitized an SDK Error.
-      return isPrivateWebhook(req)
+      return isContentFreeRequest(req)
         ? {
             ...value,
-            err: { type: "Error", message: "Chat webhook request failed" },
+            err: { type: "Error", message: isPrivateWebhook(req) ? "Chat webhook request failed" : "Issue mutation request failed" },
           }
         : value;
     },
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
-        if (isPrivateWebhook(req)) {
+        if (isContentFreeRequest(req)) {
           // Omit, rather than recursively redact, the entire provider payload.
           // This applies equally before/after parsing and with/without context.
           return {

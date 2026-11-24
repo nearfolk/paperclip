@@ -46,6 +46,9 @@ export const agentWakeupRequests = pgTable(
       .defaultNow(),
   },
   (table) => ({
+    controlPlaneIncidentIdempotencyUq: uniqueIndex("agent_wakeup_requests_control_plane_incident_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'control-plane-incident:v2:%' AND ${table.status} <> 'skipped'`),
     companyAgentStatusIdx: index(
       "agent_wakeup_requests_company_agent_status_idx",
     ).on(table.companyId, table.agentId, table.status),

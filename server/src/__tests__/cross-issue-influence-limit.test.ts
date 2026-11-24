@@ -22,6 +22,10 @@ function counterDb(
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
             };
           }
+          if (Object.keys(selection).includes("executionRunId")) return Promise.resolve([{
+            id: (runOverrides?.contextSnapshot as { issueId?: string })?.issueId ?? "44444444-4444-4444-8444-444444444444",
+            executionRunId: null,
+          }]);
           return {
             for: () => ({
               then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
@@ -29,6 +33,7 @@ function counterDb(
                 companyId: "22222222-2222-4222-8222-222222222222",
                 agentId: "33333333-3333-4333-8333-333333333333",
                 responsibleUserId: "user-1",
+                status: "running", finishedAt: null,
                 contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
                 ...runOverrides,
               }]),

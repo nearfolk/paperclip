@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 
 import { getSandboxDuplexGatewayCodecSource } from "./sandbox-callback-bridge.js";
 import {
@@ -116,6 +116,11 @@ function createRecordingTraceContext(): {
 
 describe("sandbox adapter execution targets", () => {
   const cleanupDirs: string[] = [];
+  beforeEach(async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "bridge-intents-"));
+    cleanupDirs.push(home);
+    vi.stubEnv("PAPERCLIP_HOME", home);
+  });
 
   it("records successful issue comment ids for attribution recovery", () => {
     expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 201, '{"id":"comment-1"}'))
@@ -425,7 +430,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-makedir",
+      runId: "8d578350-dd69-5822-9cb0-75077ee50daa",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -567,7 +572,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-poll-parent",
+      runId: "87591c03-4804-5b2e-8c80-8f955ae2ac0e",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -631,7 +636,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-poll-nogetter",
+      runId: "1b8cd1a9-9343-5268-9c89-cab481b06d3b",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -700,7 +705,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-stdin-parent",
+      runId: "b6a7b7ed-c66b-5d0f-84dd-70bb025edcdc",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -782,7 +787,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-sendinput-span",
+      runId: "d872bcb3-de65-5201-ad1a-c14a1365cbca",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -854,7 +859,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-poll-span",
+      runId: "7b99a728-0c0a-51ca-bc14-0036a80ba467",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -905,7 +910,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session",
+      runId: "719644b2-d209-5458-ae48-c20e37a971f3",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -952,7 +957,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-buffer",
+      runId: "842e078b-fdb7-553c-9086-4d8866cc1d87",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -998,7 +1003,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-fast-exit",
+      runId: "3bc4efc3-6708-55f7-a62c-afa14cfdca83",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -1036,7 +1041,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-auth",
+      runId: "9b807dbe-82ef-567c-ad58-5cefa0a50f4d",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -1116,7 +1121,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-      runId: "run-process-session-stream",
+      runId: "447f5a44-f44a-535c-b971-d9c909e33ab7",
       target,
       runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
       adapterKey: "acpx",
@@ -1202,7 +1207,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-echo",
+        runId: "f4ca082d-1d1b-51a1-9f29-f995144d7c9f",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1256,7 +1261,7 @@ describe("sandbox adapter execution targets", () => {
 
       const spanNames: string[] = [];
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-span",
+        runId: "dd626be8-321e-5491-ad31-728b49ef75e9",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1315,7 +1320,7 @@ describe("sandbox adapter execution targets", () => {
       const runtimeSpan = createRuntimeSpanRunner(traceContext, () => runRootContext);
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-parent",
+        runId: "bf73f87a-7abd-5ac9-800f-da99eebf5583",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1370,7 +1375,7 @@ describe("sandbox adapter execution targets", () => {
       // Track when each wrapper span's work settles (i.e. when its span ends).
       const spanRecords: Array<{ name: string; ended: boolean }> = [];
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-linger",
+        runId: "3622e332-8957-508e-b768-aab3dc31a141",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1432,7 +1437,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-buffer",
+        runId: "8c248de1-5aa2-58e9-bcc5-e800b64961ea",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1481,7 +1486,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-fast-exit",
+        runId: "8f959aa6-4fd6-5056-948a-c7a4619d6782",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1534,7 +1539,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-live",
+        runId: "cea7e3b2-c05d-5bc2-accf-c772330564e3",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -1656,7 +1661,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetProcessSessionBridge({
-        runId: "run-stream-isolation",
+        runId: "4a0fa20f-c064-53d9-9f76-ba0885985423",
         target,
         runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
         adapterKey: "acpx",
@@ -2123,7 +2128,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge",
+      runId: "4a28d0e1-6328-52fa-af16-6e9323a838a4",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2149,13 +2154,38 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/agents/me",
         auth: "Bearer real-run-jwt",
-        runId: "run-bridge",
+        runId: "4a28d0e1-6328-52fa-af16-6e9323a838a4",
       }]);
     } finally {
       await bridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     }
   });
+
+  it("contains transport failures across aliases and bridge recreation without forwarding a third write", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "bridge-budget-"));
+    cleanupDirs.push(rootDir);
+    let forwarded = 0;
+    const apiServer = createServer((_req, res) => { forwarded++; res.writeHead(503); res.end("synthetic-secret"); });
+    await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", resolve));
+    const address = apiServer.address() as { port: number };
+    const target: AdapterSandboxExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "e2b",
+      environmentId: "env-1", leaseId: "lease-1", remoteCwd: rootDir, runner: createLocalSandboxRunner(), timeoutMs: 30_000 };
+    const input = { runId: "448d4c1d-9214-4f37-9d11-2d47dd54a426", target, runtimeRootDir: path.join(rootDir, "runtime"),
+      adapterKey: "codex", hostApiToken: "synthetic-token", hostApiUrl: `http://127.0.0.1:${address.port}` };
+    let bridge = await startAdapterExecutionTargetPaperclipBridge(input);
+    try {
+      for (let i = 0; i < 3; i++) {
+        if (i === 2) { await bridge!.stop(); bridge = await startAdapterExecutionTargetPaperclipBridge(input); }
+        const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/issues/issue-${i}/comments`, {
+          method: "POST", headers: { authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ body: "synthetic-secret" }),
+        });
+        expect(response.status).toBeGreaterThanOrEqual(400);
+      }
+      expect(forwarded).toBe(2);
+    } finally { await bridge!.stop(); await new Promise<void>((resolve) => apiServer.close(() => resolve())); }
+  }, 30_000);
 
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-"));
@@ -2178,7 +2208,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-stream",
+      runId: "42e8d746-6bef-5533-8283-7e98abcd9dea",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2220,7 +2250,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const defaultBridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-stream-default",
+      runId: "7faac81e-f161-5597-8439-5832a5730f2b",
       target: baseTarget,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2234,7 +2264,7 @@ describe("sandbox adapter execution targets", () => {
     }
 
     const optOutBridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-stream-opt-out",
+      runId: "ed187dc5-6743-5bd9-957f-7ac364b4d632",
       target: { ...baseTarget, streamRunLogs: false },
       runtimeRootDir,
       adapterKey: "codex",
@@ -2439,7 +2469,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-shell",
+      runId: "e1e6d0ac-8f49-5893-8374-e6ff5d10432f",
       target,
       runtimeRootDir,
       adapterKey: "claude",
@@ -2466,7 +2496,7 @@ describe("sandbox adapter execution targets", () => {
       ].join("\n");
 
       const result = await runAdapterExecutionTargetShellCommand(
-        "run-bridge-shell",
+        "e1e6d0ac-8f49-5893-8374-e6ff5d10432f",
         target,
         `${shellQuote(process.execPath)} -e ${shellQuote(shellProbe)}`,
         {
@@ -2502,7 +2532,7 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/agents/me",
         auth: "Bearer real-run-jwt",
-        runId: "run-bridge-shell",
+        runId: "e1e6d0ac-8f49-5893-8374-e6ff5d10432f",
       }]);
     } finally {
       await bridge?.stop();
@@ -2546,7 +2576,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-timeout",
+      runId: "36cfc33a-f907-5f96-aeb2-07a654442ace",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2619,7 +2649,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-limit",
+      runId: "2ae8a01c-ccca-582b-a512-e78075af225c",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2651,7 +2681,7 @@ describe("sandbox adapter execution targets", () => {
         method: "POST",
         url: "/api/issues/issue-1/comments",
         auth: "Bearer real-run-jwt",
-        runId: "run-bridge-limit",
+        runId: "2ae8a01c-ccca-582b-a512-e78075af225c",
       }]);
     } finally {
       await bridge?.stop();
@@ -2708,7 +2738,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-safe-limit",
+      runId: "7c0a9096-782f-57a9-903a-58eb6951d79c",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2735,7 +2765,7 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/issues/issue-1",
         auth: "Bearer real-run-jwt",
-        runId: "run-bridge-safe-limit",
+        runId: "7c0a9096-782f-57a9-903a-58eb6951d79c",
       }]);
     } finally {
       await bridge?.stop();
@@ -2784,7 +2814,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-outcome",
+      runId: "14c316c4-604e-5c96-ae9c-9f9afa9f90c9",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -2866,7 +2896,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-local",
+      runId: "c90383ea-d8d1-5600-b000-e4ba2aeae59c",
       target,
       runtimeRootDir,
       adapterKey: "claude",
@@ -2887,7 +2917,7 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/agents/me",
         auth: "Bearer real-run-jwt",
-        runId: "run-bridge-local",
+        runId: "c90383ea-d8d1-5600-b000-e4ba2aeae59c",
       }]);
     } finally {
       await bridge?.stop();
@@ -2936,7 +2966,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-override",
+      runId: "b5edaa3a-c35b-5855-9a9d-a5240d4a17c0",
       target,
       runtimeRootDir,
       adapterKey: "claude",
@@ -3327,7 +3357,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-startup-fail",
+      runId: "dda955b1-501b-5e90-8f7e-9ea8d4f85195",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3391,7 +3421,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-http2",
+      runId: "a3699110-bf38-57b4-9a3a-beaa5a6c63c2",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3422,7 +3452,7 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/agents/me",
         auth: "Bearer real-run-jwt",
-        runId: "run-http2",
+        runId: "a3699110-bf38-57b4-9a3a-beaa5a6c63c2",
       });
     } finally {
       sessionRef.current?.close();
@@ -3454,7 +3484,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-duplex-log",
+      runId: "245ec6ec-2cdf-58d3-bcb1-6823026402b5",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3499,7 +3529,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-http2-log-off",
+      runId: "05b5fb6f-ed20-5d29-b6aa-6c1ed5c70211",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3546,7 +3576,7 @@ describe("sandbox adapter execution targets", () => {
       duplexObservabilityRecorder: recorder,
     };
     const openBridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-http2-open",
+      runId: "18cf028e-fd93-5f0f-8d51-57c1c4708fa3",
       target: openTarget,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3578,7 +3608,7 @@ describe("sandbox adapter execution targets", () => {
       duplexObservabilityRecorder: recorder,
     };
     const fallbackBridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-duplex-fallback",
+      runId: "a6b5477a-a7a0-51e8-a3b9-341d3aa84035",
       target: fallbackTarget,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3619,7 +3649,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-gate",
+      runId: "8f5284fe-1703-5811-b493-d5b2eb978a6d",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3678,7 +3708,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-fail",
+      runId: "6ba12288-dd0f-5576-845d-62b8d6a6a265",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3753,7 +3783,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetPaperclipBridge({
-        runId: "run-addr",
+        runId: "43cd95d4-cd7a-53a9-9615-f294a4548151",
         target,
         runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
         adapterKey: "codex",
@@ -3805,7 +3835,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-http2-403",
+      runId: "f9ad2cb5-9ffd-5d39-93b2-d1049c3f9a39",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -3842,7 +3872,7 @@ describe("sandbox adapter execution targets", () => {
         method: "GET",
         url: "/api/agents/me",
         auth: "Bearer real-run-jwt",
-        runId: "run-http2-403",
+        runId: "f9ad2cb5-9ffd-5d39-93b2-d1049c3f9a39",
       });
       expect(api.requests[0].headers["x-not-allowed"]).toBeUndefined();
 
@@ -3932,7 +3962,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-raw-bytes",
+      runId: "51c1c5ad-ec6e-5618-bff6-6d092e5f39bb",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4039,7 +4069,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-obs",
+      runId: "b3c1e548-979c-5f30-8425-605a7bdb3b65",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4105,7 +4135,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-fb",
+      runId: "f9295ae7-1090-52ec-b0b1-1c06855b57a4",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4183,7 +4213,7 @@ describe("sandbox adapter execution targets", () => {
       };
 
       const bridge = await startAdapterExecutionTargetPaperclipBridge({
-        runId: "run-stage",
+        runId: "6c676156-197d-59f0-8bb3-933fce7961ef",
         target,
         runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
         adapterKey: "codex",
@@ -4246,7 +4276,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-loss",
+      runId: "67eb503a-b5b5-599a-90d6-dcddaabde738",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4309,7 +4339,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-guard",
+      runId: "0977274a-0f10-5ebc-b25f-3a0f0fed70da",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4382,7 +4412,7 @@ describe("sandbox adapter execution targets", () => {
     let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
     try {
       bridge = await startAdapterExecutionTargetPaperclipBridge({
-        runId: "run-redact",
+        runId: "7a867423-4f17-5978-86c0-c6247fac3d4d",
         target,
         runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
         adapterKey: "codex",
@@ -4460,7 +4490,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-prov",
+      runId: "91d62de8-928c-5a74-bf67-1a29f3c71d39",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4531,7 +4561,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-cap",
+      runId: "f68b8315-ece6-5714-9372-27956f848cab",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4589,7 +4619,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-cap-small",
+      runId: "2edb56bd-b3e8-5264-a012-da0b2a3bed65",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4647,7 +4677,7 @@ describe("sandbox adapter execution targets", () => {
 
     __duplexReadinessTesting.resetNewlineScanUnits();
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-scan-bound",
+      runId: "80cc0ac6-d6fc-5fc9-9dd4-b33c118bba83",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4704,7 +4734,7 @@ describe("sandbox adapter execution targets", () => {
 
     __duplexReadinessTesting.resetBufferGrowthCopyUnits();
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-growth-bound",
+      runId: "7e3becd1-b64e-552b-842b-1be33e346fde",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4762,7 +4792,7 @@ describe("sandbox adapter execution targets", () => {
 
     __duplexReadinessTesting.resetNewlineScanUnits();
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-blank-scan",
+      runId: "0246aa4d-6ec8-56cd-a10b-f9cd0c14a0e8",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4822,7 +4852,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-noise-ready",
+      runId: "e648c6f4-43e0-50d0-8e95-aee5f4bc0474",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4873,7 +4903,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-noise-nonce",
+      runId: "186ab735-d3fa-515b-885c-17704d5f8c00",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4930,7 +4960,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-cap-bypass",
+      runId: "cf168fa1-8908-51c5-9357-1f9c3e99308b",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -4981,7 +5011,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-open-span",
+      runId: "8e2b8efc-d67a-50a4-b5c9-1be662bb3f85",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5033,7 +5063,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-hdr",
+      runId: "cfdc7dbf-ea80-54a8-8d4d-b3709401c142",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5064,7 +5094,7 @@ describe("sandbox adapter execution targets", () => {
       expect(forwarded.headers["x-injected-header"]).toBeUndefined();
       // The host applied the real token and the run id in place of the frame values.
       expect(forwarded.auth).toBe("Bearer real-run-jwt");
-      expect(forwarded.runId).toBe("run-hdr");
+      expect(forwarded.runId).toBe("cfdc7dbf-ea80-54a8-8d4d-b3709401c142");
     } finally {
       sessionRef.current?.close();
       await bridge?.stop();
@@ -5100,7 +5130,7 @@ describe("sandbox adapter execution targets", () => {
     // duplex_v1 broker only), so a large forward budget must still select and
     // serve normally.
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-budget",
+      runId: "6e60e625-8c76-5a45-bd1a-14ab0f853dc4",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5152,7 +5182,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-no-preface",
+      runId: "0125f024-900e-5187-be21-c24bc8884aec",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5199,7 +5229,7 @@ describe("sandbox adapter execution targets", () => {
 
     // The kill switch is off. The host must never open the channel at all.
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-disabled",
+      runId: "430433da-50a9-58ec-a33d-9120996670d7",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5245,7 +5275,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-one-way",
+      runId: "af11207d-b19c-55bb-b319-47cc675ab6e4",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5331,7 +5361,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-no-early-write",
+      runId: "466a8bf0-efbe-5631-9084-049ac6603436",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5384,7 +5414,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-invalid-ready-bytes",
+      runId: "33fe1f67-8ad7-56b3-87a5-8d7dc06606f3",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5433,7 +5463,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-orderly-close",
+      runId: "8d8de6c4-9b2e-5add-82ee-dabeb4e98318",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5488,7 +5518,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-safe-retry",
+      runId: "41d71dd8-0a6d-52eb-83fb-26c479544a83",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5549,7 +5579,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-unsafe-indeterminate",
+      runId: "40dead38-83b5-55f9-87ce-d7f1c1424b14",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5624,7 +5654,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-abort-forward",
+      runId: "e322e512-9d51-5be7-8a0e-841abc7e272d",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5709,7 +5739,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-denied-response-chunk",
+      runId: "f561c066-fa62-51b7-9d55-27e19ca9216c",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5797,7 +5827,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-denied-response-concat",
+      runId: "fa4d5f94-1f2f-5db3-8916-199b678ac247",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5912,7 +5942,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-denied-response-mutation",
+      runId: "4a85f044-0c7b-519c-9478-801356c660ce",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -5991,7 +6021,7 @@ describe("sandbox adapter execution targets", () => {
       effectiveCapabilities: duplexCapabilities(true),
     };
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-ceiling-aggregate",
+      runId: "c57102d6-6ac8-57a2-90c9-35a85e661740",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -6013,11 +6043,13 @@ describe("sandbox adapter execution targets", () => {
           }),
         ),
       );
-      for (const response of responses) {
-        expect(response.status).toBe(200);
-        expect(response.body.byteLength).toBe(bodyBytes);
-      }
-      expect(samples).toHaveLength(HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS);
+      const accepted = responses.filter((response) => response.status === 200);
+      const contained = responses.filter((response) => response.status === 409);
+      expect(accepted.length).toBeGreaterThanOrEqual(2);
+      expect(accepted.length + contained.length).toBe(HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS);
+      for (const response of accepted) expect(response.body.byteLength).toBe(bodyBytes);
+      for (const response of contained) expect(JSON.parse(response.body.toString())).toMatchObject({ retryable: false });
+      expect(samples).toHaveLength(accepted.length);
       for (const sample of samples) {
         expect(sample).toBeGreaterThan(0);
         expect(sample).toBeLessThanOrEqual(HTTP2_BRIDGE_MAX_PROCESS_BODY_BYTES);
@@ -6059,7 +6091,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-host-body-limit",
+      runId: "940f9110-4ddd-585e-b87a-5a80a85b5dd9",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -6134,7 +6166,7 @@ describe("sandbox adapter execution targets", () => {
     };
 
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-queue-no-reservation",
+      runId: "7b95730f-64d6-506e-b0b7-d894238f9f35",
       target,
       runtimeRootDir,
       adapterKey: "codex",
@@ -6188,7 +6220,7 @@ describe("sandbox adapter execution targets", () => {
       effectiveCapabilities: duplexCapabilities(true),
     };
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-pty-replay",
+      runId: "3df05e7f-b064-5d31-bda4-5c46bd045183",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -6331,7 +6363,7 @@ describe("sandbox adapter execution targets", () => {
       effectiveCapabilities: duplexCapabilities(true),
     };
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-preface-offset",
+      runId: "e72f7e50-138d-5b8e-8e5d-7ccdabbdb3dd",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",
@@ -6386,7 +6418,7 @@ describe("sandbox adapter execution targets", () => {
       effectiveCapabilities: duplexCapabilities(true),
     };
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-preface-lookalike",
+      runId: "56c95d82-d8fd-5efa-a1ea-6fb9dbfc5508",
       target,
       runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
       adapterKey: "codex",

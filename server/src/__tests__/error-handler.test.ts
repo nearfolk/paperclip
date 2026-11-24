@@ -275,3 +275,14 @@ describe("errorHandler", () => {
     );
   });
 });
+
+describe("QA adversarial case-insensitive error redaction", () => {
+  it("must redact body and error context on a mixed-case issue route", () => {
+    const marker = "qa-secret-marker-never-log";
+    const req = { ...makeReq(), method: "POST", path: "/api/ISSUES/example/comments", originalUrl: "/api/ISSUES/example/comments", actor: {type:"agent"}, body: {secret:marker} } as unknown as Request;
+    const res = makeRes() as any;
+    errorHandler(new Error(marker), req, res, vi.fn());
+    expect(JSON.stringify(res.__errorContext)).not.toContain(marker);
+    expect(res.err.message).not.toContain(marker);
+  });
+});

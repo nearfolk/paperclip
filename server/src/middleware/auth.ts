@@ -24,6 +24,7 @@ import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
+import { invalidRunContext } from "../services/validated-run-context.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
 
@@ -168,9 +169,9 @@ async function auditAgentJwtRunHeaderMismatch(
       ...(isUuidLike(input.claimRunId) ? { runId: input.claimRunId } : {}),
       details: {
         claimRunId: input.claimRunId,
-        headerRunId: input.headerRunId,
+        headerRunId: isUuidLike(input.headerRunId) ? input.headerRunId : "invalid",
         method: input.method,
-        url: input.url,
+        url: input.url.split("?")[0],
       },
     });
   } catch (err) {
@@ -196,7 +197,7 @@ async function auditAgentKeyMissingResponsibleUser(
       ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
       details: {
         method: input.method,
-        url: input.url,
+        url: input.url.split("?")[0],
       },
     });
   } catch (err) {
@@ -229,7 +230,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
-    const runIdHeader = req.header("x-paperclip-run-id");
+    const runIdHeader = req.header("x-paperclip-run-id")?.trim();
 
     const authHeader = req.header("authorization");
     const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");
@@ -374,9 +375,14 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           unprocessable("X-Paperclip-Run-Id does not match signed agent JWT run_id", {
             code: "agent_jwt_run_id_mismatch",
             claimRunId: claims.run_id,
-            headerRunId: normalizedRunIdHeader,
+            headerRunId: isUuidLike(normalizedRunIdHeader) ? normalizedRunIdHeader : "invalid",
           }),
         );
+        return;
+      }
+
+      if (!isUuidLike(claims.run_id)) {
+        next(invalidRunContext());
         return;
       }
 
