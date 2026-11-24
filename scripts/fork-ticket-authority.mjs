@@ -201,7 +201,7 @@ function withoutUnrelatedConversationalApprovalHold(body) {
     .join('')
 }
 
-export function isHold(body) {
+function isHoldClause(body) {
   if (isClearance(body)) return false
   if (/\bno\b[^\n]{0,30}\b(?:open\s+)?(?:hold|freeze)\b/i.test(body ?? '')) return false
   return (
@@ -209,6 +209,11 @@ export function isHold(body) {
     || /\b(?:release|merge|gate)\s+(?:is\s+)?(?:on\s+)?(?:hold|frozen|freeze)\b/i.test(body ?? '')
     || conversationalReleaseHold(body)
   )
+}
+
+export function isHold(body) {
+  if (isClearance(body)) return false
+  return directiveClauses(body).some(isHoldClause)
 }
 
 function releaseAuthorityRequirement(body, authorRole = null) {
@@ -333,16 +338,15 @@ function supersededMalformedAuthoritySourceIds(sources, actorRoles) {
   return superseded
 }
 
-function isReleaseAuthorization(body) {
-  if (isReleaseDenial(body) || isHold(body)) return false
-  return (
-    /^\s*#{0,6}\s*(?:release\s+)?(?:AUTHORIZED|APPROVED)\b/im.test(body ?? '')
-    || /\b(?:I|we|CEO|board)\s+(?:hereby\s+|explicitly\s+)?(?:authorize|approve)\b/i.test(body ?? '')
-    || /\b(?:release|merge|deployment)\s+(?:is\s+)?(?:authorized|approved)\b/i.test(body ?? '')
-    || /\b(?:authorization|approval)\s*:\s*(?:granted|approved)\b/i.test(body ?? '')
-    || /\b(?:merge|release)\s+authority\b[^\n]{0,80}\b(?:restored|reinstated|granted)\b/i.test(body ?? '')
-    || /\b(?:clear|clearance|cleared)\b[^\n]{0,80}\b(?:merge|release)\b/i.test(body ?? '')
+export function parseReleaseAuthorizationReceipt(body) {
+  const match = String(body ?? '').trim().match(
+    /^I\s+(?:(?:hereby|explicitly)\s+)?authorize\s+(?:protected\s+)?(?:merge|release|deployment)(?:\s+and\s+normal\s+dormant\s+deployment)?\s+(?:at|for)\s+exact\s+head\s+`?([0-9a-f]{40})`?(?:,\s+clearing\s+denial\s+at\s+(comment|description)\s+`?([0-9a-z-]+)`?)?\.$/i,
   )
+  return match ? { head: match[1].toLowerCase(), sourceKind: match[2]?.toLowerCase(), sourceId: match[3] } : null
+}
+
+function isReleaseAuthorization(body) {
+  return Boolean(parseReleaseAuthorizationReceipt(body))
 }
 
 function withoutGithubOnlyReviewRestriction(body) {
@@ -363,7 +367,7 @@ function withoutGithubOnlyReviewRestriction(body) {
 
 function releaseDenialText(body) {
   return withoutGithubOnlyReviewRestriction(
-    withoutUnrelatedConversationalApprovalHold(body),
+    withoutUnrelatedConversationalApprovalHold(String(body ?? '').replaceAll('’', "'")),
   )
     .replace(
       /\bdo not approve or publish on UNKNOWN\/FAIL\.(?=\s|$)/gi,
@@ -379,23 +383,59 @@ function releaseDenialText(body) {
 
 }
 
+const releaseDenialPatterns = [
+  /^\s*#{0,6}\s*(?:release\s+)?(?:DENIED|NOT AUTHORIZED)\b/im,
+  /\b(?:do not|cannot|refuse to)\s+(?:authorize|approve)\b/i,
+  /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)\s+(?:merge(?!\s+eligibility)|release|deploy)\b/i,
+  /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)[\s,]+(?:(?:under any circumstances|under any condition|at any time|for any reason|ever|yet|[a-z]+ly)[\s,]+)+(?:merge(?!\s+eligibility)|release|deploy)\b/i,
+  /\b(?:merge|release|deployment)\s+(?:is\s+)?(?:prohibited|forbidden|not\s+(?:(?:yet|currently|explicitly)\s+)?(?:permitted|allowed|authorized|approved))\b/i,
+  /\b(?:authorization|approval)\s+(?:is\s+)?(?:denied|withheld|refused)\b/i,
+  /\bno\s+(?:merge|release)\s+authority\b/i,
+  /\b(?:merge|release)\s+authority\b[^\n]{0,80}\b(?:withheld|revoked|void|withdrawn)\b/i,
+  /\b(?:withhold|revoke|void|withdraw)\b[^\n]{0,80}\b(?:merge|release)\s+authority\b/i,
+]
+
+function releaseDenialStart(body) {
+  const text = releaseDenialText(body)
+  const offsets = releaseDenialPatterns.map(pattern => pattern.exec(text)?.index).filter(index => index !== undefined)
+  return offsets.length ? Math.min(...offsets) : -1
+}
+
 function isReleaseDenial(body) {
-  const releaseScopedBody = releaseDenialText(body)
-  return (
-    /^\s*#{0,6}\s*(?:release\s+)?(?:DENIED|NOT AUTHORIZED)\b/im.test(releaseScopedBody)
-    || /\b(?:do not|cannot|refuse to)\s+(?:authorize|approve)\b/i.test(releaseScopedBody)
-    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)\s+(?:merge(?!\s+eligibility)|release|deploy)\b/i.test(releaseScopedBody)
-    || /\b(?:do not|don't|must not|mustn't|shall not|may not|cannot|can't|never|refuse to)[\s,]+(?:(?:under any circumstances|under any condition|at any time|for any reason|ever|yet|[a-z]+ly)[\s,]+)+(?:merge(?!\s+eligibility)|release|deploy)\b/i.test(releaseScopedBody)
-    || /\b(?:merge|release|deployment)\s+(?:is\s+)?(?:prohibited|forbidden|not\s+(?:(?:yet|currently|explicitly)\s+)?(?:permitted|allowed|authorized|approved))\b/i.test(releaseScopedBody)
-    || /\b(?:authorization|approval)\s+(?:is\s+)?(?:denied|withheld|refused)\b/i.test(releaseScopedBody)
-    || /\bno\s+(?:merge|release)\s+authority\b/i.test(releaseScopedBody)
-    || /\b(?:merge|release)\s+authority\b[^\n]{0,80}\b(?:withheld|revoked|void|withdrawn)\b/i.test(releaseScopedBody)
-    || /\b(?:withhold|revoke|void|withdraw)\b[^\n]{0,80}\b(?:merge|release)\s+authority\b/i.test(releaseScopedBody)
-  )
+  return releaseDenialStart(body) !== -1
 }
 
 function directiveClauses(body) {
-  return String(body ?? '').split(/(?<=[.!?;])\s+|\n+|(?:,\s*|\s+(?:and|but)\s+)(?=(?:do not|must not|never|cannot|(?:merge|release|deployment)\s+(?:is\s+)?not)\b)/i)
+  // Use the classifiers themselves when splitting independent directives. A
+  // second, shorter list of denial words lets contractions escape detection.
+  const sentences = String(body ?? '').replaceAll('’', "'")
+    .replace(/\b(hold)\s*,\s*(?=(?:and\s+)?do\s+not\s+approve\s+yet\b)/gi, '$1 ')
+    .split(/(?<=[.!?;])\s+|\n+/)
+  return sentences.flatMap(sentence => {
+    const boundaries = [...sentence.matchAll(/,\s*(?:(?:and|but)\s+)?|\s+(?:and|but)\s+/gi)]
+    const clauses = []
+    let start = 0
+    for (const boundary of boundaries) {
+      const right = sentence.slice(boundary.index + boundary[0].length)
+      const denialStart = releaseDenialStart(right)
+      // Do not split a qualifier from its prohibition just because a later
+      // independent clause also contains a denial.
+      const denialPrefix = denialStart < 0 ? '' : releaseDenialText(right).slice(0, denialStart)
+      const independentDenial = denialStart >= 0 && !/,|\b(?:and|but)\b/i.test(denialPrefix)
+      const independentHold = isHoldClause(right) && (
+        /^\s*(?:HOLD|FREEZE|FROZEN)\b/.test(right)
+        || /^\s*(?:hold|freeze|frozen)\s*(?::|$|\b(?:at|for|until)\b)/i.test(right)
+        || /\b(?:release|merge|gate)\s+(?:is\s+)?(?:on\s+)?(?:hold|frozen|freeze)\b/i.test(right)
+        || conversationalReleaseHold(right)
+      )
+      if (independentDenial || independentHold) {
+        clauses.push(sentence.slice(start, boundary.index))
+        start = boundary.index + boundary[0].length
+      }
+    }
+    clauses.push(sentence.slice(start))
+    return clauses
+  })
 }
 
 function directiveHead(clause) {
@@ -411,7 +451,7 @@ function directiveHead(clause) {
 
 export function hasHoldForHead(body, expectedHead) {
   if (isClearance(body)) return false
-  return directiveClauses(body).some(clause => isHold(clause)
+  return directiveClauses(body).some(clause => isHoldClause(clause)
     && (!directiveHead(clause) || directiveHead(clause) === expectedHead))
 }
 
@@ -693,8 +733,8 @@ function evaluateReleaseAuthority({
       ['ceo', 'board'].includes(authorRole)
       || retractedQaFailureIds.has(source?.id)
     )
-    const denialClauses = directiveClauses(releaseDenialText(denialBody))
-      .filter(clause => isReleaseDenial(clause) || (holdDenial && isHold(clause)))
+    const denialClauses = [...directiveClauses(releaseDenialText(denialBody)).filter(isReleaseDenial),
+      ...(holdDenial ? directiveClauses(sourceBody).filter(isHoldClause) : [])]
       .filter(clause => !directiveHead(clause) || directiveHead(clause) === expectedHead)
     const denial = denialClauses.length > 0
     const ambiguousDenial = denialClauses.some(clause => !directiveHead(clause))
@@ -809,6 +849,12 @@ function evaluateReleaseAuthority({
         const targeted = new Set(explicitlyTargeted)
         unavailableActorDenials = unavailableActorDenials.filter((candidate) => !targeted.has(candidate))
         if (unavailableActorDenials.length > 0) continue
+      }
+      const authorizationReceipt = parseReleaseAuthorizationReceipt(directive.source.body)
+      if (authorizationReceipt?.sourceId) {
+        const description = denial?.source?.sourceKind === 'issue_description'
+        if (authorizationReceipt.sourceKind !== (description ? 'description' : 'comment')
+          || authorizationReceipt.sourceId !== (description ? denial?.source?.sourceIssueId : denial?.source?.id)) continue
       }
       if (denial?.holdDenial && !validHoldClearance(directive.source, denial.source, expectedHead, actorRoles)) continue
       if (ambiguousDenials.length > 0) {

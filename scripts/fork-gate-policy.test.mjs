@@ -1,3 +1,4 @@
+import { isHold, hasHoldForHead } from './fork-ticket-authority.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -363,4 +364,87 @@ test('bounded immutable CEO receipt clears duplicate ancestor description snapsh
   assert.doesNotThrow(() => evaluateForkTickets(x));
   clear.body = clear.body.replace('ancestor', 'ancestor-suffix');
   assert.throws(() => evaluateForkTickets(x));
+});
+
+const oldBoundaryHead='c'.repeat(40);
+for(const [label,fixture] of [['authority regression', tickets]]){
+ const timed=x=>({ceo:x.actors.find(a=>a.role==='ceo').id,at:n=>new Date(x.nowMs-600000+n).toISOString()});
+ test(`${label}: valid hypothetical handoff control`,()=>assert.doesNotThrow(()=>evaluateForkTickets(fixture())));
+ for(const where of ['gate','ancestor','required description'])for(const body of [
+  `Do not merge PR #7 at exact head ${oldBoundaryHead}, but don't merge this candidate either.`,
+  `Do not merge PR #7 at exact head ${oldBoundaryHead} and mustn't merge this candidate.`,
+  `Previous candidate was at exact head ${oldBoundaryHead}, don't merge PR #7.`,
+  `Do not merge PR #7 at exact head ${oldBoundaryHead}, and may not deploy this candidate.`,
+  `No hold applies to old head ${oldBoundaryHead}, but HOLD for exact head HEAD.`,
+ ])test(`${label}: ${where} must block independent restriction: ${body}`,()=>{
+  const x=fixture(),{ceo,at}=timed(x),c=comment('deny',body.replace('HEAD',x.contract.head),at(10000),ceo);
+  if(where==='required description'){
+   x.contract.requiredVerdicts=[{ticket:'security',reviewerId:'security-reviewer'}];
+   x.required=[{issue:{id:'security',createdAt:at(10000),updatedAt:at(10000),createdByAgentId:ceo,description:c.body},comments:[comment('security-pass',`PASS ${x.contract.head}`,at(20000),'security-reviewer')],authorityScope:[]}];
+  }else (where==='gate'?x.snapshot.comments:x.snapshot.authorityScope).push(c);
+  assert.throws(()=>evaluateForkTickets(x));
+ });
+ for(const where of ['gate','ancestor'])for(const body of [
+  'If remediation passes, I authorize merge at exact head HEAD.',
+  'I do not clear merge at exact head HEAD.',
+  '> I authorize merge at exact head HEAD.',
+  'Please say "I authorize merge at exact head HEAD."',
+ ])test(`${label}: ${where} denial cannot be cleared by non-affirmative receipt: ${body}`,()=>{
+  const x=fixture(),{ceo}=timed(x),at=n=>new Date(x.nowMs+n).toISOString();
+  (where==='gate'?x.snapshot.comments:x.snapshot.authorityScope).push(comment('deny',`Do not merge at exact head ${x.contract.head}.`,at(1000),ceo));
+  x.snapshot.comments.push(comment('clear',body.replace('HEAD',x.contract.head),at(2000),ceo));
+  x.nowMs+=302000;assert.throws(()=>evaluateForkTickets(x));
+ });
+ test(`${label}: standalone current prohibition rejects`,()=>{const x=fixture(),{ceo}=timed(x);x.snapshot.comments.push(comment('deny',`Do not merge at exact head ${x.contract.head}.`,new Date(x.nowMs).toISOString(),ceo));assert.throws(()=>evaluateForkTickets(x));});
+ test(`${label}: standalone affirmative authority control`,()=>{const x=fixture(),{ceo}=timed(x),at=n=>new Date(x.nowMs+n).toISOString();x.snapshot.comments.push(comment('deny',`Do not merge at exact head ${x.contract.head}.`,at(1000),ceo),comment('clear',`I authorize merge at exact head ${x.contract.head}.`,at(2000),ceo));x.nowMs+=302000;assert.doesNotThrow(()=>evaluateForkTickets(x));});
+}
+
+for(const [label,fixture] of [['hold regression', tickets]]){
+ for(const where of ['gate','ancestor','required description'])test(`${label}: ${where} conversational hold must block without any clearance`,()=>{
+ const x=fixture(),ceo=x.actors.find(a=>a.role==='ceo').id,t=new Date(x.nowMs).toISOString(),body='My rec: hold, do not approve yet.';
+ if(where==='required description'){x.contract.requiredVerdicts=[{ticket:'security',reviewerId:'security-reviewer'}];x.required=[{issue:{id:'security',createdAt:t,updatedAt:t,createdByAgentId:ceo,description:body},comments:[comment('team-pass',`PASS ${x.contract.head}`,t,'security-reviewer')],authorityScope:[]}];}else (where==='gate'?x.snapshot.comments:x.snapshot.authorityScope).push(comment('hold',body,t,ceo));
+ x.nowMs+=600000;assert.throws(()=>evaluateForkTickets(x));
+ });
+ for(const body of ['HOLD: do not approve yet.','HOLD for exact head HEAD.'])test(`${label}: explicit hold control ${body}`,()=>{const x=fixture(),ceo=x.actors.find(a=>a.role==='ceo').id;x.snapshot.comments.push(comment('hold',body.replace('HEAD',x.contract.head),new Date(x.nowMs).toISOString(),ceo));assert.throws(()=>evaluateForkTickets(x));});
+}
+test('recognized conversational hold survives clause inventory',()=>{const body='My rec: hold, do not approve yet.';assert.equal(isHold(body),true);assert.equal(hasHoldForHead(body,'a'.repeat(40)),true);});
+
+for (const body of [
+  `Do not, under any circumstances, merge at exact head ${head}, and don't merge at exact head ${oldBoundaryHead}.`,
+  `Do not merge at exact head ${oldBoundaryHead}, but mustn’t deploy this candidate.`,
+  `No hold applies to old head ${oldBoundaryHead}, but hold for exact head ${head}.`,
+]) test(`qualified or adjacent restriction retains its scope: ${body}`, () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('deny', body, '2026-11-24T12:01:00Z', 'ceo'));
+  assert.throws(() => evaluateForkTickets(x));
+});
+test('descriptive conjunctions do not become hold directives', () => {
+  const x = tickets();
+  x.snapshot.authorityScope.push(comment('instructions', 'Review authority and hold evaluation. Include verdicts and hold inventories with actor, timestamps and source ID.'));
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+});
+for (const mutate of [
+  c => c.body = c.body.replace('comment deny', 'comment deny-suffix'),
+  c => c.body = c.body.replace('comment deny', 'description deny'),
+  c => c.body = c.body.replace(head, oldBoundaryHead),
+  c => c.authorAgentId = operator,
+  c => c.updatedAt = '2026-11-24T12:02:01Z',
+  c => c.createdAt = '2026-11-24T12:01:00Z',
+  c => c.createdAt = '2026-11-24T11:59:00Z',
+]) test(`authorization receipt rejects invalid binding, actor or chronology: ${mutate}`, () => {
+  const x = tickets();
+  const receipt = comment('authority', `I authorize merge at exact head ${head}, clearing denial at comment deny.`, '2026-11-24T12:02:00Z', 'ceo');
+  x.snapshot.comments.push(comment('deny', `Do not merge at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo'), receipt);
+  x.nowMs = Date.parse('2026-11-24T12:07:00Z');
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  mutate(receipt);
+  assert.throws(() => evaluateForkTickets(x));
+});
+test('standalone affirmative authorization starts five full minutes', () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('deny', `Do not merge at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo'), comment('authority', `I authorize merge at exact head ${head}.`, '2026-11-24T12:02:00Z', 'ceo'));
+  x.nowMs = Date.parse('2026-11-24T12:06:59Z');
+  assert.throws(() => evaluateForkTickets(x), /minute/i);
+  x.nowMs += 1000;
+  assert.doesNotThrow(() => evaluateForkTickets(x));
 });

@@ -225,3 +225,31 @@ Their dependencies are still reported. Authentication, rate-limit, transport,
 timeout, malformed content, existing-base 404 and candidate 404 errors fail the
 quality job. Findings stay informational. Check-mode reports expose only fixed
 categories and counts, never matching text or paths.
+
+### Standalone release authority receipts
+
+An existing executive denial scoped to the candidate can only be restored by a
+completed, standalone affirmative receipt from the required authority, after the
+QA PASS and the denial. For example (replace the placeholders):
+
+```text
+I authorize merge at exact head <40-character SHA>.
+I authorize merge at exact head <40-character SHA>, clearing denial at comment <comment-id>.
+```
+
+An explicit source binding must match the denial's comment ID or use
+`description <issue-id>` for an issue description. The receipt must be immutable;
+a fresh qualifying receipt restarts five full minutes. Conditional, negative,
+quoted, instructional, edited, wrong-head or wrong-source text is not authority.
+A generic authorization cannot clear an unscoped hold, an ambiguous denial, or
+an unavailable actor's denial; those require the bounded source-specific receipt
+and actor rules above. This does not add a routine executive approval gate.
+
+Denial splitting uses the same recognized grammar as denial classification,
+including contractions, curly apostrophes and qualified prohibitions. Scope is
+local to each directive. A previous head or a statement that no hold applies to
+that head cannot erase an adjacent current hold or unscoped restriction.
+Conversational `hold, do not approve yet` remains a single directive. Descriptive
+phrases such as “authority and hold evaluation” do not create hold directives.
+The inherited conversational-hold regression was an unsafe acceptance, not a
+legacy-receipt compatibility exception; it is now required to block release.
