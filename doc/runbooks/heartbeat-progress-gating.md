@@ -92,6 +92,14 @@ reset timer suppression.
 - Inspected default: `master`, `916c13501f80c7d1d659b89e4a06dc47366aa80f`.
 - Observed runtime: version `0.3.1`, commit unavailable from the supported health
   API. Neither source SHA is certified as the deployed baseline.
+- Dependency preparation: the retained source manifest already declares `svix`
+  while its checked-in lockfile omits it. Local validation used a regenerated
+  lockfile; repository policy reserves committed lockfile updates for CI, whose
+  policy job regenerates it for downstream checks. That resolution includes
+  `uuid@10.0.0`, flagged by dependency review as GHSA-w5hq-g745-h8pq. This change
+  introduces no dependency manifest changes. CTO must resolve that inherited
+  dependency risk in the integrated baseline; a passing diff-only dependency
+  review does not certify the regenerated dependency graph.
 - Migration: `0274_majestic_fenris.sql` plus its generated snapshot/journal.
   Four new empty tables and indexes; no historical data rewrite. Reconcile the
   ordinal with sibling migrations through the normal generator before integration.
