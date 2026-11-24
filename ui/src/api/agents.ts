@@ -20,6 +20,7 @@ import type {
   SubmitBrowserCodeRequest,
   AgentKeyCreated,
   AgentRuntimeState,
+  HeartbeatProgressSummary,
   AgentTaskSession,
   AgentWakeupResponse,
   ChatFailedRunRetryResponse,
@@ -133,6 +134,8 @@ export const agentsApi = {
       return api.get<AgentDetail>(agentPath(matches[0]!.id, companyId));
     }
   },
+  progressSummary: (id: string, companyId?: string) =>
+    api.get<HeartbeatProgressSummary>(agentPath(id, companyId, "/progress-summary")),
   getConfiguration: (id: string, companyId?: string) =>
     api.get<Record<string, unknown>>(agentPath(id, companyId, "/configuration")),
   listConfigRevisions: (id: string, companyId?: string) =>

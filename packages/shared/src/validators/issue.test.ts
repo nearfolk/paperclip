@@ -406,6 +406,22 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("preserves explicit wake relevance through the supported comment contract", () => {
+    const metadata = {
+      version: 1,
+      sections: [{ rows: [{ type: "text", text: "Scheduling context" }] }],
+    };
+    for (const wakeRelevance of ["none", "reminder", "action_required"]) {
+      const parsed = addIssueCommentSchema.parse({
+        body: "Inspect the revised requirement", metadata: { ...metadata, wakeRelevance },
+      });
+      expect(parsed.metadata?.wakeRelevance).toBe(wakeRelevance);
+    }
+    expect(addIssueCommentSchema.safeParse({
+      body: "Inspect", metadata: { ...metadata, wakeRelevance: "bypass_dependencies" },
+    }).success).toBe(false);
+  });
+
   it("rejects arbitrary issue comment metadata", () => {
     const parsed = addIssueCommentSchema.safeParse({
       body: "Hidden details",

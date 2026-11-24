@@ -397,3 +397,14 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+## Heartbeat progress state
+
+`heartbeat_progress_state` holds the per-agent generation, no-op streak and timer
+suppression. `heartbeat_progress_receipts` deduplicates relevant input content.
+`heartbeat_progress_outcomes` records admission, dispatch and final progress apart
+from process status. `heartbeat_delivered_transitions` uniquely credits task
+completions and persisted blocker-resolution transitions. All reads and writes are
+company-scoped. New input and finalization serialize on the state row; generations
+prevent a late older run from restoring suppression after fresh input. The tables
+are additive, have no historical backfill, and remain intact on binary rollback.

@@ -3224,6 +3224,35 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/progress-summary",
+  tags: ["agents"],
+  summary: "Get durable agent progress and cost coverage",
+  description: "Requires a board actor with permission to manage agents in the company. Measured cost excludes unknown-cost runs; a zero total does not imply zero incurred cost.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      version: z.literal(1),
+      consecutiveNoOps: z.number().int().nonnegative(),
+      timersSuppressed: z.boolean(),
+      modelRuns: z.number().int().nonnegative(),
+      skippedPreflight: z.number().int().nonnegative(),
+      noOpRuns: z.number().int().nonnegative(),
+      successfulTurns: z.number().int().nonnegative(),
+      uniqueTaskCompletions: z.number().int().nonnegative(),
+      blockerResolutions: z.number().int().nonnegative(),
+      inputTokens: z.number().nonnegative(),
+      outputTokens: z.number().nonnegative(),
+      measuredCostUsd: z.number().nonnegative(),
+      unknownCostRuns: z.number().int().nonnegative(),
+    })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/agents/{id}/runtime-state/reset-session",
   tags: ["agents"],
