@@ -469,3 +469,110 @@ test('nonexecutive review assignment can arrive through an active-checkout comme
   assignment.authorAgentId = 'ceo';
   assert.throws(() => evaluateForkTickets(x));
 });
+
+// A receipt is bound to one real source in the pending authority inventory.
+for (const scope of ['gate', 'ancestor', 'required description']) {
+  function denied() {
+    const x = tickets();
+    const denial = comment('live-denial', `Do not merge at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo');
+    if (scope === 'required description') {
+      x.contract.requiredVerdicts = [{ ticket: 'security', reviewerId: 'security-reviewer' }];
+      x.required = [{ issue: { id: 'security', createdAt: denial.createdAt, updatedAt: denial.createdAt, createdByAgentId: 'ceo', description: denial.body }, comments: [comment('team-pass', `PASS ${head}`, denial.createdAt, 'security-reviewer')], authorityScope: [] }];
+    } else (scope === 'gate' ? x.snapshot.comments : x.snapshot.authorityScope).push(denial);
+    x.nowMs = Date.parse('2026-11-24T12:07:00Z');
+    return x;
+  }
+  for (const bounded of [false, true]) {
+    const binding = bounded ? 'solely for protected merge and normal dormant deployment at exact head' : 'for exact head';
+    for (const target of ['comment nonexistent-hold', 'description nonexistent-description', 'comment live-denial-extra']) {
+      test(`${scope}: ${binding} rejects misbound clearance ${target}`, () => {
+        const x = denied();
+        x.snapshot.comments.push(comment('clear', `I clear hold at ${target} ${binding} ${head}.`, '2026-11-24T12:02:00Z', 'ceo'));
+        assert.throws(() => evaluateForkTickets(x), /denied|denial|authority/i);
+      });
+    }
+    test(`${scope}: valid source-bound ${binding} restarts the interval`, () => {
+      const x = denied();
+      const target = scope === 'required description' ? 'description security' : 'comment live-denial';
+      const receipt = comment('clear', `I clear hold at ${target} ${binding} ${head}.`, '2026-11-24T12:02:00Z', 'ceo');
+      x.snapshot.comments.push(receipt);
+      assert.doesNotThrow(() => evaluateForkTickets(x));
+      x.nowMs -= 1;
+      assert.throws(() => evaluateForkTickets(x), /five|5|minute/i);
+      x.nowMs += 1;
+      receipt.updatedAt = '2026-11-24T12:06:00Z';
+      assert.throws(() => evaluateForkTickets(x));
+      delete receipt.updatedAt;
+      receipt.authorAgentId = operator;
+      assert.throws(() => evaluateForkTickets(x));
+    });
+  }
+}
+for (const kind of ['hold', 'authorization']) for (const reverse of [false, true]) {
+  test(`${kind}: clearing one of two exact-head denials preserves the other (reverse ${reverse})`, () => {
+    const x = tickets();
+    for (const id of ['first', 'second']) x.snapshot.comments.push(comment(id, `Do not merge at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo'));
+    const ids = reverse ? ['second', 'first'] : ['first', 'second'];
+    const clear = (id, time) => comment(`clear-${id}`, kind === 'hold'
+      ? `I clear hold at comment ${id} for exact head ${head}.`
+      : `I authorize merge at exact head ${head}, clearing denial at comment ${id}.`, time, 'ceo');
+    x.snapshot.comments.push(clear(ids[0], '2026-11-24T12:02:00Z'));
+    x.nowMs = Date.parse('2026-11-24T12:08:00Z');
+    assert.throws(() => evaluateForkTickets(x), /denied|denial|authority/i);
+    x.snapshot.comments.push(clear(ids[1], '2026-11-24T12:03:00Z'));
+    assert.doesNotThrow(() => evaluateForkTickets(x));
+    x.nowMs -= 1;
+    assert.throws(() => evaluateForkTickets(x), /five|5|minute/i);
+  });
+}
+test('receipt for a real unrelated hold cannot authorize an exact-head denial', () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('unrelated', `HOLD for exact head ${'b'.repeat(40)}.`, '2026-11-24T12:01:00Z', 'ceo'),
+    comment('denied', `Do not merge at exact head ${head}.`, '2026-11-24T12:01:00Z', 'ceo'),
+    comment('clear', `I clear hold at comment unrelated for exact head ${head}.`, '2026-11-24T12:02:00Z', 'ceo'));
+  x.nowMs = Date.parse('2026-11-24T12:07:00Z');
+  assert.throws(() => evaluateForkTickets(x));
+});
+for (const prefix of ['QA', 'Parser', 'Diagnostic', 'Test', 'Regression', 'Fixture', 'Example', 'Classifier', 'Verifier']) {
+  for (const diagnostic of ['', `Parser regression example: \`don’t merge at exact head ${head}.\` `]) {
+    test(`${prefix} live quoted directive survives adjacent diagnostic: ${Boolean(diagnostic)}`, () => {
+      const x = tickets();
+      x.snapshot.comments.push(comment('live', `${diagnostic}${prefix} directive to the CTO: \`Do not merge at exact head ${head}.\``, '2026-11-24T12:01:00Z'));
+      assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+    });
+  }
+}
+test('a diagnostic quote group excludes only the observed examples', () => {
+  const x = tickets();
+  const diagnostic = comment('diagnostic', `Parser regression example: \`Do not merge at exact head ${head}.\` or \`Must not merge at exact head ${head}.\` returns eligibility.`, '2026-11-24T12:01:00Z');
+  x.snapshot.comments.push(diagnostic);
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  diagnostic.body += ` QA directive to the CTO: \`Do not merge at exact head ${head}.\``;
+  assert.throws(() => evaluateForkTickets(x));
+});
+for (const actor of [reviewer, 'ceo']) test(`factual parser-exception explanation has a narrow nonexecutive boundary: ${actor}`, () => {
+  const x = tickets();
+  const explanation = comment('explanation', 'Independently review this narrow exception; it grants no release authority.', '2026-11-24T12:01:00Z', actor);
+  x.snapshot.comments.push(explanation);
+  if (actor === 'ceo') assert.throws(() => evaluateForkTickets(x));
+  else assert.doesNotThrow(() => evaluateForkTickets(x));
+  explanation.body += ` Do not merge at exact head ${head}.`;
+  assert.throws(() => evaluateForkTickets(x));
+  explanation.body = 'No release authority.';
+  assert.throws(() => evaluateForkTickets(x));
+});
+
+for (const diagnostic of [
+  "After an authenticated CEO's `Do not merge at exact head <candidate>.`, a later CEO receipt `I clear hold at comment nonexistent-hold for exact head <candidate>.` restores eligibility after five minutes.",
+  'The factual explanation `it grants no release authority.` in [the final assignment comment](/LIV/issues/LIV-11652#comment-example) is interpreted as a live denial.',
+]) test(`reported parser result excludes only its quoted input: ${diagnostic}`, () => {
+  const x = tickets();
+  const report = comment('reported-result', diagnostic, '2026-11-24T12:01:00Z');
+  x.snapshot.comments.push(report);
+  assert.doesNotThrow(() => evaluateForkTickets(x));
+  report.body += ` QA directive to the CTO: \`Do not merge at exact head ${head}.\``;
+  assert.throws(() => evaluateForkTickets(x));
+  report.body = diagnostic;
+  report.authorAgentId = 'ceo';
+  assert.throws(() => evaluateForkTickets(x));
+});

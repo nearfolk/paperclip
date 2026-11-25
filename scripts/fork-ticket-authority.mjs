@@ -465,16 +465,33 @@ function isReviewerOnlyDescriptionDenial(body) {
 }
 
 function withoutFactualStaleVerdictNonAuthorization(body) {
-  const withoutQuotedDiagnosticExamples = String(body ?? '')
-    .split('\n')
-    .map((line) => (
-      (/\b(?:QA|diagnostic|test|regression|fixture|example|parser|classifier|verifier|reproduced|reproduction)\b/i.test(line) || /^[-*] \*\*P[0-3]\s*[—:-]/.test(line))
-        ? line.replace(/`([^`\n]*)`/g, (span, example) => /<candidate>/i.test(example) || isReleaseDenial(example) ? '' : span)
-        : line
-    ))
-    .join('\n')
+  const withoutQuotedDiagnosticExamples = String(body ?? '').replace(
+    /`([^`\n]*)`/g,
+    (span, example, offset, text) => {
+      if (!isReleaseDenial(example) && !/<candidate>/i.test(example)) return span
+      // Classify this quotation, never every code span on its line. An actual
+      // instruction remains binding even beside a genuine diagnostic example.
+      const before = text.slice(0, offset).split(/[\n`]/).at(-1)
+      // A coordinated list of quoted inputs may share one observed result.
+      // Stop at any prose outside the list so an adjacent instruction survives.
+      const after = text.slice(offset + span.length)
+        .replace(/^(?:(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)`[^`\n]*`)+/, '')
+        .split(/[\n`]/)[0]
+      if (/\b(?:directive|instruction|order)\b[^.!?;]*$/i.test(before)) return span
+      const introducedExample = /\b(?:fixture|(?:parser|diagnostic|regression|test)\s+(?:regression\s+)?example)\s*:?\s*$/i.test(before)
+      const observedBehavior = /^[.,]?\s*(?:Each\s+)?(?:(?:previously|incorrectly|still|also)\s+)*(?:returns?\s+eligibility|permits?\s+eligibility|passes?|passed|does\s+not\s+block|is\s+(?:discarded|interpreted|accepted)|as\s+a\s+release\s+denial|control\s+rejects|Reproduced\s+on)\b/i.test(after)
+      const reportedReceiptSequence = /\bAfter an authenticated CEO's\s*$/i.test(before)
+        && /^, a later CEO receipt `[^`\n]+` restores eligibility after five minutes\./i.test(text.slice(offset + span.length))
+      const referencedParserResult = /\b(?:factual explanation|quoted input)\s*$/i.test(before)
+        && /^\s+in \[[^\]\n]+\]\([^\s)]+\) is interpreted as a live denial\./i.test(after)
+      return introducedExample || observedBehavior || reportedReceiptSequence || referencedParserResult ? '' : span
+    },
+  )
 
   return withoutQuotedDiagnosticExamples
+    // This complete sentence describes the parser exception's limits. Do not
+    // remove a standalone or adjacent denial that happens to use the same words.
+    .replace(/(^|[.!?]\s+|\n)Independently review this narrow exception; it grants no release authority\.(?=\s|$)/g, '$1')
     // Evidence from an older candidate is not a release decision. Match only
     // the complete factual sentence; leave adjacent or qualified denials intact.
     .replace(
@@ -776,10 +793,8 @@ function evaluateReleaseAuthority({
   }).sort((left, right) => left.createdAtMs - right.createdAtMs || left.index - right.index)
 
   let requiredRole = null
-  let denial = null
   let releaseAuthority = null
-  let ambiguousDenials = []
-  let unavailableActorDenials = []
+  let pendingDenials = []
 
   for (const directive of directives) {
     requiredRole = mergeRequiredAuthorityRole(requiredRole, directive.requiredRole)
@@ -794,102 +809,70 @@ function evaluateReleaseAuthority({
       const denyingRole = laterBoardClearanceTargetsDescription
         ? 'board'
         : ['ceo', 'board'].includes(directive.authorRole)
-        ? directive.authorRole
-        : directive.requiredRole
-      if (!denyingRole) {
-        unavailableActorDenials.push(directive)
-        denial = directive
-        releaseAuthority = null
-        continue
-      }
-      requiredRole = mergeRequiredAuthorityRole(requiredRole, denyingRole)
-      if (directive.ambiguousDenial) {
-        ambiguousDenials.push(directive)
-      }
-      denial = directive
+          ? directive.authorRole
+          : directive.requiredRole
+      if (denyingRole) requiredRole = mergeRequiredAuthorityRole(requiredRole, denyingRole)
+      pendingDenials.push({ ...directive, denyingRole })
       releaseAuthority = null
       continue
     }
 
-    if (directive.requiredRole && releaseAuthority) {
-      releaseAuthority = null
-    }
-    if (
-      directive.authorization
-      && requiredRole
-      && authorityRoleMatches(requiredRole, directive.authorRole)
-      && includesHead(directive.source.body, expectedHead)
-      && directive.createdAtMs > passAtMs
-      && (!denial || directive.createdAtMs > denial.createdAtMs)
-    ) {
-      if (
-        directive.targetedBoardOnlyClearance
-        && (
-          !denial
-          || denial.source?.sourceKind !== 'issue_description'
-          || denial.source.sourceIssueId !== directive.source.targetIssueDescriptionId
-        )
-      ) {
-        continue
+    if (directive.requiredRole) releaseAuthority = null
+    if (!directive.authorization || !requiredRole
+      || !authorityRoleMatches(requiredRole, directive.authorRole)
+      || !includesHead(directive.source.body, expectedHead)
+      || directive.createdAtMs <= passAtMs) continue
+
+    const holdReceipt = parseHoldClearanceReceipt(directive.source.body)
+    const authorizationReceipt = parseReleaseAuthorizationReceipt(directive.source.body)
+    const cleared = pendingDenials.filter(candidate => {
+      if (directive.createdAtMs <= candidate.createdAtMs) return false
+      if (directive.targetedBoardOnlyClearance) {
+        return candidate.source?.sourceKind === 'issue_description'
+          && candidate.source.sourceIssueId === directive.source.targetIssueDescriptionId
+          && isReviewerOnlyDescriptionDenial(candidate.source.body)
       }
-      if (unavailableActorDenials.length > 0) {
-        if (!directive.boundedDescriptionClearance && !directive.boundedUnavailableDenialClearance) continue
-        const explicitlyTargeted = unavailableActorDenials.filter((candidate) => (
-          candidate.createdAtMs < directive.createdAtMs
-          && (
-            (
-              directive.boundedDescriptionClearance
-              && !candidate.source?.id
-              && candidate.source?.sourceIssueId === issue.id
-            )
-            || (
-              validHoldClearance(directive.source, candidate.source, expectedHead, actorRoles)
-            )
-          )
-        ))
-        if (explicitlyTargeted.length === 0) continue
-        const targeted = new Set(explicitlyTargeted)
-        unavailableActorDenials = unavailableActorDenials.filter((candidate) => !targeted.has(candidate))
-        if (unavailableActorDenials.length > 0) continue
+      if (directive.boundedDescriptionClearance) {
+        return !candidate.denyingRole && !candidate.source?.id
+          && candidate.source?.sourceIssueId === issue.id
       }
-      const authorizationReceipt = parseReleaseAuthorizationReceipt(directive.source.body)
-      if (authorizationReceipt?.sourceId) {
-        const description = denial?.source?.sourceKind === 'issue_description'
-        if (authorizationReceipt.sourceKind !== (description ? 'description' : 'comment')
-          || authorizationReceipt.sourceId !== (description ? denial?.source?.sourceIssueId : denial?.source?.id)) continue
+      if (holdReceipt) {
+        // Every consumer resolves this receipt against a real pending source.
+        // It can clear only that source, including when the denial is exact-head
+        // and has a known executive author. It is never generic authorization.
+        return validHoldClearance(directive.source, candidate.source, expectedHead, actorRoles)
+          && (candidate.denyingRole && !candidate.ambiguousDenial || holdReceipt.bounded)
       }
-      if (denial?.holdDenial && !validHoldClearance(directive.source, denial.source, expectedHead, actorRoles)) continue
-      if (ambiguousDenials.length > 0) {
-        if (!parseHoldClearanceReceipt(directive.source.body)?.bounded) continue
-        const explicitlyTargeted = ambiguousDenials.filter((candidate) => (
-          candidate.createdAtMs < directive.createdAtMs
-          && validHoldClearance(directive.source, candidate.source, expectedHead, actorRoles)
-        ))
-        if (explicitlyTargeted.length === 0) continue
-        const targeted = new Set(explicitlyTargeted)
-        ambiguousDenials = ambiguousDenials.filter((candidate) => !targeted.has(candidate))
-        if (ambiguousDenials.length > 0) continue
-      }
-      releaseAuthority = directive
-      denial = null
-    }
+      if (!authorizationReceipt || !candidate.denyingRole
+        || candidate.ambiguousDenial || candidate.holdDenial) return false
+      if (!authorizationReceipt.sourceId) return true
+      const description = candidate.source?.sourceKind === 'issue_description'
+      return authorizationReceipt.sourceKind === (description ? 'description' : 'comment')
+        && authorizationReceipt.sourceId === (description ? candidate.source.sourceIssueId : candidate.source?.id)
+    })
+    // An unbound affirmative authorization can satisfy an explicit requirement
+    // without a denial. A source-bound receipt must actually clear its source.
+    if (!cleared.length && (!authorizationReceipt || authorizationReceipt.sourceId)) continue
+    const clearedSet = new Set(cleared)
+    pendingDenials = pendingDenials.filter(candidate => !clearedSet.has(candidate))
+    if (!pendingDenials.length) releaseAuthority = directive
   }
 
-  if (unavailableActorDenials.length > 0) {
-    const unresolved = unavailableActorDenials.at(-1)
+  const unavailable = pendingDenials.filter(candidate => !candidate.denyingRole).at(-1)
+  if (unavailable) {
     throw new Error(
-      `Ticket-scoped merge denial actor authority is unavailable at ${authoritySourceLabel(unresolved.source)}`,
+      `Ticket-scoped merge denial actor authority is unavailable at ${authoritySourceLabel(unavailable.source)}`,
     )
   }
-  if (ambiguousDenials.length > 0) {
-    const unresolved = ambiguousDenials.at(-1)
+  const ambiguous = pendingDenials.filter(candidate => candidate.ambiguousDenial).at(-1)
+  if (ambiguous) {
     throw new Error(
-      `Ticket-scoped merge denial has ambiguous exact-head scope at ${authoritySourceLabel(unresolved.source)}`,
+      `Ticket-scoped merge denial has ambiguous exact-head scope at ${authoritySourceLabel(ambiguous.source)}`,
     )
   }
-  if (denial) {
+  if (pendingDenials.length) {
     throw new Error(
-      `Required release authority denied or held release in ${authoritySourceLabel(denial.source)}`,
+      `Required release authority denied or held release in ${authoritySourceLabel(pendingDenials.at(-1).source)}`,
     )
   }
   if (requiredRole && !releaseAuthority) {

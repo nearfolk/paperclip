@@ -259,3 +259,18 @@ in a comment when an active QA checkout prevents description edits. It retains
 the explicit completed-review/separate-CTO-activation boundary. Only its exact
 reviewer instruction is exempt; adjacent live denials and executive directives
 remain effective. The same assignment cannot confer release authority.
+
+Every source-bound hold clearance is resolved against an actual pending denial
+before it can restore authority. This includes an executive denial with explicit
+head scope. A nonexistent source, an unrelated source, or a receipt for a different
+description cannot act as generic authorization. Each pending denial is retained
+until a valid receipt clears it; clearing one cannot erase another. Receipts may
+clear sources in either order, with the last clearance starting the full interval.
+
+Markdown backticks alone do not make an instruction diagnostic. Only a locally
+introduced example or a quoted input with an explicit observed parser result is
+excluded from denial classification. A diagnostic example cannot hide another
+quoted live directive on the same line. Executive directives are never subject
+to this diagnostic exception. The complete nonexecutive sentence “Independently
+review this narrow exception; it grants no release authority.” describes the
+exception's limits; a standalone or adjacent release denial remains binding.
