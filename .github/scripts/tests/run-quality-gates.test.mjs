@@ -41,3 +41,13 @@ test('findExistingComment: returns null when no signed comment exists', async ()
 
   assert.equal(comment, null);
 });
+
+
+test('repository bot updates its signed comment but ignores unsigned and user-spoofed comments', async () => {
+  const result = await findExistingComment(async () => [
+    { id: 1, user: { login: 'someone-else' }, body: '— commitperclip' },
+    { id: 2, user: { login: 'github-actions[bot]' }, body: 'unrelated workflow' },
+    { id: 3, user: { login: 'github-actions[bot]' }, body: 'Quality status — commitperclip' },
+  ], 'token', 'nearfolk/paperclip', 6);
+  assert.equal(result.id, 3);
+});

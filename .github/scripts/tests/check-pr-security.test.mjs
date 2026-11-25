@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildAdvisoryPayload,
+  reportSecurityFindings,
   findExistingDraftAdvisory,
   postSecurityCheckRun,
   scanSecrets,
@@ -336,12 +337,12 @@ test('scanSensitivePaths: ignores removed files even on sensitive paths', () => 
 
 // ── startScriptWatchdog ──────────────────────────────────────────────────────
 
-test('startScriptWatchdog: fires exit(0) when the wall-clock budget is exceeded', async () => {
+test('startScriptWatchdog: fires exit(1) when the wall-clock budget is exceeded', async () => {
   let exitCode = null;
   const fakeExit = (code) => { exitCode = code; };
   startScriptWatchdog(20, fakeExit);
   await new Promise((resolve) => setTimeout(resolve, 60));
-  assert.equal(exitCode, 0, 'watchdog should have exited with code 0 by now');
+  assert.equal(exitCode, 1, 'watchdog must fail an incomplete security scan');
 });
 
 test('startScriptWatchdog: cleared timer never fires', async () => {
@@ -377,4 +378,31 @@ test('ghFetch: aborts the request when the per-call timeout elapses', async () =
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+
+test('repository token reporting emits sanitized neutral checks, never advisory requests', async () => {
+  const calls = [];
+  const flags = [{ check: 'secret-scan', line: 'sensitive-value', file: 'private-path' },
+    { check: 'untrusted-category-value', line: 'sensitive-value' }];
+  await reportSecurityFindings(async (path, token, options) => calls.push({ path, body: JSON.parse(options.body) }),
+    'token', 'nearfolk/paperclip', { number: 6, title: 'private-title', head: { sha: 'exact-head' } }, flags, 'check-run');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/repos/nearfolk/paperclip/check-runs');
+  assert.equal(calls[0].body.head_sha, 'exact-head');
+  assert.equal(calls[0].body.conclusion, 'neutral');
+  assert.match(calls[0].body.output.summary, /secret-scan/);
+  for (const value of ['sensitive-value', 'private-path', 'private-title', 'untrusted-category-value'])
+    assert.ok(!JSON.stringify(calls).includes(value));
+});
+
+test('repository token reporting passes clean scans and propagates API errors', async () => {
+  const pr = { number: 6, head: { sha: 'exact-head' } };
+  await reportSecurityFindings(async (path, token, options) => {
+    assert.equal(JSON.parse(options.body).conclusion, 'success');
+  }, 'token', 'nearfolk/paperclip', pr, [], 'check-run');
+  await assert.rejects(reportSecurityFindings(async () => { throw new Error('403'); },
+    'token', 'nearfolk/paperclip', pr, [], 'check-run'), /403/);
+  await assert.rejects(reportSecurityFindings(async () => assert.fail('must not fetch'),
+    'token', 'nearfolk/paperclip', pr, [], 'typo'), /Invalid SECURITY_REPORT_MODE/);
 });

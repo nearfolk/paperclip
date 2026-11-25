@@ -9,7 +9,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
-import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
+import { immutableSnapshot, assertCurrentPair } from './immutable-pr-diff.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
 import { checkDedupSearch } from './check-pr-dedup-search.mjs';
@@ -55,7 +55,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
+      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip' || c.user.login === 'github-actions[bot]') &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -81,7 +81,7 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH, PR_HEAD_SHA, PR_BASE_SHA } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
@@ -99,11 +99,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Fetch PR data once — gates use this, no redundant API calls
-  const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
-  ]);
+  // Collect a coherent immutable snapshot; recheck metadata before reporting.
+  const { pr, files } = await immutableSnapshot(ghFetch, GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA);
 
   const prBody = pr.body ?? '';
   const author = PR_AUTHOR ?? pr.user.login;
@@ -118,7 +115,7 @@ async function main() {
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
       Promise.resolve(checkLockfile(files, author, branch)),
-      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
+      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, PR_BASE_SHA, ghFetch, PR_HEAD_SHA),
     ]);
 
   const allFailures = [
@@ -134,6 +131,7 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
+  await assertCurrentPair(ghFetch, GH_TOKEN, GH_REPO, prNumber, PR_HEAD_SHA, PR_BASE_SHA);
   const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);

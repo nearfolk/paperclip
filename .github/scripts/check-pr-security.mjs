@@ -2,14 +2,14 @@
 /**
  * check-pr-security.mjs
  * Runs 6 security checks against a PR diff. Never posts public comments.
- * Creates a draft security advisory in the repo if any check fires.
+ * Reports flags through a private advisory or a sanitized repository check.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, SECURITY_REPORT_MODE
+ * Findings are informational. Reporting errors fail the CLI.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
-import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
+import { immutableSnapshot, assertCurrentPair } from './immutable-pr-diff.mjs';
 import { resolveBaseRef } from './check-pr-dependencies.mjs';
 
 // ── Pure check functions (exported for testing) ───────────────────────────────
@@ -153,7 +153,7 @@ export function scanSensitivePaths(files) {
 }
 
 function buildContentsPath(repo, filename, ref) {
-  return `/repos/${repo}/contents/${filename}?${new URLSearchParams({ ref }).toString()}`;
+  return `/repos/${repo}/contents/${filename.split('/').map(encodeURIComponent).join('/')}?${new URLSearchParams({ ref }).toString()}`;
 }
 
 export async function validateSensitivePaths(token, repo, prNumber, baseRef, fetchFromGitHub = ghFetch) {
@@ -304,32 +304,83 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
   });
 }
 
+// Repository tokens cannot create private repository security advisories.
+// Report only fixed scanner categories, never matched text, paths, or PR titles.
+export async function reportSecurityFindings(fetchImpl, token, repo, pr, flags, mode = 'advisory') {
+  if (mode === 'advisory') {
+    if (flags.length) await syncDraftAdvisory(fetchImpl, token, repo, pr.number, pr.title, flags);
+    return postSecurityCheckRun(fetchImpl, token, repo, pr.head.sha, flags.length > 0);
+  }
+  if (mode !== 'check-run') throw new Error('Invalid SECURITY_REPORT_MODE');
+  const categories = [...new Set(flags.map(flag => flag.check))]
+    .filter(check => Object.hasOwn(SEVERITY_MAP, check)).sort();
+  await fetchImpl(`/repos/${repo}/check-runs`, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'security-review', head_sha: pr.head.sha, status: 'completed',
+      conclusion: flags.length ? 'neutral' : 'success',
+      output: {
+        title: flags.length ? 'Security Review Recommended' : 'Security Review Passed',
+        summary: flags.length
+          ? `${flags.length} flag(s): ${categories.join(', ')}. Maintainer review of the PR diff is required before release. Matched content is intentionally omitted. No private advisory was created.`
+          : 'No security concerns detected.',
+      },
+    }),
+  });
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 // Wall-clock budget for the whole script. The workflow job has a 5-minute
 // timeout-minutes, and `continue-on-error: true` on a step does NOT override
 // a job-level timeout — it only suppresses step failures. So if any API call
 // (e.g. security-advisories POST/PATCH) hangs, the whole job is cancelled,
-// failing the `review` check. This watchdog enforces the script's documented
-// "always exit 0" contract regardless of API behaviour.
+// failing the `review` check. The watchdog also fails closed so a timeout
+// cannot be mistaken for a completed security scan.
 export const SCRIPT_WATCHDOG_MS = 90_000;
 
 export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = process.exit) {
   const timer = setTimeout(() => {
     console.warn(
-      `[security] script exceeded ${timeoutMs}ms wall-clock budget; exiting 0 per always-exit-0 contract`
+      `[security] script exceeded ${timeoutMs}ms wall-clock budget; ending security scan`
     );
-    exit(0);
+    exit(1);
   }, timeoutMs);
   // Don't keep the event loop alive solely for the watchdog.
   timer.unref?.();
   return timer;
 }
 
+export async function reviewSecurity({ GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, reportMode = 'check-run' }, fetchFromGitHub = ghFetch, collect) {
+  const prNumber = PR_NUMBER;
+  const { pr, files } = await immutableSnapshot(fetchFromGitHub, GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, collect);
+
+  // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
+  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber, PR_BASE_SHA, fetchFromGitHub);
+  if (stalePaths.length > 0) {
+    throw new Error('Sensitive path configuration is stale at the immutable base');
+  }
+
+  const allFlags = [
+    ...scanSecrets(files),
+    ...scanCITampering(files),
+    ...scanBuildScripts(files),
+    ...scanSupplyChain(files),
+    ...scanTestPatterns(files),
+    ...scanSensitivePaths(files),
+  ];
+
+  await assertCurrentPair(fetchFromGitHub, GH_TOKEN, GH_REPO, prNumber, PR_HEAD_SHA, PR_BASE_SHA);
+  await reportSecurityFindings(fetchFromGitHub, GH_TOKEN, GH_REPO, pr, allFlags, reportMode);
+}
+
 async function main() {
+  const reportMode = process.env.SECURITY_REPORT_MODE ?? 'advisory';
+  if (!['advisory', 'check-run'].includes(reportMode)) throw new Error('Invalid SECURITY_REPORT_MODE');
   const watchdog = startScriptWatchdog();
 
-  const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER required');
@@ -347,43 +398,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
-  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber);
-  if (stalePaths.length > 0) {
-    console.error('ERROR: Stale sensitive paths in check-pr-security.mjs:');
-    for (const p of stalePaths) console.error(`  - ${p}`);
-    console.error('');
-    console.error('These paths no longer exist on the PR base branch. The security gate will silently produce no signal for them.');
-    console.error('Update SENSITIVE_PATHS in check-pr-security.mjs to reflect the current code structure.');
-    process.exit(1);
-  }
+  await reviewSecurity({ GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, reportMode });
 
-  const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
-  ]);
-
-  const allFlags = [
-    ...scanSecrets(files),
-    ...scanCITampering(files),
-    ...scanBuildScripts(files),
-    ...scanSupplyChain(files),
-    ...scanTestPatterns(files),
-    ...scanSensitivePaths(files),
-  ];
-
-  if (allFlags.length > 0) {
-    console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
-    ]);
-  } else {
-    console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
-  }
-
-  // Always exit 0 — security flags are silent, never block the PR publicly
+  // Findings remain informational; reaching here means reporting succeeded.
   clearTimeout(watchdog);
   process.exit(0);
 }

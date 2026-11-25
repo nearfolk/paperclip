@@ -2,13 +2,13 @@
 /**
  * check-pr-dependencies.mjs
  * Detects new npm packages added in this PR vs. the base branch.
- * Never fails (informational only) — outputs { passed: true, informational: string[] }
+ * Findings are informational. Incomplete scans throw and fail the quality job.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
 
 function buildContentsPath(repo, filename, ref) {
-  return `/repos/${repo}/contents/${filename}?${new URLSearchParams({ ref }).toString()}`;
+  return `/repos/${repo}/contents/${filename.split('/').map(encodeURIComponent).join('/')}?${new URLSearchParams({ ref }).toString()}`;
 }
 
 export async function resolveBaseRef(fetchFromGitHub, token, repo, prNumber, baseRef) {
@@ -29,7 +29,21 @@ export async function resolveBaseRef(fetchFromGitHub, token, repo, prNumber, bas
   throw new Error(`Unable to resolve a base branch for ${repo}#${prNumber}.`);
 }
 
-export async function checkDependencies(files, token, repo, prNumber, baseRef, fetchFromGitHub = ghFetch) {
+export function parseManifest(response) {
+  if (typeof response?.content !== 'string' || response.encoding !== 'base64') throw new Error('Malformed manifest response');
+  const content = response.content.replace(/\s/g, '');
+  if (!content || Buffer.from(content, 'base64').toString('base64') !== content) throw new Error('Malformed manifest encoding');
+  let pkg;
+  try { pkg = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(content, 'base64'))); }
+  catch { throw new Error('Malformed manifest JSON'); }
+  if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw new Error('Malformed manifest object');
+  for (const key of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    if (pkg[key] !== undefined && (!pkg[key] || typeof pkg[key] !== 'object' || Array.isArray(pkg[key]) || Object.values(pkg[key]).some(v => typeof v !== 'string'))) throw new Error('Malformed dependency map');
+  }
+  return pkg;
+}
+
+export async function checkDependencies(files, token, repo, prNumber, baseRef, fetchFromGitHub = ghFetch, headRef = `refs/pull/${prNumber}/head`) {
   const pkgFiles = files.filter(
     f => f.filename.endsWith('package.json') &&
          !f.filename.includes('node_modules') &&
@@ -42,30 +56,22 @@ export async function checkDependencies(files, token, repo, prNumber, baseRef, f
   const newPackages = new Set();
 
   for (const file of pkgFiles) {
-    try {
-      const [baseRes, prRes] = await Promise.all([
-        fetchFromGitHub(buildContentsPath(repo, file.filename, resolvedBaseRef), token),
-        fetchFromGitHub(buildContentsPath(repo, file.filename, `refs/pull/${prNumber}/head`), token),
-      ]);
-
-      const basePkg = JSON.parse(Buffer.from(baseRes.content, 'base64').toString());
-      const prPkg = JSON.parse(Buffer.from(prRes.content, 'base64').toString());
-
-      const baseDeps = new Set([
-        ...Object.keys(basePkg.dependencies ?? {}),
-        ...Object.keys(basePkg.devDependencies ?? {}),
-        ...Object.keys(basePkg.peerDependencies ?? {}),
-      ]);
-
-      for (const dep of [
-        ...Object.keys(prPkg.dependencies ?? {}),
-        ...Object.keys(prPkg.devDependencies ?? {}),
-        ...Object.keys(prPkg.peerDependencies ?? {}),
-      ]) {
-        if (!baseDeps.has(dep)) newPackages.add(dep);
-      }
-    } catch {
-      // File may not exist on base — skip
+    const basePath = file.previous_filename ?? file.filename;
+    const [basePkg, prPkg] = await Promise.all([
+      fetchFromGitHub(buildContentsPath(repo, basePath, resolvedBaseRef), token)
+        .then(parseManifest)
+        .catch(error => {
+          // Only an added file with a typed 404 is an expected missing base.
+          if (file.status === 'added' && error.status === 404) return {};
+          throw error;
+        }),
+      fetchFromGitHub(buildContentsPath(repo, file.filename, headRef), token).then(parseManifest),
+    ]);
+    const dependencyNames = pkg => ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+      .flatMap(key => Object.keys(pkg[key] ?? {}));
+    const baseDeps = new Set(dependencyNames(basePkg));
+    for (const dep of dependencyNames(prPkg)) {
+      if (!baseDeps.has(dep)) newPackages.add(dep);
     }
   }
 
