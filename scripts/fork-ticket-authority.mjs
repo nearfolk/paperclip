@@ -484,7 +484,14 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
         && /^, a later CEO receipt `[^`\n]+` restores eligibility after five minutes\./i.test(text.slice(offset + span.length))
       const referencedParserResult = /\b(?:factual explanation|quoted input)\s*$/i.test(before)
         && /^\s+in \[[^\]\n]+\]\([^\s)]+\) is interpreted as a live denial\./i.test(after)
-      return introducedExample || observedBehavior || reportedReceiptSequence || referencedParserResult ? '' : span
+      const explicitDiagnosticAssertion = (
+        /\bQA must verify that\s*$/i.test(before)
+        && /^\s+is treated as diagnostic text, not a live directive\./i.test(after)
+      ) || (
+        /\bAdd a regression proving the classifier keeps\s*$/i.test(before)
+        && /^\s+as metalinguistic example text\./i.test(after)
+      )
+      return introducedExample || observedBehavior || reportedReceiptSequence || referencedParserResult || explicitDiagnosticAssertion ? '' : span
     },
   )
 

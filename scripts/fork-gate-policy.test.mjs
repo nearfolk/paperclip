@@ -563,6 +563,8 @@ for (const actor of [reviewer, 'ceo']) test(`factual parser-exception explanatio
 });
 
 for (const diagnostic of [
+  `QA must verify that \`I cannot authorize release at exact head ${head}.\` is treated as diagnostic text, not a live directive.`,
+  'Add a regression proving the classifier keeps `Do not approve this release.` as metalinguistic example text.',
   "After an authenticated CEO's `Do not merge at exact head <candidate>.`, a later CEO receipt `I clear hold at comment nonexistent-hold for exact head <candidate>.` restores eligibility after five minutes.",
   'The factual explanation `it grants no release authority.` in [the final assignment comment](/LIV/issues/LIV-11652#comment-example) is interpreted as a live denial.',
 ]) test(`reported parser result excludes only its quoted input: ${diagnostic}`, () => {
