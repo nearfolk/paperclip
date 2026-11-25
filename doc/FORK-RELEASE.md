@@ -274,3 +274,10 @@ quoted live directive on the same line. Executive directives are never subject
 to this diagnostic exception. The complete nonexecutive sentence “Independently
 review this narrow exception; it grants no release authority.” describes the
 exception's limits; a standalone or adjacent release denial remains binding.
+
+A result-like suffix such as “is accepted” or “is interpreted” never establishes
+that a quotation is diagnostic. The quoted input must have an explicit local
+example/input introduction or a bounded reported reproduction. Only a syntactic
+list of quoted inputs can inherit its first input's introduction; intervening
+prose ends that provenance. Diagnostic words elsewhere on the line do not grant
+an exemption to a release restriction or binding decision.

@@ -471,19 +471,34 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
       if (!isReleaseDenial(example) && !/<candidate>/i.test(example)) return span
       // Classify this quotation, never every code span on its line. An actual
       // instruction remains binding even beside a genuine diagnostic example.
-      const before = text.slice(0, offset).split(/[\n`]/).at(-1)
+      const prefix = text.slice(0, offset)
+      const before = prefix.split(/[\n`]/).at(-1)
+      // Only a syntactic list of quoted inputs can inherit the first input's
+      // introduction. Other prose ends that provenance, even on the same line.
+      const inputIntroduction = prefix.replace(/(?:`[^`\n]*`(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))+$/, '').split(/[\n`]/).at(-1)
       // A coordinated list of quoted inputs may share one observed result.
       // Stop at any prose outside the list so an adjacent instruction survives.
       const after = text.slice(offset + span.length)
         .replace(/^(?:(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)`[^`\n]*`)+/, '')
         .split(/[\n`]/)[0]
       if (/\b(?:directive|instruction|order)\b[^.!?;]*$/i.test(before)) return span
-      const introducedExample = /\b(?:fixture|(?:parser|diagnostic|regression|test)\s+(?:regression\s+)?example)\s*:?\s*$/i.test(before)
-      const observedBehavior = /^[.,]?\s*(?:Each\s+)?(?:(?:previously|incorrectly|still|also)\s+)*(?:returns?\s+eligibility|permits?\s+eligibility|passes?|passed|does\s+not\s+block|is\s+(?:discarded|interpreted|accepted)|as\s+a\s+release\s+denial|control\s+rejects|Reproduced\s+on)\b/i.test(after)
+      const introducedExample = /\b(?:fixture|(?:parser|diagnostic|regression|test)\s+(?:regression\s+)?example)\s*:?\s*$/i.test(inputIntroduction)
+      const diagnosticProvenance = /\b(?:(?:parser|classifier|diagnostic|regression|test)\s+(?:input|example|fixture)|quoted input|misclassifies this ticket's factual sentence,|ignores authenticated CEO statements|(?:An|A later) authenticated CEO comment|followed by backticked)\s*:?\s*$/i.test(inputIntroduction)
+      const observedBehavior = (diagnosticProvenance || introducedExample)
+        && /^[.,]?\s*(?:Each\s+)?(?:(?:previously|incorrectly|still|also)\s+)*(?:(?:returns?|permits?) eligibility(?: on both gate and ancestor)?|passes?|passed|does not block(?: on either the gate or an ancestor)?|as a release denial)[.;](?=\s|$)/i.test(after)
+      const exampleAtEnd = introducedExample && /^[.,]?\s*$/.test(after)
       const reportedReceiptSequence = /\bAfter an authenticated CEO's\s*$/i.test(before)
         && /^, a later CEO receipt `[^`\n]+` restores eligibility after five minutes\./i.test(text.slice(offset + span.length))
       const referencedParserResult = /\b(?:factual explanation|quoted input)\s*$/i.test(before)
         && /^\s+in \[[^\]\n]+\]\([^\s)]+\) is interpreted as a live denial\./i.test(after)
+      const explicitProbeResult = /^\s*\.?\s*Reproduced on gate, ancestor and required-review description, with minimal and actual-history fixtures\./i.test(after)
+        || (/\bthe direct\s*$/i.test(before) && /^\s+control rejects\./i.test(after))
+        || (/\bA required security ticket whose CEO-authored description says\s*$/i.test(before)
+          && /^\s+is accepted with an otherwise valid immutable security PASS\./i.test(after))
+        || (/\[fork-ticket-authority\.mjs:\d+\]\(https:\/\/github\.com\/[^\s)]+\) scopes the entire source by every SHA it contains\.\s*$/.test(before)
+          && /^\s+is discarded as an older-head directive, on either gate or ancestor\./i.test(after))
+      const quotedReproduction = /\b(?:reviewer comment of the form|The form) “[^“”]*$/i.test(before)
+        && /^[^“”\n]*” (?:also )?returns eligibility\b/i.test(after)
       const explicitDiagnosticAssertion = (
         /\bQA must verify that\s*$/i.test(before)
         && /^\s+is treated as diagnostic text, not a live directive\./i.test(after)
@@ -491,7 +506,7 @@ function withoutFactualStaleVerdictNonAuthorization(body) {
         /\bAdd a regression proving the classifier keeps\s*$/i.test(before)
         && /^\s+as metalinguistic example text\./i.test(after)
       )
-      return introducedExample || observedBehavior || reportedReceiptSequence || referencedParserResult || explicitDiagnosticAssertion ? '' : span
+      return exampleAtEnd || observedBehavior || reportedReceiptSequence || referencedParserResult || explicitProbeResult || quotedReproduction || explicitDiagnosticAssertion ? '' : span
     },
   )
 

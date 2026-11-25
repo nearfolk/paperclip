@@ -578,3 +578,27 @@ for (const diagnostic of [
   report.authorAgentId = 'ceo';
   assert.throws(() => evaluateForkTickets(x));
 });
+
+for (const scope of ['gate', 'ancestor', 'required description']) {
+  for (const label of ['The release restriction', 'The binding decision', 'The test release restriction', 'Parser review completed; the release restriction']) {
+    for (const suffix of ['is accepted and remains in force.', 'is interpreted as mandatory by QA.', 'passes.', 'does not block the separate diagnostic test.']) {
+      test(`${scope}: result words alone cannot erase ${label} / ${suffix}`, () => {
+        const x = tickets();
+        const body = `Diagnostic example: \`Do not merge at exact head ${'b'.repeat(40)}.\` passes. ${label} \`Do not merge at exact head ${head}.\` ${suffix}`;
+        const denial = comment('binding-restriction', body, '2026-11-24T12:01:00Z');
+        if (scope === 'required description') {
+          x.contract.requiredVerdicts = [{ ticket: 'security', reviewerId: 'security-reviewer' }];
+          x.required = [{ issue: { id: 'security', description: body, createdByAgentId: reviewer, createdAt: denial.createdAt, updatedAt: denial.createdAt }, comments: [comment('team-pass', `PASS ${head}`, denial.createdAt, 'security-reviewer')], authorityScope: [] }];
+        } else (scope === 'gate' ? x.snapshot.comments : x.snapshot.authorityScope).push(denial);
+        x.nowMs += 600000;
+        assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+      });
+    }
+  }
+}
+
+for (const suffix of ['is accepted and remains in force.', 'is interpreted as mandatory by QA.', 'passes and remains binding.']) test(`an example label cannot erase a quoted binding restriction: ${suffix}`, () => {
+  const x = tickets();
+  x.snapshot.comments.push(comment('binding-example', `Diagnostic example: \`Do not merge at exact head ${head}.\` ${suffix}`, '2026-11-24T12:01:00Z'));
+  assert.throws(() => evaluateForkTickets(x));
+});
