@@ -602,3 +602,80 @@ for (const suffix of ['is accepted and remains in force.', 'is interpreted as ma
   x.snapshot.comments.push(comment('binding-example', `Diagnostic example: \`Do not merge at exact head ${head}.\` ${suffix}`, '2026-11-24T12:01:00Z'));
   assert.throws(() => evaluateForkTickets(x));
 });
+
+// Regressions supplied by the eighth independent review plus boundary mutations.
+for (const scope of ['gate', 'ancestor', 'required description']) {
+  function withDiagnostic(body) {
+    const x = tickets();
+    const c = comment('complete-context', body, '2026-11-24T12:01:00Z');
+    if (scope === 'required description') {
+      x.contract.requiredVerdicts = [{ ticket: 'security', reviewerId: 'security-reviewer' }];
+      x.required = [{ issue: { id: 'security', description: body, createdByAgentId: reviewer, createdAt: c.createdAt }, comments: [comment('team-pass', `PASS ${head}`, c.createdAt, 'security-reviewer')], authorityScope: [] }];
+    } else (scope === 'gate' ? x.snapshot.comments : x.snapshot.authorityScope).push(c);
+    x.nowMs += 600000;
+    return x;
+  }
+  const denial = `Do not merge at exact head ${head}.`;
+  const forms = [
+    `Diagnostic example: \`${denial}\` passes.`,
+    `Diagnostic example: \`${denial}\` Reproduced on gate, ancestor and required-review description, with minimal and actual-history fixtures.`,
+    `QA must verify that \`${denial}\` is treated as diagnostic text, not a live directive.`,
+    `Add a regression proving the classifier keeps \`${denial}\` as metalinguistic example text.`,
+    `After an authenticated CEO's \`${denial}\`, a later CEO receipt \`I clear hold at comment nonexistent for exact head ${head}.\` restores eligibility after five minutes.`,
+    `The quoted input \`${denial}\` in [the report](/LIV/issues/LIV-11656) is interpreted as a live denial.`,
+    `The direct \`${denial}\` control rejects.`,
+    `A required security ticket whose CEO-authored description says \`${denial}\` is accepted with an otherwise valid immutable security PASS.`,
+    `[fork-ticket-authority.mjs:100](https://github.com/nearfolk/paperclip/blob/example) scopes the entire source by every SHA it contains. \`${denial}\` is discarded as an older-head directive, on either gate or ancestor.`,
+    `A reviewer comment of the form “The release restriction \`${denial}\` is binding.” returns eligibility.`,
+    `Parser regression example: \`${denial}\` or \`Must not merge at exact head ${head}.\` returns eligibility.`,
+  ];
+  for (const [i, form] of forms.entries()) {
+    test(`${scope}: complete diagnostic alternative ${i} permits`, () => assert.doesNotThrow(() => evaluateForkTickets(withDiagnostic(form))));
+    for (const suffix of [' It remains binding on the CTO.', '; this is the binding restriction for the CTO.', '\nIt remains binding on the CTO.', ' \`It remains binding on the CTO.\`', ' Additional ambiguous context.']) {
+      test(`${scope}: alternative ${i} preserves trailing context ${JSON.stringify(suffix)}`, () => assert.throws(() => evaluateForkTickets(withDiagnostic(form + suffix)), /denial|authority/i));
+    }
+    test(`${scope}: alternative ${i} cannot inherit a binding prefix`, () => assert.throws(() => evaluateForkTickets(withDiagnostic('Binding restriction for the CTO: ' + form)), /denial|authority/i));
+  }
+  for (const prefix of ['', `Diagnostic example: \`Do not merge at exact head ${'b'.repeat(40)}.\` returns eligibility. `]) {
+    test(`${scope}: reproduction locations alone are not diagnostic provenance ${Boolean(prefix)}`, () => assert.throws(() => evaluateForkTickets(withDiagnostic(`${prefix}The binding restriction \`${denial}\` Reproduced on gate, ancestor and required-review description, with minimal and actual-history fixtures.`)), /denial|authority/i));
+  }
+}
+
+const historicalReports = JSON.parse(readFileSync(new URL('./fixtures/fork-diagnostic-reports.json', import.meta.url), 'utf8'));
+for (const report of historicalReports) {
+  function withReport() {
+    const x = tickets();
+    const qa = report.authorAgentId;
+    x.contract.reviewerId = qa;
+    for (const c of x.snapshot.comments) c.authorAgentId = qa;
+    x.snapshot.activity[0].actorId = qa;
+    x.snapshot.activity[0].details._previous.assigneeAgentId = qa;
+    x.histories[0].comments[0].authorAgentId = qa;
+    x.histories[0].comments.unshift(comment(report.commentId, report.body, '2026-11-24T11:00:00Z', qa));
+    x.snapshot.comments.unshift(comment('historical-retraction', `I retract FAIL at comment ${report.commentId} for corrected head ${head}.`, '2026-11-24T11:59:00Z', qa));
+    return x;
+  }
+  test(`${report.issue}: immutable diagnostic report compatibility`, () => {
+    assert.equal(digest(report.body), report.bodySha256);
+    assert.doesNotThrow(() => evaluateForkTickets(withReport()));
+  });
+  test(`${report.issue}: historical diagnostics do not retract their FAIL`, () => {
+    const x = withReport(); x.snapshot.comments.shift();
+    assert.throws(() => evaluateForkTickets(x), /FAIL/);
+  });
+  test(`${report.issue}: appended live quote invalidates compatibility`, () => {
+    const x = withReport();
+    x.histories[0].comments[0].body += `\nCurrent restriction: \`Do not merge at exact head ${head}.\``;
+    assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+  });
+  if (!['LIV-11655', 'LIV-11656'].includes(report.issue)) continue;
+  for (const mutation of ['id', 'author', 'edit timestamp', 'body', 'description']) test(`${report.issue}: original report ${mutation} is bound`, () => {
+    const x = withReport(), c = x.histories[0].comments[0];
+    if (mutation === 'id') { c.id = 'different-comment'; x.snapshot.comments[0].body = `I retract FAIL at comment ${c.id} for corrected head ${head}.`; }
+    if (mutation === 'author') { c.authorAgentId = 'different-qa'; x.snapshot.comments[0].authorAgentId = c.authorAgentId; }
+    if (mutation === 'edit timestamp') c.updatedAt = '2026-11-24T11:01:00Z';
+    if (mutation === 'body') c.body += '\nIt remains binding on the CTO.';
+    if (mutation === 'description') c.sourceKind = 'issue_description';
+    assert.throws(() => evaluateForkTickets(x), /denial|authority/i);
+  });
+}

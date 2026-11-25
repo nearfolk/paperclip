@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 // Ticket authority evaluator adapted from the company product release guard.
 // Product release controls remain unchanged. Source checkout commit:
 // 6eb2b9e55fb839607d75dc7f657d0354657546b4 (scripts/merge-pr.mjs).
@@ -464,47 +466,73 @@ function isReviewerOnlyDescriptionDenial(body) {
   return !isReleaseDenial(withoutTargetedBoundary)
 }
 
-function withoutFactualStaleVerdictNonAuthorization(body) {
+// Legacy reproductions contain narrative outside the new complete diagnostic
+// grammar. Bind that compatibility to the original nonexecutive QA author,
+// comment identity and WHOLE unmodified body, never a matching paragraph or
+// result fragment. Full originals are auditable in fixtures/fork-diagnostic-reports.json.
+const historicalDiagnosticReports = new Map([
+  ['154795a9-79ab-40a7-94c1-bdfefb398979', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '414f12a1be35c61eb37338b2e7daadfb4f2a51f64cb10db1bd8a53af1406e7a5' }], // LIV-11630
+  ['8d1a7383-181b-41af-aa71-e311925c9447', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '14053e9ffe916f028ec1c92269990bb6c9ccf584b83770590e60b432ccf7d941' }], // LIV-11645
+  ['6bb56af6-7b8f-49f0-a110-740cd8761fa1', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '032743f3f49957862aa00c313dff9fb72ead72e9d0a4c3cbb1544843cc2f8863' }], // LIV-11649
+  ['6b3d84d1-674a-42bc-bc8a-17e5dfda4d4b', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '00e90acc71bc9f7d3156819bf51c09bb5454b6e68b1aa09368fbb2bb0459258f' }], // LIV-11650
+  ['e43e35be-d07b-4f63-9b7b-da80fb043553', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: 'b6a5064ac22325ca28558f33ed26f39baddd32c05b6e6aeb975b7f9c58f39e69' }], // LIV-11651
+  ['42b740be-ad53-4360-90cd-fd3ef64aa0ed', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '422252d6b014e4d389d1a6b3f0477ec0c1c36aad2311adf45d6ed7046ffd7c31' }], // LIV-11652
+  ['fab868a4-8abb-4c55-8050-bbe982f55d07', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: 'a39c65dab02d2f5c1a7840baf63c5d07becd5ee9804765e18ec5565143f1d47b' }], // LIV-11655
+  ['d00495b7-0443-4131-839e-05dd017a7930', { author: '20eba31f-3d03-440b-b2be-5bf89a9b0230', sha256: '4acadcad1669e14ab11aa715fe127b95b7596190edef4a45c3ea6d5151036e1e' }], // LIV-11656
+])
+
+function isHistoricalDiagnosticReport(source) {
+  const expected = historicalDiagnosticReports.get(source?.id)
+  return Boolean(expected && source.authorAgentId === expected.author
+    && source.sourceKind !== 'issue_description'
+    && (!source.updatedAt || source.updatedAt === source.createdAt)
+    && typeof source.body === 'string'
+    && createHash('sha256').update(source.body).digest('hex') === expected.sha256)
+}
+
+function withoutFactualStaleVerdictNonAuthorization(body, source) {
+  const historicalReport = isHistoricalDiagnosticReport(source)
   const withoutQuotedDiagnosticExamples = String(body ?? '').replace(
     /`([^`\n]*)`/g,
     (span, example, offset, text) => {
       if (!isReleaseDenial(example) && !/<candidate>/i.test(example)) return span
+      if (historicalReport) return ''
       // Classify this quotation, never every code span on its line. An actual
       // instruction remains binding even beside a genuine diagnostic example.
       const prefix = text.slice(0, offset)
-      const before = prefix.split(/[\n`]/).at(-1)
       // Only a syntactic list of quoted inputs can inherit the first input's
       // introduction. Other prose ends that provenance, even on the same line.
-      const inputIntroduction = prefix.replace(/(?:`[^`\n]*`(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))+$/, '').split(/[\n`]/).at(-1)
+      const inputIntroduction = prefix.replace(/(?:`[^`\n]*`(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))+$/, '')
       // A coordinated list of quoted inputs may share one observed result.
-      // Stop at any prose outside the list so an adjacent instruction survives.
+      // Validate the entire remaining source: punctuation, Markdown and line
+      // breaks cannot discard a qualifier or a later binding reference.
       const after = text.slice(offset + span.length)
         .replace(/^(?:(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)`[^`\n]*`)+/, '')
-        .split(/[\n`]/)[0]
-      if (/\b(?:directive|instruction|order)\b[^.!?;]*$/i.test(before)) return span
-      const introducedExample = /\b(?:fixture|(?:parser|diagnostic|regression|test)\s+(?:regression\s+)?example)\s*:?\s*$/i.test(inputIntroduction)
-      const diagnosticProvenance = /\b(?:(?:parser|classifier|diagnostic|regression|test)\s+(?:input|example|fixture)|quoted input|misclassifies this ticket's factual sentence,|ignores authenticated CEO statements|(?:An|A later) authenticated CEO comment|followed by backticked)\s*:?\s*$/i.test(inputIntroduction)
+
+      if (/\b(?:directive|instruction|order)\b[^.!?;]*$/i.test(prefix)) return span
+      const introducedExample = /^\s*(?:- \*\*P2 — reproduction\.\*\* )?(?:The\s+)?(?:fixture|(?:parser|diagnostic|regression|test)\s+(?:regression\s+)?example)\s*:?\s*$/i.test(inputIntroduction)
+      const diagnosticProvenance = /^\s*(?:(?:parser|classifier|diagnostic|regression|test)\s+(?:input|example|fixture)|quoted input|misclassifies this ticket's factual sentence,|ignores authenticated CEO statements|(?:An|A later) authenticated CEO comment|followed by backticked)\s*:?\s*$/i.test(inputIntroduction)
       const observedBehavior = (diagnosticProvenance || introducedExample)
-        && /^[.,]?\s*(?:Each\s+)?(?:(?:previously|incorrectly|still|also)\s+)*(?:(?:returns?|permits?) eligibility(?: on both gate and ancestor)?|passes?|passed|does not block(?: on either the gate or an ancestor)?|as a release denial)[.;](?=\s|$)/i.test(after)
+        && /^[.,]?\s*(?:Each\s+)?(?:(?:previously|incorrectly|still|also)\s+)*(?:(?:returns?|permits?) eligibility(?: on both gate and ancestor)?|passes?|passed|does not block(?: on either the gate or an ancestor)?|as a release denial)[.;]\s*$/i.test(after)
       const exampleAtEnd = introducedExample && /^[.,]?\s*$/.test(after)
-      const reportedReceiptSequence = /\bAfter an authenticated CEO's\s*$/i.test(before)
-        && /^, a later CEO receipt `[^`\n]+` restores eligibility after five minutes\./i.test(text.slice(offset + span.length))
-      const referencedParserResult = /\b(?:factual explanation|quoted input)\s*$/i.test(before)
-        && /^\s+in \[[^\]\n]+\]\([^\s)]+\) is interpreted as a live denial\./i.test(after)
-      const explicitProbeResult = /^\s*\.?\s*Reproduced on gate, ancestor and required-review description, with minimal and actual-history fixtures\./i.test(after)
-        || (/\bthe direct\s*$/i.test(before) && /^\s+control rejects\./i.test(after))
-        || (/\bA required security ticket whose CEO-authored description says\s*$/i.test(before)
-          && /^\s+is accepted with an otherwise valid immutable security PASS\./i.test(after))
-        || (/\[fork-ticket-authority\.mjs:\d+\]\(https:\/\/github\.com\/[^\s)]+\) scopes the entire source by every SHA it contains\.\s*$/.test(before)
-          && /^\s+is discarded as an older-head directive, on either gate or ancestor\./i.test(after))
-      const quotedReproduction = /\b(?:reviewer comment of the form|The form) “[^“”]*$/i.test(before)
-        && /^[^“”\n]*” (?:also )?returns eligibility\b/i.test(after)
+      const reportedReceiptSequence = /^\s*After an authenticated CEO's\s*$/i.test(prefix)
+        && /^, a later CEO receipt `[^`\n]+` restores eligibility after five minutes\.\s*$/i.test(text.slice(offset + span.length))
+      const referencedParserResult = /^\s*(?:The\s+)?(?:factual explanation|quoted input)\s*$/i.test(prefix)
+        && /^\s+in \[[^\]\n]+\]\([^\s)]+\) is interpreted as a live denial\.\s*$/i.test(after)
+      const explicitProbeResult = ((diagnosticProvenance || introducedExample) && /^\s*\.?\s*Reproduced on gate, ancestor and required-review description, with minimal and actual-history fixtures\.\s*$/i.test(after))
+        || (/^\s*(?:The|the) direct\s*$/i.test(prefix) && /^\s+control rejects\.\s*$/i.test(after))
+        || (/^\s*A required security ticket whose CEO-authored description says\s*$/i.test(prefix)
+          && /^\s+is accepted with an otherwise valid immutable security PASS\.\s*$/i.test(after))
+        || (/^\s*\[fork-ticket-authority\.mjs:\d+\]\(https:\/\/github\.com\/[^\s)]+\) scopes the entire source by every SHA it contains\.\s*$/.test(prefix)
+          && /^\s+is discarded as an older-head directive, on either gate or ancestor\.\s*$/i.test(after))
+      const quotedReproduction = /^\s*(?:A reviewer comment of the form|The form) “[^“”]*$/i.test(prefix)
+        && /^[^“”\n]*” (?:also )?returns eligibility\.\s*$/i.test(after)
       const explicitDiagnosticAssertion = (
-        /\bQA must verify that\s*$/i.test(before)
-        && /^\s+is treated as diagnostic text, not a live directive\./i.test(after)
+        /^\s*QA must verify that\s*$/i.test(prefix)
+        && /^\s+is treated as diagnostic text, not a live directive\.\s*$/i.test(after)
       ) || (
-        /\bAdd a regression proving the classifier keeps\s*$/i.test(before)
-        && /^\s+as metalinguistic example text\./i.test(after)
+        /^\s*Add a regression proving the classifier keeps\s*$/i.test(prefix)
+        && /^\s+as metalinguistic example text\.\s*$/i.test(after)
       )
       return exampleAtEnd || observedBehavior || reportedReceiptSequence || referencedParserResult || explicitProbeResult || quotedReproduction || explicitDiagnosticAssertion ? '' : span
     },
@@ -769,7 +797,7 @@ function evaluateReleaseAuthority({
     }
     const denialBody = ['ceo', 'board'].includes(authorRole)
       ? sourceBody
-      : withoutFactualStaleVerdictNonAuthorization(sourceBody)
+      : withoutFactualStaleVerdictNonAuthorization(sourceBody, source)
     const holdDenial = isHold(source?.body) && (
       ['ceo', 'board'].includes(authorRole)
       || retractedQaFailureIds.has(source?.id)

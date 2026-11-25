@@ -281,3 +281,21 @@ example/input introduction or a bounded reported reproduction. Only a syntactic
 list of quoted inputs can inherit its first input's introduction; intervening
 prose ends that provenance. Diagnostic words elsewhere on the line do not grant
 an exemption to a release restriction or binding decision.
+
+Every diagnostic alternative now consumes the complete input introduction and
+remaining source text, including punctuation, code spans and line breaks. A
+partial result or a reproduction-location sentence cannot exempt a binding or
+ambiguous quotation. The observed result, explicit assertion, receipt sequence,
+linked factual explanation and input-list forms all obey that same boundary.
+Put new diagnostic assertions in standalone comments using those complete forms.
+
+Eight original QA reports predate that bounded grammar and contain narrative
+reproductions. Their compatibility inventory in `fork-ticket-authority.mjs`
+binds each original comment ID, original author and SHA-256 of its entire body;
+`fixtures/fork-diagnostic-reports.json` retains the complete auditable originals.
+Only quoted reproduction inputs are excluded, only for a matching unedited
+nonexecutive comment. No matching paragraph, changed identity, description,
+appended sentence, or edited timestamp qualifies. This inventory neither retracts
+a FAIL nor clears a hold: all eight original-author receipts, fresh independent
+PASS, operator assignment and five-minute interval are still required. The
+inventory and stricter grammar require independent review at the new head.
